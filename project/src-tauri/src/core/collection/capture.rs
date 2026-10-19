@@ -218,7 +218,7 @@ pub fn spawn_capture_thread(
                     continue;
                 }
             };
-            if super::sensitive::permit_capture(&cfg, &plan.regions).is_err() {
+            if super::sensitive::permit_capture(&cfg, &front, url.as_deref()).is_err() {
                 control.note_capture(sig.epoch, "privacy");
                 continue;
             }
@@ -240,7 +240,7 @@ pub fn spawn_capture_thread(
                 continue;
             }
             if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
-                || super::sensitive::permit_capture(&cfg, &plan.regions).is_err()
+                || super::sensitive::permit_capture(&cfg, &front, url.as_deref()).is_err()
             {
                 control.note_capture(sig.epoch, "privacy");
                 continue;
@@ -264,7 +264,7 @@ pub fn spawn_capture_thread(
             };
             for (display, img) in images {
                 if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
-                    || super::sensitive::permit_capture(&cfg, &plan.regions).is_err()
+                    || super::sensitive::permit_capture(&cfg, &front, url.as_deref()).is_err()
                 {
                     control.note_capture(sig.epoch, "privacy");
                     break;
