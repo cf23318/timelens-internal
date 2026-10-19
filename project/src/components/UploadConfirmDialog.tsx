@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { useInternalStore } from "../stores/internalStore";
-import { useDesktopText, fileSize, missingLabel } from "../lib/desktop";
-import * as internal from "../services/internal";
 import { Link } from "react-router-dom";
+import { useInternalStore } from "../stores/internalStore";
+import { useDesktopText, missingLabel } from "../lib/desktop";
+import * as internal from "../services/internal";
 
-export function UploadConfirmDialog({ onClose }: { onClose: () => void }) {
+export function UploadConfirmDialog({ onClose, background = false }: { onClose: () => void; background?: boolean }) {
   const { text, english } = useDesktopText();
   const { data, busy, act } = useInternalStore();
   const dialog = useRef<HTMLDialogElement>(null);
@@ -14,30 +14,37 @@ export function UploadConfirmDialog({ onClose }: { onClose: () => void }) {
   useEffect(() => { dialog.current?.showModal(); return () => { dialog.current?.close(); }; }, []);
   if (!data || !initial.current) return null;
   const original = initial.current;
-  const cleanupOnly = Boolean(original.progress.receipt);
+  const legacy = Boolean(original.progress.receipt || original.progress.storedBundle || original.progress.bundlePath);
   const confirmation: internal.UploadConfirmation = {
     taskId: original.progress.taskId, uploadUrl: original.config.uploadUrl,
     encryptionRecipient: original.config.encryptionRecipient, domesticServerConfirmed: original.config.domesticServerConfirmed,
-    cleanupOnly,
+    cleanupOnly: false, surveyId: original.config.uploadSurveyId, deviceId: original.config.uploadDeviceId,
   };
-  const stale = data.progress.taskId !== confirmation.taskId || data.progress.status !== original.progress.status || Boolean(data.progress.receipt) !== cleanupOnly || JSON.stringify(data.config) !== JSON.stringify(original.config);
-  const blocked = stale || Boolean((data.progress.needsFlush && data.progress.status !== "recording") || data.progress.integrityError) || (!cleanupOnly && data.uploadMissing.length > 0);
+  const stale = data.progress.taskId !== confirmation.taskId || data.progress.status !== original.progress.status || JSON.stringify(data.config) !== JSON.stringify(original.config);
+  const blocked = legacy || (background && data.uploadActive) || stale || Boolean((data.progress.needsFlush && data.progress.status !== "recording") || data.progress.integrityError) || data.uploadMissing.length > 0;
   const confirm = async () => {
     if (blocked || !acknowledged || busy) return;
     setLocalError("");
-    const ok = await act(() => original.progress.status === "completed" ? internal.retryInternalUpload(confirmation) : internal.finishInternalTask(confirmation), text("已启动回收，请等待任务状态更新", "Recovery started. Wait for the task status to update."));
+    const ok = await act(() => background ? internal.startFrameUpload(confirmation) : original.progress.status === "completed" ? internal.retryInternalUpload(confirmation) : internal.finishInternalTask(confirmation), text("逐张上传已启动，本地数据保留", "Frame upload started. Local data is retained."));
     if (ok) onClose(); else setLocalError(text("未能启动，请关闭此窗口查看错误详情。", "Could not start. Close this dialog to review the error."));
   };
   return <dialog ref={dialog} className="desktop-dialog" aria-labelledby="upload-confirm-title" onCancel={e => { if (busy) e.preventDefault(); else onClose(); }}>
-    <div className="desktop-dialog-header"><div><div className="desktop-eyebrow">{text("操作确认", "Confirmation")}</div><h2 id="upload-confirm-title">{cleanupOnly ? text("重试本地数据清理", "Retry local cleanup") : text("结束采集并上传", "End collection and upload")}</h2></div><button className="desktop-icon-button" aria-label={text("关闭", "Close")} onClick={onClose} disabled={busy}>×</button></div>
+    <div className="desktop-dialog-header"><div><div className="desktop-eyebrow">{text("操作确认", "Confirmation")}</div><h2 id="upload-confirm-title">{background ? text("启用本次运行的后台上传", "Enable upload for this run") : text("结束采集并上传", "End collection and upload")}</h2></div><button className="desktop-icon-button" aria-label={text("关闭", "Close")} onClick={onClose} disabled={busy}>×</button></div>
     <div className="desktop-dialog-body">
-      <p>{cleanupOnly ? text("服务器已确认接收此任务。本次仅重试本地清理，不会重新上传。", "A server receipt already exists. This action retries local cleanup without uploading again.") : text("确认后将结束本次采集，使用已保存的配置加密打包并上传。结束后的任务不能继续采集。", "This ends the task, encrypts its data and uploads using saved settings. An ended task cannot resume collection.")}</p>
-      <dl className="desktop-review-list"><div><dt>{text("任务编号", "Task ID")}</dt><dd className="font-mono text-xs break-all">{confirmation.taskId}</dd></div><div><dt>{text("数据范围", "Contents")}</dt><dd>{text("本次采集数据库、已保存截图、索引与清单。数据库含窗口、网址、事件及统计，不只是图片。", "Collection database, saved screenshots, indexes and manifest. The database includes window, URL, event and metric records.")}</dd></div><div><dt>{text("已入库截图", "Stored screenshots")}</dt><dd>{original.snapshots.count} · {fileSize(original.snapshots.bytes)} {text("（仅截图体积，非最终包大小）", "(images only, not final package size)")}</dd></div>{cleanupOnly ? <div><dt>{text("服务器回执", "Server receipt")}</dt><dd>{text("已确认接收，本次仅重试本地清理", "Receipt confirmed; this action only retries local cleanup")}</dd></div> : <><div><dt>{text("已保存目的地", "Saved destination")}</dt><dd className="break-all">{confirmation.uploadUrl || text("尚未配置", "Not configured")}</dd></div><div><dt>{text("加密公钥", "Public key")}</dt><dd className="font-mono text-xs break-all">{confirmation.encryptionRecipient || text("尚未配置", "Not configured")}</dd></div></>}</dl>
-      <div className="desktop-alert desktop-alert-info">{cleanupOnly ? text("本地清理会删除已采集的数据库、截图和数据包，请确认已完成必要核对。", "Local cleanup removes collected database records, screenshots and packages. Complete any necessary review first.") : text("上传失败会保留本地数据。只有服务器回执与任务、文件大小和校验值匹配后，才清理本地采集数据。", "Failed uploads retain local data. Cleanup only follows a server receipt matching the task, file size and checksum.")}</div>
-      {blocked && <div className="desktop-alert desktop-alert-warning" role="status">{stale ? text("任务或配置已变化，请关闭后重新查看。", "The task or settings changed. Close and review again.") : (data.progress.needsFlush && data.progress.status !== "recording") || data.progress.integrityError ? text("数据保存或完整性检查未完成，不能开始回收。", "Pending writes or integrity checks prevent recovery.") : <>{text("上传准备未完成：", "Incomplete setup: ")}{data.uploadMissing.map(c => missingLabel(c,english)).join("、")}。 <Link to="/settings?tab=admin" onClick={onClose} className="desktop-text-link">{text("检查管理员配置", "Review administrator settings")}</Link></>}</div>}
-      <label className="desktop-checkbox-row"><input type="checkbox" checked={acknowledged} disabled={busy || blocked} onChange={e => setAcknowledged(e.target.checked)}/><span>{text("我已核对上述信息，并了解本地数据的清理规则。", "I reviewed the details and understand the local cleanup rules.")}</span></label>
+      <p>{background ? text("确认后开始逐张上传队列中的截图，并继续上传本次运行新保存的截图。不会自动开始采集；重启后需要重新确认上传。", "Uploads queued and newly saved frames during this run. Collection does not start automatically; restart requires upload confirmation again.") : text("确认后结束采集，将队列中的原始 WebP 逐张通过 HTTPS 上传。不制作加密包；结束后的任务不能继续采集。", "Ends collection and uploads queued original WebP images over HTTPS, without an encrypted package. An ended task cannot resume collection.")}</p>
+      <dl className="desktop-review-list">
+        <div><dt>{text("任务编号", "Task ID")}</dt><dd className="font-mono text-xs break-all">{confirmation.taskId}</dd></div>
+        <div><dt>{text("数据范围", "Contents")}</dt><dd>{text("新上传队列中的原始截图，以及调研/设备编号、时间、显示器编号、大小和校验值。活动数据库不上传。", "Original queued screenshots and survey/device IDs, timestamps, display IDs, sizes and checksums. The activity database is not uploaded.")}</dd></div>
+        <div><dt>{text("当前队列", "Current queue")}</dt><dd>{text("待传", "Pending")} {original.uploads.pending} · {text("已确认", "Verified")} {original.uploads.verified} · {text("需处理", "Needs review")} {original.uploads.blocked}</dd></div>
+        <div><dt>{text("未加入队列的旧截图", "Legacy images excluded")}</dt><dd>{original.uploads.legacy}</dd></div>
+        <div><dt>{text("已保存目的地", "Saved destination")}</dt><dd className="break-all">{confirmation.uploadUrl || text("尚未配置", "Not configured")}</dd></div>
+        <div><dt>{text("调研 / 设备", "Survey / device")}</dt><dd>{confirmation.surveyId} / {confirmation.deviceId}</dd></div>
+      </dl>
+      <div className="desktop-alert desktop-alert-info">{text("每张图片都核对服务器回执。成功或失败均保留本地截图和活动数据库；旧截图不会自动加入新队列。", "Every receipt is verified. Successful and failed uploads retain local images and the activity database. Legacy screenshots are not automatically enrolled.")}</div>
+      {blocked && <div className="desktop-alert desktop-alert-warning" role="status">{legacy ? text("该任务已有旧版加密包或回执，请先人工核对。", "This task has a legacy bundle or receipt requiring review.") : background && data.uploadActive ? text("后台上传已开启。", "Background upload is already enabled.") : stale ? text("任务或配置已变化，请关闭后重新查看。", "The task or settings changed. Close and review again.") : (data.progress.needsFlush && data.progress.status !== "recording") || data.progress.integrityError ? text("数据保存或完整性检查未完成，不能开始上传。", "Pending writes or integrity checks prevent upload.") : <>{text("上传准备未完成：", "Incomplete setup: ")}{data.uploadMissing.map(c => missingLabel(c,english)).join("、")}。 <Link to="/settings?tab=admin" onClick={onClose} className="desktop-text-link">{text("检查管理员配置", "Review administrator settings")}</Link></>}</div>}
+      <label className="desktop-checkbox-row"><input type="checkbox" checked={acknowledged} disabled={busy || blocked} onChange={e => setAcknowledged(e.target.checked)}/><span>{text("我已核对上述信息，了解截图原图将发送到上述服务器。", "I reviewed the details and understand that original screenshots are sent to this server.")}</span></label>
       {localError && <p className="text-sm text-red-600" role="alert">{localError}</p>}
     </div>
-    <div className="desktop-dialog-footer"><button className="desktop-button" onClick={onClose} disabled={busy} autoFocus>{text("取消", "Cancel")}</button><button className="desktop-button desktop-button-danger" disabled={busy || blocked || !acknowledged} onClick={() => void confirm()}>{busy ? text("处理中…", "Working…") : cleanupOnly ? text("确认清理本地数据", "Confirm local cleanup") : text("确认结束并上传", "Confirm end and upload")}</button></div>
+    <div className="desktop-dialog-footer"><button className="desktop-button" onClick={onClose} disabled={busy} autoFocus>{text("取消", "Cancel")}</button><button className="desktop-button desktop-button-danger" disabled={busy || blocked || !acknowledged} onClick={() => void confirm()}>{busy ? text("处理中…", "Working…") : background ? text("确认开启后台上传", "Enable background upload") : text("确认结束并上传", "Confirm end and upload")}</button></div>
   </dialog>;
 }

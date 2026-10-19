@@ -12,7 +12,7 @@ pub fn open_write(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
+        PRAGMA synchronous = FULL;
         PRAGMA cache_size = -8000;
         PRAGMA foreign_keys = ON;
     "#,

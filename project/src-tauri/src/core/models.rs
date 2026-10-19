@@ -176,7 +176,7 @@ pub struct AppSwitchRow {
     pub switch_type: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotRow {
     pub id: String,
     pub session_id: String,
@@ -318,6 +318,11 @@ pub enum WriteEvent {
     RawEvent(RawEventRow),
     AppSwitch(AppSwitchRow),
     Snapshot(SnapshotRow),
+    SnapshotConfirmed {
+        row: SnapshotRow,
+        upload: super::frame_upload::UploadDraft,
+        done: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     SnapshotOcr(SnapshotOcrRow),
     SessionUpdate(SessionUpdateOp),
     InputMetric(InputMetricRow),

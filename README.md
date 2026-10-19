@@ -1,3 +1,5 @@
+> 本地内部版已改为逐张原始截图上传，保留本地数据库与图片。最新说明见 [内部版安装与配置](docs/internal-frame-install.md) 和 [接收服务](upload-server/README.md)。下方旧版加密回收说明属于历史实现。
+
 # TimeLens Internal · 内部采集版
 
 本仓库是基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) **v0.17.5 / f8e7107** 的改造版本，保留上游 MIT 许可证。当前改造在 PR 分支中审核，功能与验证边界见 [内部版审核说明](INTERNAL_REVIEW.md)。下方保留的上游介绍、界面和下载链接用于说明原项目，不代表本改造版本的功能或安装包。

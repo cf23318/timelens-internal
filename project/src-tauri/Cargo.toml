@@ -100,6 +100,9 @@ windows = { version = "0.58", features = [
 ] }
 screenshots = "0.8"
 
+[features]
+frame-contract-tests = []
+
 [dev-dependencies]
 tempfile = "3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

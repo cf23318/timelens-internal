@@ -6,10 +6,11 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "P0 initial schema",
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "P0 initial schema",
+        sql: r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     description TEXT,
@@ -92,7 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_switches_ts ON app_switches(timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_switches_from_app ON app_switches(from_app);
 CREATE INDEX IF NOT EXISTS idx_switches_to_app ON app_switches(to_app);
 "#,
-},
+    },
     Migration {
         version: 2,
         description: "Phase 2: missing P0 tables + daily_analysis + daily_reports",
@@ -362,6 +363,21 @@ CREATE TABLE IF NOT EXISTS custom_intents (
 );
 "#,
     },
+    Migration {
+        version: 9,
+        description: "Internal raw-frame upload outbox; no historical auto-enrollment",
+        sql: r#"
+CREATE TABLE frame_upload_outbox (
+ snapshot_id TEXT PRIMARY KEY REFERENCES snapshots(id), task_id TEXT NOT NULL,
+ display_id INTEGER NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+ destination TEXT, survey_id TEXT, device_id TEXT,
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','verified','blocked')),
+ attempts INTEGER NOT NULL DEFAULT 0, next_retry_ms INTEGER NOT NULL DEFAULT 0,
+ receipt_json TEXT, last_error TEXT
+);
+CREATE INDEX frame_upload_pending ON frame_upload_outbox(task_id,status,next_retry_ms);
+"#,
+    },
 ];
 
 fn current_version(conn: &Connection) -> rusqlite::Result<i32> {
@@ -406,6 +422,26 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
+    fn version_eight_images_are_preserved_and_never_auto_enrolled() {
+        let mut c = Connection::open_in_memory().unwrap();
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 8) {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c.execute_batch("INSERT INTO schema_migrations VALUES(8,'fixture',0); INSERT INTO window_sessions(id,app_name,window_title,start_ms,end_ms,duration_ms,is_active) VALUES('s','fixture','synthetic',0,1,1,0); INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES('legacy','s','fixture.webp',1,10,'poll');").unwrap();
+        run_migrations(&mut c).unwrap();
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM frame_upload_outbox", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
     fn migrations_run_twice_idempotent() {
         let mut c = Connection::open_in_memory().unwrap();
         run_migrations(&mut c).unwrap();
@@ -417,7 +453,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 8);
+        assert_eq!(v, 9);
         let tables: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='daily_analysis'",

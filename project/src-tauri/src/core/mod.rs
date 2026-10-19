@@ -12,7 +12,9 @@ pub mod ocr;
 pub mod privacy;
 pub mod replay;
 pub mod settings;
-pub mod transfer;
+pub mod transfer; // Legacy encrypted bundle reader; new tasks use frame_upload.
+pub mod frame_upload;
+pub mod recovery;
 pub mod writer;
 
 pub mod acquisition;

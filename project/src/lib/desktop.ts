@@ -14,8 +14,8 @@ export function duration(ms: number, english = false): string {
 export function taskLabel(status: TaskProgress["status"], english = false): string {
   const labels = {
     ready: ["待开始", "Ready"], recording: ["采集中", "Recording"], paused: ["已暂停", "Paused"],
-    completed: ["已结束 · 待回收", "Ended · Pending recovery"], uploading: ["回收处理中", "Recovery in progress"],
-    uploaded: ["上传与清理完成", "Upload and cleanup complete"],
+    completed: ["已结束 · 待上传", "Ended · Pending upload"], uploading: ["逐张上传中", "Uploading frames"],
+    uploaded: ["队列截图已上传 · 本地保留", "Queued images uploaded · Local data retained"],
   };
   return labels[status]?.[english ? 1 : 0] ?? (english ? "Unknown status" : "状态未知");
 }
@@ -34,12 +34,14 @@ export function captureLabel(code: string, english = false): string {
     duplicate: ["画面相近，已去重", "Similar frame skipped"],
     capture_error: ["截图失败，请检查系统权限", "Screenshot failed; check permissions"],
     save_error: ["截图保存失败，请查看任务错误", "Screenshot could not be saved"],
+    saved: ["截图已保存并入队", "Screenshot committed and queued"],
     queued: ["截图已进入保存队列", "Screenshot queued for saving"],
   };
   return labels[code]?.[english ? 1 : 0] ?? (english ? "Waiting for the next screenshot" : "等待下一次截图尝试");
 }
 export function missingLabel(code: string, english = false): string {
   const labels: Record<string, [string, string]> = {
+    survey: ["调研编号", "Survey ID"], device: ["设备编号", "Device ID"],
     server: ["上传地址", "Upload endpoint"], key: ["加密公钥", "Encryption public key"],
     domestic: ["国内服务器确认", "Domestic server confirmation"], credential: ["管理员上传凭证", "Administrator upload credential"],
   };
