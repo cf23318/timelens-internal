@@ -19,6 +19,7 @@ type SystemPermissionPanelProps = {
   onPermissionsChange?: (p: PermissionStatus) => void;
   /** macOS 重装/TCC 排障长文案；会话页等场景可关 */
   showMacosPermissionHelp?: boolean;
+  showNotifications?: boolean;
 };
 
 /**
@@ -30,6 +31,7 @@ export function SystemPermissionPanel({
   permissions: controlled,
   onPermissionsChange,
   showMacosPermissionHelp = true,
+  showNotifications = false,
 }: SystemPermissionPanelProps) {
   const { t } = useTranslation();
   const [local, setLocal] = useState<PermissionStatus | null>(null);
@@ -83,7 +85,7 @@ export function SystemPermissionPanel({
           >
             {badges.screen}
           </span>
-          <span
+          {showNotifications && <span
             className={`rounded px-2 py-0.5 ${
               permissions.notificationListenerGranted
                 ? "bg-[var(--tl-perm-ok-bg)] text-[var(--tl-perm-ok-text)]"
@@ -91,7 +93,7 @@ export function SystemPermissionPanel({
             }`}
           >
             {badges.notifications}
-          </span>
+          </span>}
         </div>
       )}
       {showActions && (
@@ -138,7 +140,7 @@ export function SystemPermissionPanel({
               </button>
             </>
           )}
-          {permissions && !permissions.notificationListenerGranted && (
+          {showNotifications && permissions && !permissions.notificationListenerGranted && (
             <button
               type="button"
               className="rounded border border-[var(--tl-perm-action-border)] bg-[var(--tl-error-bg)]/50 px-3 py-1.5 text-[var(--tl-perm-action-text)]"

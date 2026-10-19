@@ -1,6 +1,6 @@
 //! OpenAI 兼容 Chat Completions：仅消费聚合 JSON，不接触 raw_events。
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -37,10 +37,7 @@ pub fn prompt_hash_hex() -> String {
 /// Send a minimal request to verify connectivity. Returns latency in milliseconds on success.
 pub fn test_connection(base_url: &str, api_key: &str, model: &str) -> Result<u64, String> {
     let url = normalize_chat_url(base_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::core::internal::external_ai_client()?;
 
     let body = json!({
         "model": model,
@@ -78,14 +75,17 @@ pub fn complete_narrative(
     lang: &str,
 ) -> Result<String, String> {
     let is_en = lang == "en";
-    let system_prompt = if is_en { SYSTEM_PROMPT_EN } else { SYSTEM_PROMPT_ZH };
+    let system_prompt = if is_en {
+        SYSTEM_PROMPT_EN
+    } else {
+        SYSTEM_PROMPT_ZH
+    };
 
     let date = analysis_json
         .get("analysis_date")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let json_pretty =
-        serde_json::to_string_pretty(analysis_json).map_err(|e| e.to_string())?;
+    let json_pretty = serde_json::to_string_pretty(analysis_json).map_err(|e| e.to_string())?;
     let user = if is_en {
         format!(
             "Below is the aggregated data for analysis_date={date} (JSON). Please generate the \"AI Recap\" body (Markdown, may be multiple paragraphs).\n\n```json\n{json_pretty}\n```"
@@ -97,10 +97,7 @@ pub fn complete_narrative(
     };
 
     let url = normalize_chat_url(base_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::core::internal::external_ai_client()?;
 
     let body = json!({
         "model": model,
@@ -122,10 +119,7 @@ pub fn complete_narrative(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        return Err(format!(
-            "模型 API 错误 ({status}): {}",
-            truncate_err(&text)
-        ));
+        return Err(format!("模型 API 错误 ({status}): {}", truncate_err(&text)));
     }
 
     let v: Value = resp.json().map_err(|e| e.to_string())?;
@@ -162,8 +156,7 @@ pub fn complete_weekly_narrative(
         .get("week_start")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let json_pretty =
-        serde_json::to_string_pretty(analysis_json).map_err(|e| e.to_string())?;
+    let json_pretty = serde_json::to_string_pretty(analysis_json).map_err(|e| e.to_string())?;
     let user = if is_en {
         format!(
             "Below is the weekly aggregated data for week_start={week_start} (JSON). Please generate the \"AI Weekly Recap\" body (Markdown, may be multiple paragraphs).\n\n```json\n{json_pretty}\n```"
@@ -175,10 +168,7 @@ pub fn complete_weekly_narrative(
     };
 
     let url = normalize_chat_url(base_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::core::internal::external_ai_client()?;
 
     let body = json!({
         "model": model,
@@ -200,10 +190,7 @@ pub fn complete_weekly_narrative(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        return Err(format!(
-            "模型 API 错误 ({status}): {}",
-            truncate_err(&text)
-        ));
+        return Err(format!("模型 API 错误 ({status}): {}", truncate_err(&text)));
     }
 
     let v: Value = resp.json().map_err(|e| e.to_string())?;

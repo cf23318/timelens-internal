@@ -22,6 +22,7 @@ use super::engine::{fts_normalize, ocr_image_file};
 
 #[derive(Debug, Clone)]
 pub struct OcrJob {
+    pub epoch: u64,
     pub snapshot_id: String,
     pub session_id: String,
     pub file_path: String,
@@ -42,12 +43,16 @@ pub fn spawn_ocr_worker(
     ocr_last_success_ms: Arc<AtomicI64>,
     ocr_last_error: Arc<Mutex<Option<String>>>,
     ocr_pending: Arc<AtomicUsize>,
+    control: Arc<crate::core::internal::InternalControl>,
 ) {
     thread::spawn(move || {
         let mut last_by_session: HashMap<String, i64> = HashMap::new();
         let mut last_phash: HashMap<String, String> = HashMap::new();
         while let Ok(job) = rx.recv() {
             ocr_pending.fetch_sub(1, Ordering::Relaxed);
+            if !control.is_current(job.epoch) {
+                continue;
+            }
             if !ocr_enabled.load(Ordering::Relaxed) {
                 continue;
             }
@@ -84,6 +89,9 @@ pub fn spawn_ocr_worker(
             }
             let path = Path::new(&job.file_path);
             if !path.exists() {
+                let Some(_active) = control.active(job.epoch) else {
+                    continue;
+                };
                 let merge = merge_session_summary(
                     &read_conn,
                     &job.session_id,
@@ -91,22 +99,26 @@ pub fn spawn_ocr_worker(
                     None,
                     Some("截图文件缺失或已清理"),
                 );
-                send_row(
-                    &writer,
-                    fail_row(
-                        &job,
-                        "文件不存在或已清理",
-                        now,
-                        merge,
-                    ),
-                );
+                send_row(&writer, fail_row(&job, "文件不存在或已清理", now, merge));
                 continue;
             }
             let pipeline_cfg = {
                 let g = read_conn.lock();
                 get_ocr_pipeline_config(&g)
             };
-            match ocr_image_file(path, &pipeline_cfg) {
+            let outcome = {
+                let Some(_job) = control.begin_native(job.epoch) else {
+                    continue;
+                };
+                ocr_image_file(path, &pipeline_cfg, &control.ocr_temp_dir())
+            };
+            let Some(_active) = control.active(job.epoch) else {
+                continue;
+            };
+            if !ocr_enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            match outcome {
                 Ok(outcome) => {
                     let text = outcome.text;
                     let summary = outcome.summary;

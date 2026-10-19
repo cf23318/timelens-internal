@@ -13,6 +13,8 @@ const BATCH_MAX: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct WriterMetrics {
+    pub last_error: parking_lot::Mutex<Option<String>>,
+    error_marker: parking_lot::Mutex<Option<std::path::PathBuf>>,
     pub total_batches: AtomicU64,
     pub total_events: AtomicU64,
     pub batch_latency_sum_ms: AtomicU64,
@@ -21,6 +23,18 @@ pub struct WriterMetrics {
 }
 
 impl WriterMetrics {
+    fn record_error(&self, message: String) {
+        let mut error = self.last_error.lock();
+        if error.is_some() {
+            return;
+        }
+        *error = Some(message.clone());
+        if let Some(path) = self.error_marker.lock().as_ref() {
+            if crate::core::internal::write_json_atomic(path, &message).is_err() {
+                log::error!("无法持久保存数据库错误标记；任务保留未完成落盘状态");
+            }
+        }
+    }
     pub fn snapshot(&self, pending_estimate: u32) -> crate::core::models::WriterStats {
         let batches = self.total_batches.load(AtomicOrdering::Relaxed);
         let events = self.total_events.load(AtomicOrdering::Relaxed);
@@ -61,7 +75,7 @@ fn event_sort_key(e: &WriteEvent) -> u8 {
         WriteEvent::NudgeLog(_) => 8,
         WriteEvent::Retention { .. } => 9,
         WriteEvent::WalCheckpoint => 10,
-        WriteEvent::Shutdown => 0,
+        WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) => 0,
     }
 }
 
@@ -72,19 +86,61 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub fn check_health(&self) -> Result<(), String> {
+        self.metrics.last_error.lock().clone().map_or(Ok(()), Err)
+    }
+    pub fn erase_collected_data(&self) -> Result<(), String> {
+        self.check_health()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send_timeout(
+                WriteEvent::EraseCollectedData(tx),
+                std::time::Duration::from_secs(5),
+            )
+            .map_err(|_| "数据库写入队列不可用")?;
+        rx.recv_timeout(std::time::Duration::from_secs(120))
+            .map_err(|_| "等待采集数据清理超时")?
+    }
+    pub fn flush(&self) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send_timeout(WriteEvent::Flush(tx), std::time::Duration::from_secs(5))
+            .map_err(|_| "数据库写入队列不可用")?;
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|_| "等待数据库写入完成超时")?
+    }
     pub fn try_send(&self, ev: WriteEvent) -> Result<(), WriteEvent> {
         match self.tx.try_send(ev) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(ev)) => {
+                self.metrics
+                    .record_error("数据库队列已满，存在未写入的数据；已禁止自动清理".into());
                 warn!("writer queue full, dropping event");
                 Err(ev)
             }
-            Err(TrySendError::Disconnected(ev)) => Err(ev),
+            Err(TrySendError::Disconnected(ev)) => {
+                self.metrics
+                    .record_error("数据库写入线程已中断，已禁止自动清理".into());
+                Err(ev)
+            }
         }
     }
 }
 
 pub fn spawn_writer_thread(mut conn: Connection, metrics: Arc<WriterMetrics>) -> WriterHandle {
+    let marker = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::path::Path::new(p).parent())
+        .map(|p| p.join("integrity-error.json"));
+    if let Some(path) = marker.as_ref().filter(|p| p.exists()) {
+        let message = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok())
+            .unwrap_or_else(|| "已有数据库完整性错误标记，请人工审核".into());
+        *metrics.last_error.lock() = Some(message);
+    }
+    *metrics.error_marker.lock() = marker;
     let (tx, rx) = bounded(QUEUE_CAP);
     let metrics_thread = metrics.clone();
     std::thread::spawn(move || writer_loop(&mut conn, rx, metrics_thread));
@@ -101,11 +157,25 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             let _ = super::storage::db::wal_checkpoint(conn);
             break;
         }
+        if let WriteEvent::Flush(done) = first {
+            let _ = done.send(metrics.last_error.lock().clone().map_or(Ok(()), Err));
+            continue;
+        }
+        if let WriteEvent::EraseCollectedData(done) = first {
+            let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
+            let _ = done.send(health.and_then(|_| erase_data(conn)));
+            continue;
+        }
         let mut batch = vec![first];
         while batch.len() < BATCH_MAX {
             match rx.try_recv() {
                 Ok(e) => {
-                    if matches!(e, WriteEvent::Shutdown) {
+                    if matches!(
+                        e,
+                        WriteEvent::Shutdown
+                            | WriteEvent::Flush(_)
+                            | WriteEvent::EraseCollectedData(_)
+                    ) {
                         batch.push(e);
                         break;
                     }
@@ -115,11 +185,33 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             }
         }
         let has_shutdown = batch.iter().any(|e| matches!(e, WriteEvent::Shutdown));
+        let mut flushes = Vec::new();
+        let mut erasures = Vec::new();
+        batch.retain(|e| match e {
+            WriteEvent::Flush(done) => {
+                flushes.push(done.clone());
+                false
+            }
+            WriteEvent::EraseCollectedData(done) => {
+                erasures.push(done.clone());
+                false
+            }
+            _ => true,
+        });
         batch.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
         let started = Instant::now();
         let n = batch.len() as u64;
-        if let Err(e) = apply_batch(conn, &batch) {
+        let result = apply_batch(conn, &batch).map_err(|e| e.to_string());
+        if let Err(ref e) = result {
             error!("writer batch failed: {e}");
+            metrics.record_error(format!("数据库写入失败，已禁止自动清理：{e}"));
+        }
+        let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
+        for done in flushes {
+            let _ = done.send(health.clone());
+        }
+        for done in erasures {
+            let _ = done.send(health.clone().and_then(|_| erase_data(conn)));
         }
         let ms = started.elapsed().as_millis() as u64;
         metrics.total_batches.fetch_add(1, AtomicOrdering::Relaxed);
@@ -136,6 +228,40 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             break;
         }
     }
+}
+
+pub(crate) fn erase_data(conn: &mut Connection) -> Result<(), String> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA secure_delete=ON;")
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let tables = {
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations' AND name NOT LIKE 'snapshot_ocr_fts_%'").map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?
+        };
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for table in tables {
+            tx.execute(
+                &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
+        let busy: i32 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if busy != 0 {
+            return Err("数据库仍被占用，清理需要重试".into());
+        }
+        Ok(())
+    })();
+    let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    result
 }
 
 fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<()> {
@@ -462,7 +588,7 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                     )?;
                 }
             },
-            WriteEvent::Shutdown => {}
+            WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) => {}
         }
     }
     tx.commit()?;
@@ -503,7 +629,11 @@ mod tests {
     #[test]
     fn apply_batch_raw_inserts_row_and_app_meta() {
         let mut c = conn_with_schema();
-        apply_batch(&mut c, &[WriteEvent::RawEvent(sample_raw("r1", 1_700_000_000_000))]).unwrap();
+        apply_batch(
+            &mut c,
+            &[WriteEvent::RawEvent(sample_raw("r1", 1_700_000_000_000))],
+        )
+        .unwrap();
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
             .unwrap();
@@ -646,5 +776,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn flush_waits_for_commit_and_erasure_cleans_rows_and_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.sqlite");
+        let conn = crate::core::storage::db::open_write(&path).unwrap();
+        conn.execute("INSERT INTO snapshot_ocr_fts(snapshot_id,session_id,captured_at_ms,body) VALUES('a','s',1,'private-fixture')", []).unwrap();
+        let h = spawn_writer_thread(conn, Arc::new(WriterMetrics::default()));
+        h.try_send(WriteEvent::RawEvent(sample_raw(
+            "flush-test",
+            2_000_000_000_000,
+        )))
+        .unwrap();
+        h.flush().unwrap();
+        let read = Connection::open(&path).unwrap();
+        assert_eq!(
+            read.query_row("SELECT COUNT(*) FROM raw_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        h.erase_collected_data().unwrap();
+        for table in ["raw_events", "app_meta", "snapshot_ocr_fts", "settings"] {
+            assert_eq!(
+                read.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(
+            read.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        h.try_send(WriteEvent::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn prior_write_failure_stays_visible_to_later_flush_and_prevents_erasure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.sqlite");
+        let conn = crate::core::storage::db::open_write(&path).unwrap();
+        let h = spawn_writer_thread(conn, Arc::new(WriterMetrics::default()));
+        h.try_send(WriteEvent::Snapshot(crate::core::models::SnapshotRow {
+            id: "bad".into(),
+            session_id: "nonexistent".into(),
+            file_path: "fixture.webp".into(),
+            captured_at_ms: 1,
+            file_size_bytes: 1,
+            trigger_type: "poll".into(),
+            resolution: None,
+            format: "webp".into(),
+            perceptual_hash: None,
+        }))
+        .unwrap();
+        assert!(h.flush().is_err());
+        h.try_send(WriteEvent::RawEvent(sample_raw("later", 2_000_000_000_000)))
+            .unwrap();
+        assert!(h.flush().is_err());
+        assert!(h.erase_collected_data().is_err());
+        let read = Connection::open(&path).unwrap();
+        assert_eq!(
+            read.query_row("SELECT COUNT(*) FROM raw_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        h.try_send(WriteEvent::Shutdown).unwrap();
+        let restored = spawn_writer_thread(
+            crate::core::storage::db::open_write(&path).unwrap(),
+            Arc::new(WriterMetrics::default()),
+        );
+        assert!(restored.flush().is_err());
+        assert!(restored.erase_collected_data().is_err());
+        restored.try_send(WriteEvent::Shutdown).unwrap();
     }
 }

@@ -332,6 +332,8 @@ pub enum WriteEvent {
         snapshot_cutoff_ms: i64,
     },
     WalCheckpoint,
+    Flush(std::sync::mpsc::Sender<Result<(), String>>),
+    EraseCollectedData(std::sync::mpsc::Sender<Result<(), String>>),
     Shutdown,
 }
 
@@ -340,6 +342,11 @@ pub struct CaptureSignal {
     pub priority: CapturePriority,
     pub session_id: Option<String>,
     pub trigger_type: String,
+    pub epoch: u64,
+    pub expected_app: String,
+    pub expected_title: String,
+    pub expected_bundle: Option<String>,
+    pub expected_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +358,8 @@ pub enum CapturePriority {
 #[derive(Debug, Clone)]
 pub enum AggregationCmd {
     Shutdown,
+    Barrier(std::sync::mpsc::Sender<()>),
+    SessionReady(std::sync::mpsc::Sender<Option<String>>),
     /// New foreground state after privacy filter (each tick when not AFK).
     Tick {
         timestamp_ms: i64,

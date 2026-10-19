@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TimeLens",
+  "productName": "TimeLens Internal",
   "version": "0.17.5",
-  "identifier": "com.timelens.desktop",
+  "identifier": "com.timelens.internal",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -24,10 +24,10 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' tauri: asset: timelens: http://asset.localhost http://timelens.localhost; connect-src ipc: http://ipc.localhost; img-src 'self' data: blob: asset: timelens: http://asset.localhost http://timelens.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-src 'none'; object-src 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/.timelens/**", "$USERPROFILE/.timelens/**"]
+        "scope": ["$HOME/.timelens-internal/**", "$USERPROFILE/.timelens-internal/**"]
       }
     }
   },
@@ -44,7 +44,7 @@
     "macOS": {
       "minimumSystemVersion": "12.0",
       "entitlements": "./Entitlements.plist",
-      "signingIdentity": "TimeLens Developer"
+      "signingIdentity": null
     }
   }
 }

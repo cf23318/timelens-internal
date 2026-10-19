@@ -22,10 +22,31 @@ use crate::core::models::{
 use crate::core::privacy;
 use crate::core::settings::app_name_blacklisted;
 use crate::core::writer::WriterHandle;
+use crate::core::{browser, internal::InternalControl};
 
 const AFK_SECS: f64 = 300.0;
 const POLL: Duration = Duration::from_secs(2);
-const LOW_CAPTURE_EVERY: Duration = Duration::from_secs(120);
+
+fn sampling_interrupted(monotonic_gap: Duration, previous_ms: i64, now_ms: i64) -> bool {
+    let wall_gap = now_ms.saturating_sub(previous_ms);
+    monotonic_gap > Duration::from_secs(5) || wall_gap > 5000 || wall_gap < 0
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    #[test]
+    fn detects_sleep_even_if_monotonic_clock_stops_and_handles_clock_changes() {
+        assert!(!sampling_interrupted(Duration::from_secs(2), 1000, 3000));
+        assert!(sampling_interrupted(
+            Duration::from_secs(2),
+            1000,
+            28_801_000
+        ));
+        assert!(sampling_interrupted(Duration::from_secs(6), 1000, 3000));
+        assert!(sampling_interrupted(Duration::from_secs(2), 3000, 1000));
+    }
+}
 
 fn compute_hash(app: &str, bundle: &Option<String>, title: &str, fs: bool) -> i64 {
     let mut h = Crc32::new();
@@ -40,6 +61,12 @@ fn compute_hash(app: &str, bundle: &Option<String>, title: &str, fs: bool) -> i6
     h.finish() as u32 as i64
 }
 
+fn confirmed_session(tx: &Sender<AggregationCmd>) -> Option<String> {
+    let (done, rx) = std::sync::mpsc::channel();
+    tx.send(AggregationCmd::SessionReady(done)).ok()?;
+    rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_tracker_thread(
     app: AppHandle,
@@ -52,6 +79,7 @@ pub fn spawn_tracker_thread(
     current_session: Arc<RwLock<Option<String>>>,
     notification_heuristic_enabled: Arc<AtomicBool>,
     app_blacklist: Arc<RwLock<Vec<String>>>,
+    control: Arc<InternalControl>,
 ) {
     thread::spawn(move || {
         let mut last_hash: Option<i64> = None;
@@ -62,13 +90,52 @@ pub fn spawn_tracker_thread(
         let mut local_afk = false;
         let mut in_blackout = false;
         let mut last_low_cap = std::time::Instant::now()
-            .checked_sub(LOW_CAPTURE_EVERY)
+            .checked_sub(Duration::from_secs(15))
             .unwrap_or_else(std::time::Instant::now);
+        let mut last_epoch = u64::MAX;
+        let mut last_url: Option<String> = None;
+        let mut last_poll = std::time::Instant::now();
+        let mut last_poll_wall = Utc::now().timestamp_millis();
 
         while running.load(Ordering::Relaxed) {
             thread::sleep(POLL);
+            let previous_poll_wall = last_poll_wall;
+            let now_ms = Utc::now().timestamp_millis();
+            let interrupted = sampling_interrupted(last_poll.elapsed(), previous_poll_wall, now_ms);
+            last_poll = std::time::Instant::now();
+            last_poll_wall = now_ms;
             if !tracking.load(Ordering::Relaxed) {
                 continue;
+            }
+            let epoch = control.epoch.load(Ordering::SeqCst);
+            let Some(_active) = control.active(epoch) else {
+                continue;
+            };
+            if epoch != last_epoch {
+                last_epoch = epoch;
+                last_hash = None;
+                last_app.clear();
+                last_bundle = None;
+                last_title.clear();
+                last_url = None;
+                last_session_start_ms = 0;
+                local_afk = false;
+                in_blackout = false;
+                is_afk.store(false, Ordering::Relaxed);
+            }
+            if interrupted {
+                // Suspend or a stalled native call must not turn an unobserved gap into app time.
+                let _ = agg_tx.send(AggregationCmd::EnterRecordingBlackout {
+                    timestamp_ms: previous_poll_wall,
+                });
+                last_hash = None;
+                last_app.clear();
+                last_bundle = None;
+                last_title.clear();
+                last_url = None;
+                last_session_start_ms = 0;
+                local_afk = false;
+                in_blackout = false;
             }
             let idle = acquisition::idle_seconds();
             if idle >= AFK_SECS {
@@ -121,8 +188,12 @@ pub fn spawn_tracker_thread(
                     local_afk = false;
                     is_afk.store(false, Ordering::Relaxed);
                     let ts = Utc::now().timestamp_millis();
-                    let _ = agg_tx.send(AggregationCmd::EnterRecordingBlackout { timestamp_ms: ts });
-                    let _ = app.emit("afk_state_changed", json!({ "isAfk": false, "idleSeconds": 0.0 }));
+                    let _ =
+                        agg_tx.send(AggregationCmd::EnterRecordingBlackout { timestamp_ms: ts });
+                    let _ = app.emit(
+                        "afk_state_changed",
+                        json!({ "isAfk": false, "idleSeconds": 0.0 }),
+                    );
                     in_blackout = true;
                     last_hash = None;
                     last_app.clear();
@@ -132,12 +203,26 @@ pub fn spawn_tracker_thread(
                     continue;
                 }
                 in_blackout = false;
-                let (eu, ep) = privacy::extract_url_and_path(&front.window_title);
+                let (title_url, ep) = privacy::extract_url_and_path(&front.window_title);
+                let eu = if browser::is_browser(&front) {
+                    browser::current_url(&front)
+                } else {
+                    title_url.and_then(|s| browser::sanitized_url(&s))
+                };
+                let title = if front
+                    .bundle_id
+                    .as_deref()
+                    .is_some_and(privacy::should_redact_bundle)
+                {
+                    "[redacted]".into()
+                } else {
+                    privacy::redact_title(&front.window_title)
+                };
                 let _ = agg_tx.send(AggregationCmd::ExitAfk {
                     timestamp_ms: ts,
                     app_name: front.app_name.clone(),
                     bundle_id: front.bundle_id.clone(),
-                    window_title: front.window_title.clone(),
+                    window_title: title.clone(),
                     extracted_url: eu.clone(),
                     extracted_file_path: ep.clone(),
                     state_hash: compute_hash(
@@ -160,7 +245,7 @@ pub fn spawn_tracker_thread(
                     app_name: front.app_name.clone(),
                     bundle_id: front.bundle_id.clone(),
                     window_title: privacy::redact_title(&front.window_title),
-                    extracted_url: eu,
+                    extracted_url: eu.clone(),
                     extracted_file_path: ep,
                     idle_seconds: idle,
                     is_fullscreen: if front.is_fullscreen { 1 } else { 0 },
@@ -175,8 +260,13 @@ pub fn spawn_tracker_thread(
                 last_title = front.window_title.clone();
                 last_session_start_ms = ts;
                 let _ = capture_tx.try_send(CaptureSignal {
+                    epoch,
+                    expected_app: front.app_name.clone(),
+                    expected_title: front.window_title.clone(),
+                    expected_bundle: front.bundle_id.clone(),
+                    expected_url: eu.clone(),
                     priority: CapturePriority::High,
-                    session_id: current_session.read().ok().and_then(|g| g.clone()),
+                    session_id: confirmed_session(&agg_tx),
                     trigger_type: "afk_exit".into(),
                 });
                 continue;
@@ -219,25 +309,50 @@ pub fn spawn_tracker_thread(
                 }
             }
             title = privacy::redact_title(&title);
-            let (ex_url, ex_path) = privacy::extract_url_and_path(&front.window_title);
-            let ex_path = ex_path.map(|p| privacy::redact_path(&p));
-            let hash = compute_hash(&front.app_name, &front.bundle_id, &title, front.is_fullscreen);
-            let ts = Utc::now().timestamp_millis();
-            let trigger = match last_hash {
-                None => "window_change",
-                Some(lh) if lh != hash => {
-                    if front.app_name != last_app
-                        || front.bundle_id.as_ref() != last_bundle.as_ref()
-                    {
-                        "window_change"
-                    } else {
-                        "title_change"
-                    }
-                }
-                Some(_) => "poll",
+            let (title_url, ex_path) = privacy::extract_url_and_path(&front.window_title);
+            let ex_url = if browser::is_browser(&front) {
+                browser::current_url(&front)
+            } else {
+                title_url.and_then(|s| browser::sanitized_url(&s))
             };
+            // Browser provider calls can take time; never associate an address with a different front app.
+            if !acquisition::sample_front_window().is_ok_and(|now| {
+                now.app_name == front.app_name
+                    && now.bundle_id == front.bundle_id
+                    && now.window_title == front.window_title
+            }) {
+                continue;
+            }
+            let ex_path = ex_path.map(|p| privacy::redact_path(&p));
+            let hash = compute_hash(
+                &front.app_name,
+                &front.bundle_id,
+                &title,
+                front.is_fullscreen,
+            );
+            let ts = Utc::now().timestamp_millis();
+            let trigger = if last_url != ex_url {
+                "window_change"
+            } else {
+                match last_hash {
+                    None => "window_change",
+                    Some(lh) if lh != hash => {
+                        if front.app_name != last_app
+                            || front.bundle_id.as_ref() != last_bundle.as_ref()
+                        {
+                            "window_change"
+                        } else {
+                            "window_change"
+                        }
+                    }
+                    Some(_) => "poll",
+                }
+            };
+            last_url = ex_url.clone();
 
-            if trigger == "window_change" {
+            if trigger == "window_change"
+                && (front.app_name != last_app || front.bundle_id != last_bundle)
+            {
                 let dur = (ts - last_session_start_ms).max(0);
                 let short_bounce = notification_heuristic_enabled.load(Ordering::Relaxed)
                     && !last_app.is_empty()
@@ -304,9 +419,7 @@ pub fn spawn_tracker_thread(
                 state_hash: hash,
             });
 
-            if trigger == "window_change" {
-                thread::sleep(Duration::from_millis(50));
-            }
+            let confirmed_sid = confirmed_session(&agg_tx);
 
             let id = Uuid::new_v4().to_string();
             let _ = writer.try_send(WriteEvent::RawEvent(RawEventRow {
@@ -315,7 +428,7 @@ pub fn spawn_tracker_thread(
                 app_name: front.app_name.clone(),
                 bundle_id: front.bundle_id.clone(),
                 window_title: title.clone(),
-                extracted_url: ex_url,
+                extracted_url: ex_url.clone(),
                 extracted_file_path: ex_path,
                 idle_seconds: idle,
                 is_fullscreen: if front.is_fullscreen { 1 } else { 0 },
@@ -330,16 +443,28 @@ pub fn spawn_tracker_thread(
             }
 
             if trigger == "window_change" || trigger == "title_change" {
-                let sid = current_session.read().ok().and_then(|g| g.clone());
+                let sid = confirmed_sid.clone();
                 let _ = capture_tx.try_send(CaptureSignal {
+                    epoch,
+                    expected_app: front.app_name.clone(),
+                    expected_title: front.window_title.clone(),
+                    expected_bundle: front.bundle_id.clone(),
+                    expected_url: ex_url.clone(),
                     priority: CapturePriority::High,
                     session_id: sid,
                     trigger_type: trigger.to_string(),
                 });
-            } else if last_low_cap.elapsed() >= LOW_CAPTURE_EVERY {
+            } else if last_low_cap.elapsed()
+                >= Duration::from_secs(control.config.read().capture_interval_secs)
+            {
                 last_low_cap = std::time::Instant::now();
-                let sid = current_session.read().ok().and_then(|g| g.clone());
+                let sid = confirmed_sid;
                 let _ = capture_tx.try_send(CaptureSignal {
+                    epoch,
+                    expected_app: front.app_name.clone(),
+                    expected_title: front.window_title.clone(),
+                    expected_bundle: front.bundle_id.clone(),
+                    expected_url: ex_url.clone(),
                     priority: CapturePriority::Low,
                     session_id: sid,
                     trigger_type: "poll".into(),

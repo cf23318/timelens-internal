@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{Local, NaiveDate, Utc};
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{async_runtime, AppHandle, Emitter, State};
+use tauri::{async_runtime, AppHandle, State};
 use uuid::Uuid;
 
 use crate::analysis::ai_client;
@@ -46,17 +46,23 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 #[tauri::command]
-pub fn start_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.0.tracking.store(true, Ordering::Relaxed);
-    let _ = app.emit("tracking_state_changed", json!({ "isRunning": true }));
-    Ok(())
+pub async fn start_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::internal::start_collection(&app, &state)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn stop_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.0.tracking.store(false, Ordering::Relaxed);
-    let _ = app.emit("tracking_state_changed", json!({ "isRunning": false }));
-    Ok(())
+pub async fn stop_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::internal::pause_collection(&app, &state, false)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -65,45 +71,103 @@ pub fn is_tracking(state: State<'_, AppState>) -> bool {
 }
 
 #[tauri::command]
-pub fn restart_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
-    state.0.tracking.store(false, Ordering::Relaxed);
-    let _ = app.emit("tracking_state_changed", json!({ "isRunning": false }));
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    state.0.tracking.store(true, Ordering::Relaxed);
-    let _ = app.emit("tracking_state_changed", json!({ "isRunning": true }));
-    Ok(true)
+pub async fn restart_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::internal::pause_collection(&app, &state, false)?;
+        crate::core::internal::start_collection(&app, &state)?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn trigger_screenshot(state: State<'_, AppState>) -> Result<(), String> {
-    let sid = state
-        .0
-        .current_session
-        .read()
-        .map_err(|_| "lock")?
-        .clone();
-    let Some(sid) = sid else {
-        return Err(
-            "暂无活跃 Session：请先点击「开始采集」，并等待至少一次前台窗口采样（约 2s）后再试"
-                .into(),
-        );
-    };
-    state
-        .0
-        .capture_tx
-        .send(CaptureSignal {
-            priority: CapturePriority::High,
-            session_id: Some(sid),
-            trigger_type: "manual".into(),
-        })
-        .map_err(|_| "截图队列已满，请稍后重试".to_string())?;
-    Ok(())
+pub async fn trigger_screenshot(state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let epoch = state.0.internal.epoch.load(Ordering::SeqCst);
+        if !state.0.tracking.load(Ordering::SeqCst) {
+            return Err("当前未录制".into());
+        }
+        let front = acquisition::sample_front_window()?;
+        let sid = state.0.current_session.read().map_err(|_| "lock")?.clone();
+        let Some(sid) = sid else {
+            return Err(
+                "暂无活跃 Session：请先点击「开始采集」，并等待至少一次前台窗口采样（约 2s）后再试"
+                    .into(),
+            );
+        };
+        let expected_url = crate::core::browser::url_for_front(&front);
+        if !state.0.internal.is_current(epoch) {
+            return Err("录制状态已变化，请重试".into());
+        }
+        state
+            .0
+            .capture_tx
+            .try_send(CaptureSignal {
+                epoch,
+                expected_app: front.app_name.clone(),
+                expected_title: front.window_title.clone(),
+                expected_bundle: front.bundle_id.clone(),
+                expected_url,
+                priority: CapturePriority::High,
+                session_id: Some(sid),
+                trigger_type: "manual".into(),
+            })
+            .map_err(|_| "截图队列已满，请稍后重试".to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn get_internal_config(state: State<'_, AppState>) -> crate::core::internal::InternalConfig {
+    state.0.internal.config.read().clone()
+}
+
+#[tauri::command]
+pub async fn save_internal_config(
+    state: State<'_, AppState>,
+    config: crate::core::internal::InternalConfig,
+) -> Result<(), String> {
+    let control = state.0.internal.clone();
+    tauri::async_runtime::spawn_blocking(move || control.save_config(config))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn get_internal_progress(state: State<'_, AppState>) -> crate::core::internal::TaskProgress {
+    state.0.internal.progress.lock().clone()
+}
+
+#[tauri::command]
+pub async fn finish_internal_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::core::internal::pause_collection(&app, &state, true)?;
+        crate::core::transfer::begin_recovery(&app)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn retry_internal_upload(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::core::transfer::begin_recovery(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub fn check_permissions(state: State<'_, AppState>) -> Result<PermissionStatus, String> {
     let ax = acquisition::ax_trusted();
-    let sr = acquisition::screen_capture_refresh_access();
+    let sr = acquisition::screen_capture_granted();
     let nl = acquisition::notifications_listener_access_granted();
     state.0.screen_ok.store(sr, Ordering::Relaxed);
     Ok(PermissionStatus {
@@ -210,7 +274,8 @@ pub fn get_sessions(
         let rows = stmt
             .query_map(params![start, end, an], map_session)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     } else {
         let mut stmt = conn
             .prepare(
@@ -223,13 +288,12 @@ pub fn get_sessions(
         let rows = stmt
             .query_map(params![start, end], map_session)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 }
 
-fn map_session(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<WindowSession> {
+fn map_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<WindowSession> {
     Ok(WindowSession {
         id: r.get(0)?,
         start_ms: r.get(1)?,
@@ -273,7 +337,8 @@ pub fn get_session_snapshots(
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -281,9 +346,7 @@ pub fn get_activity_stats(
     state: State<'_, AppState>,
     date: Option<String>,
 ) -> Result<ActivityStats, String> {
-    let date_str = date.unwrap_or_else(|| {
-        Local::now().format("%Y-%m-%d").to_string()
-    });
+    let date_str = date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
     let (start, end) = local_day_bounds_ms(&date_str)?;
     let conn = state.0.read_conn.lock();
     let session_count: i64 = conn
@@ -341,7 +404,8 @@ pub fn get_all_app_meta(state: State<'_, AppState>) -> Result<Vec<AppMeta>, Stri
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -377,7 +441,8 @@ pub fn get_app_switches(
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -412,7 +477,8 @@ pub fn get_recent_app_switches(
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -480,7 +546,8 @@ pub fn get_raw_events_recent(
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -490,6 +557,9 @@ pub fn get_writer_stats(state: State<'_, AppState>) -> crate::core::models::Writ
 
 #[tauri::command]
 pub fn run_retention_cleanup(state: State<'_, AppState>) -> Result<(), String> {
+    if state.0.internal.progress.lock().status != crate::core::internal::TaskStatus::Uploaded {
+        return Err("内部任务数据须在上传确认后统一清理".into());
+    }
     let now = Utc::now().timestamp_millis();
     let raw_cut = now - 7_i64 * 24 * 3600 * 1000;
     let snap_cut = now - 3_i64 * 24 * 3600 * 1000;
@@ -514,6 +584,7 @@ pub fn get_language(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 pub fn set_language(state: State<'_, AppState>, lang: String) -> Result<(), String> {
+    let _configuration_guard = state.0.internal.configuration_write()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_language(&mut c, &lang).map_err(|e| e.to_string())
 }
@@ -535,53 +606,19 @@ pub struct UpdateCheckResult {
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
     let current = app.package_info().version.to_string();
-    let client = reqwest::Client::builder()
-        .user_agent(format!("TimeLens/{} update-checker", current))
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get("https://api.github.com/repos/gitxuzhefeng/timelines/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    // 404 = 还没有发布任何 Release，视为"已是最新"
-    if status.as_u16() == 404 {
-        return Ok(UpdateCheckResult {
-            has_update: false,
-            latest_version: current,
-            release_url: String::new(),
-            release_notes: String::new(),
-        });
-    }
-    if !status.is_success() {
-        return Err(format!("GitHub API 错误: {} {}", status.as_u16(),
-            status.canonical_reason().unwrap_or("")));
-    }
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let tag = json["tag_name"]
-        .as_str()
-        .unwrap_or("")
-        .trim_start_matches('v')
-        .to_string();
-    let release_url = json["html_url"].as_str().unwrap_or("").to_string();
-    let release_notes = json["body"].as_str().unwrap_or("").to_string();
-    let has_update = !tag.is_empty() && tag != current;
     Ok(UpdateCheckResult {
-        has_update,
-        latest_version: tag,
-        release_url,
-        release_notes,
+        has_update: false,
+        latest_version: current,
+        release_url: String::new(),
+        release_notes: "内部采集版已停用在线更新".into(),
     })
 }
 
 /// 用系统默认浏览器打开 URL（window.open 在 Tauri 2 中不会开系统浏览器）
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
-    open::that(url).map_err(|e| e.to_string())
+    let _ = url;
+    crate::core::internal::deny_external_action()
 }
 
 fn max_ts(conn: &rusqlite::Connection, sql: &str) -> Option<i64> {
@@ -752,9 +789,9 @@ fn build_daily_ocr_summaries_value(
 fn parse_ocr_search_keywords(q: &str) -> Result<Vec<String>, String> {
     const MAX_KW: usize = 8;
     let mut out: Vec<String> = Vec::new();
-    for part in q.split(|c: char| {
-        c.is_whitespace() || c == ',' || c == '，' || c == ';' || c == '；'
-    }) {
+    for part in
+        q.split(|c: char| c.is_whitespace() || c == ',' || c == '，' || c == ';' || c == '；')
+    {
         let t = part.trim();
         if t.is_empty() {
             continue;
@@ -820,6 +857,13 @@ pub fn set_engine_enabled(
     name: String,
     enabled: bool,
 ) -> Result<(), String> {
+    let _configuration_guard = state.0.internal.configuration_write()?;
+    if enabled
+        && (matches!(name.as_str(), "notifications" | "ambient")
+            || (name == "input" && cfg!(target_os = "windows")))
+    {
+        return Err("内部版已停用此采集项".into());
+    }
     let key = match name.as_str() {
         "input" => settings::key_engine_input(),
         "clipboard" => settings::key_engine_clipboard(),
@@ -876,8 +920,16 @@ pub async fn test_ai_connection(
         };
 
         match ai_client::test_connection(&base_url, &key, &model) {
-            Ok(ms) => TestAiConnectionResponse { ok: true, latency_ms: ms, error: None },
-            Err(e) => TestAiConnectionResponse { ok: false, latency_ms: 0, error: Some(e) },
+            Ok(ms) => TestAiConnectionResponse {
+                ok: true,
+                latency_ms: ms,
+                error: None,
+            },
+            Err(e) => TestAiConnectionResponse {
+                ok: false,
+                latency_ms: 0,
+                error: Some(e),
+            },
         }
     })
     .await
@@ -910,6 +962,7 @@ pub fn set_ai_privacy_acknowledged(
     state: State<'_, AppState>,
     acknowledged: bool,
 ) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_ai_privacy_acknowledged(&mut c, acknowledged).map_err(|e| e.to_string())?;
     Ok(())
@@ -922,6 +975,7 @@ pub fn set_ai_settings(
     model: Option<String>,
     api_key: Option<String>,
 ) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     if let Some(b) = base_url {
         settings::set_ai_base_url(&mut c, &b).map_err(|e| e.to_string())?;
@@ -937,6 +991,10 @@ pub fn set_ai_settings(
 
 #[tauri::command]
 pub fn set_ai_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
+    if enabled {
+        return Err("内部采集版已停用外部 AI".into());
+    }
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     if enabled && !settings::get_ai_privacy_acknowledged(&c) {
         return Err("请先阅读并确认隐私说明后再开启 AI".into());
@@ -953,6 +1011,7 @@ pub fn update_session_intent(
     session_id: String,
     intent: Option<String>,
 ) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     let (app_name, bundle_id): (String, Option<String>) = c
         .query_row(
@@ -995,7 +1054,9 @@ pub struct AppIntentAggregateDto {
 
 /// 列出所有出现过的 (app_name, bundle_id) 组合及会话数、解析到的 Intent。
 #[tauri::command]
-pub fn list_app_intent_aggregates(state: State<'_, AppState>) -> Result<Vec<AppIntentAggregateDto>, String> {
+pub fn list_app_intent_aggregates(
+    state: State<'_, AppState>,
+) -> Result<Vec<AppIntentAggregateDto>, String> {
     let g = state.0.read_conn.lock();
     let sql = "SELECT app_name, \
          CASE WHEN trim(coalesce(bundle_id,'')) = '' THEN NULL ELSE trim(bundle_id) END AS bid, \
@@ -1082,6 +1143,7 @@ pub fn set_intent_for_app_aggregate(
     bundle_id: Option<String>,
     intent: Option<String>,
 ) -> Result<i64, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     apply_intent_for_app_aggregate_conn(&mut c, &app_name, bundle_id.as_ref(), intent.as_ref())
 }
@@ -1100,6 +1162,7 @@ pub fn set_intent_for_app_aggregates_batch(
     state: State<'_, AppState>,
     items: Vec<AppIntentBatchItem>,
 ) -> Result<i64, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     let mut total: i64 = 0;
     for item in items {
@@ -1117,6 +1180,7 @@ pub fn set_intent_for_app_aggregates_batch(
 /// 将「尚无 Intent」的历史会话按当前映射规则（含内置字典）补齐。
 #[tauri::command]
 pub fn backfill_session_intents_from_mappings(state: State<'_, AppState>) -> Result<i64, String> {
+    crate::core::internal::deny_personal_action()?;
     let c = open_db_rw(&state.0.paths.db_path)?;
     let mut stmt = c
         .prepare(
@@ -1168,6 +1232,7 @@ pub fn get_app_blacklist(state: State<'_, AppState>) -> Result<Vec<String>, Stri
 /// 应用黑名单（按 `app_name` 精确匹配）：写入 DB 并同步内存，采集线程即时生效。
 #[tauri::command]
 pub fn set_app_blacklist(state: State<'_, AppState>, apps: Vec<String>) -> Result<(), String> {
+    let _configuration_guard = state.0.internal.configuration_write()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_app_blacklist(&mut c, &apps).map_err(|e| e.to_string())?;
     if let Ok(mut w) = state.0.app_blacklist.write() {
@@ -1177,7 +1242,11 @@ pub fn set_app_blacklist(state: State<'_, AppState>, apps: Vec<String>) -> Resul
 }
 
 #[tauri::command]
-pub async fn generate_daily_analysis(state: State<'_, AppState>, date: String) -> Result<String, String> {
+pub async fn generate_daily_analysis(
+    state: State<'_, AppState>,
+    date: String,
+) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
     async_runtime::spawn_blocking(move || {
         let mut c = open_db_rw(&state.0.paths.db_path)?;
@@ -1285,12 +1354,11 @@ pub async fn generate_daily_report(
     date: String,
     with_ai: bool,
 ) -> Result<DailyReportDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
-    async_runtime::spawn_blocking(move || {
-        generate_daily_report_sync(&state, date, with_ai)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    async_runtime::spawn_blocking(move || generate_daily_report_sync(&state, date, with_ai))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn generate_daily_report_sync(
@@ -1385,8 +1453,7 @@ fn generate_daily_report_sync(
         let mut payload: serde_json::Value =
             serde_json::to_value(&row).map_err(|e| e.to_string())?;
         if let Some(obj) = payload.as_object_mut() {
-            let ds: serde_json::Value =
-                serde_json::from_str(&data_sources).unwrap_or(json!({}));
+            let ds: serde_json::Value = serde_json::from_str(&data_sources).unwrap_or(json!({}));
             obj.insert("data_sources".to_string(), ds);
         }
 
@@ -1635,6 +1702,7 @@ pub fn export_external_ai_summary_bundle(
     slice: Option<String>,
     open_folder: Option<bool>,
 ) -> Result<ExternalAiExportResultDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let slice = slice.unwrap_or_else(|| "full_day".to_string());
     let lang = {
         let conn = state.0.read_conn.lock();
@@ -1642,7 +1710,8 @@ pub fn export_external_ai_summary_bundle(
         settings::get_language(&conn)
     };
 
-    let bundle = crate::analysis::agent_export::export_summary_bundle(&state, &date, &slice, &lang)?;
+    let bundle =
+        crate::analysis::agent_export::export_summary_bundle(&state, &date, &slice, &lang)?;
     if open_folder.unwrap_or(false) {
         let _ = open::that(&bundle.export_dir);
     }
@@ -1661,6 +1730,7 @@ pub fn send_to_external_ai_summary(
     provider_id: Option<String>,
     auto_paste: Option<bool>,
 ) -> Result<ExternalAiSendResultDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let slice = slice.unwrap_or_else(|| "full_day".to_string());
     let (lang, selected_provider_id) = {
         let conn = state.0.read_conn.lock();
@@ -1671,7 +1741,8 @@ pub fn send_to_external_ai_summary(
         (lang, selected)
     };
 
-    let bundle = crate::analysis::agent_export::export_summary_bundle(&state, &date, &slice, &lang)?;
+    let bundle =
+        crate::analysis::agent_export::export_summary_bundle(&state, &date, &slice, &lang)?;
     let clipboard_text = format!(
         "{}\n\n---\n\n{}",
         external_ai_prompt(&lang),
@@ -1718,6 +1789,7 @@ pub fn export_daily_report(
     date: String,
     report_type: Option<String>,
 ) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let t = report_type.unwrap_or_else(|| "fact_only".into());
     let conn = state.0.read_conn.lock();
     let content: String = conn
@@ -1749,10 +1821,8 @@ fn exports_subdir(state: &AppState, sub: &str) -> Result<std::path::PathBuf, Str
 }
 
 #[tauri::command]
-pub fn export_sessions_csv(
-    state: State<'_, AppState>,
-    date: String,
-) -> Result<String, String> {
+pub fn export_sessions_csv(state: State<'_, AppState>, date: String) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     use crate::core::time_range::local_day_bounds_ms;
     let (start_ms, end_ms) = local_day_bounds_ms(&date)?;
     let sessions: Vec<WindowSession> = {
@@ -1797,10 +1867,8 @@ pub fn export_sessions_csv(
 }
 
 #[tauri::command]
-pub fn export_daily_json(
-    state: State<'_, AppState>,
-    date: String,
-) -> Result<String, String> {
+pub fn export_daily_json(state: State<'_, AppState>, date: String) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let conn = state.0.read_conn.lock();
     let raw: String = conn
         .query_row(
@@ -1856,6 +1924,7 @@ pub fn export_daily_markdown(
     date: String,
     report_type: Option<String>,
 ) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let t = report_type.unwrap_or_else(|| "fact_only".into());
     let conn = state.0.read_conn.lock();
     let content_md: String = conn
@@ -1902,10 +1971,8 @@ pub fn export_daily_markdown(
 }
 
 #[tauri::command]
-pub fn export_daily_html(
-    state: State<'_, AppState>,
-    date: String,
-) -> Result<String, String> {
+pub fn export_daily_html(state: State<'_, AppState>, date: String) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let conn = state.0.read_conn.lock();
     let content_md: String = conn
         .query_row(
@@ -1943,6 +2010,7 @@ pub fn export_weekly_markdown(
     state: State<'_, AppState>,
     week_start: String,
 ) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let conn = state.0.read_conn.lock();
     // 查询 weekly_reports 表（八期引入）
     let row: Option<(String, i64, f64)> = conn
@@ -2041,6 +2109,7 @@ pub fn set_ocr_privacy_acknowledged(
     state: State<'_, AppState>,
     acknowledged: bool,
 ) -> Result<(), String> {
+    let _configuration_guard = state.0.internal.configuration_write()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_ocr_privacy_acknowledged(&mut c, acknowledged).map_err(|e| e.to_string())?;
     Ok(())
@@ -2059,6 +2128,7 @@ pub fn set_ocr_settings(
     ocr_preprocess_scale: Option<bool>,
     ocr_preprocess_dark_invert: Option<bool>,
 ) -> Result<OcrSettingsDto, String> {
+    let _configuration_guard = state.0.internal.configuration_write()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     if let Some(v) = enabled {
         if v && !settings::get_ocr_privacy_acknowledged(&c) {
@@ -2084,6 +2154,7 @@ pub fn set_ocr_settings(
     )
     .map_err(|e| e.to_string())?;
     drop(c);
+    drop(_configuration_guard);
     get_ocr_settings(state)
 }
 
@@ -2183,10 +2254,7 @@ pub fn search_ocr_text(
     restrict_session_id: Option<String>,
 ) -> Result<Vec<OcrSearchHit>, String> {
     let tokens = parse_ocr_search_keywords(&query)?;
-    let keywords_display: Vec<String> = tokens
-        .iter()
-        .map(|t| t.replace("\"\"", "\""))
-        .collect();
+    let keywords_display: Vec<String> = tokens.iter().map(|t| t.replace("\"\"", "\"")).collect();
     let match_expr = build_ocr_fts_and_expr(&tokens);
     let conn = state.0.read_conn.lock();
     let bl = settings::get_app_blacklist(&conn);
@@ -2235,7 +2303,8 @@ pub fn search_ocr_text(
             let rows = stmt
                 .query_map(params![match_expr, start, end, sid], map_row)
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
         } else {
             let mut stmt = conn
                 .prepare(
@@ -2254,7 +2323,8 @@ pub fn search_ocr_text(
             let rows = stmt
                 .query_map(params![match_expr, start, end], map_row)
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
         }
     } else if let Some(ref sid) = restrict_session_id {
         let mut stmt = conn
@@ -2273,7 +2343,8 @@ pub fn search_ocr_text(
         let rows = stmt
             .query_map(params![match_expr, sid], map_row)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     } else {
         let mut stmt = conn
             .prepare(
@@ -2290,7 +2361,8 @@ pub fn search_ocr_text(
         let rows = stmt
             .query_map([&match_expr], map_row)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     };
 
     hits.retain(|h| !settings::app_name_blacklisted(&h.app_name, &bl));
@@ -2381,61 +2453,17 @@ pub fn list_ocr_eval_samples(
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
-/// 对单帧重新跑本地 OCR 管线（不写入数据库），返回行级闸门明细。
+/// 内部版只允许受采集生命周期控制的 OCR，禁用上游的开发调试重跑入口。
 #[tauri::command]
 pub fn evaluate_ocr_snapshot(
-    state: State<'_, AppState>,
-    snapshot_id: String,
+    _state: State<'_, AppState>,
+    _snapshot_id: String,
 ) -> Result<OcrEvaluateSnapshotDto, String> {
-    let path: String = {
-        let conn = state.0.read_conn.lock();
-        conn.query_row(
-            "SELECT file_path FROM snapshots WHERE id = ?1",
-            [&snapshot_id],
-            |r| r.get(0),
-        )
-        .map_err(|_| "找不到截图".to_string())?
-    };
-    if path.trim().is_empty() {
-        return Err("截图路径为空".into());
-    }
-    let pipeline = {
-        let c = state.0.read_conn.lock();
-        settings::get_ocr_pipeline_config(&c)
-    };
-    let pipeline_err = pipeline.clone();
-    let t0 = Instant::now();
-    let res = crate::core::ocr::ocr_image_file(Path::new(&path), &pipeline);
-    let duration_ms = t0.elapsed().as_millis() as u64;
-    match res {
-        Ok(out) => Ok(OcrEvaluateSnapshotDto {
-            snapshot_id: snapshot_id.clone(),
-            ok: true,
-            error_message: None,
-            duration_ms,
-            pipeline,
-            final_text: out.text,
-            summary_line: out.summary,
-            gated_preview: out.gated_preview,
-            lines: out.lines_detail,
-            ocr_meta: out.ocr_meta,
-        }),
-        Err(e) => Ok(OcrEvaluateSnapshotDto {
-            snapshot_id,
-            ok: false,
-            error_message: Some(e),
-            duration_ms,
-            pipeline: pipeline_err,
-            final_text: String::new(),
-            summary_line: None,
-            gated_preview: String::new(),
-            lines: vec![],
-            ocr_meta: None,
-        }),
-    }
+    Err("内部版未开放单帧 OCR 调试重跑，请使用受控的采集 OCR 流程".into())
 }
 
 // ── 八期：周报命令 ────────────────────────────────────────────────────────────
@@ -2462,20 +2490,15 @@ pub struct WeeklyAnalysisDto {
 }
 
 #[tauri::command]
-pub fn get_week_start_for_date(
-    state: State<'_, AppState>,
-    date: String,
-) -> Result<String, String> {
+pub fn get_week_start_for_date(state: State<'_, AppState>, date: String) -> Result<String, String> {
     let conn = state.0.read_conn.lock();
     let wsd = crate::core::settings::get_week_start_day(&conn);
     crate::analysis::weekly::week_start_for_date(&date, wsd)
 }
 
 #[tauri::command]
-pub fn set_week_start_day(
-    state: State<'_, AppState>,
-    day: u8,
-) -> Result<(), String> {
+pub fn set_week_start_day(state: State<'_, AppState>, day: u8) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     crate::core::settings::set_week_start_day(&mut c, day).map_err(|e| e.to_string())?;
     crate::analysis::weekly::mark_all_weeks_stale(&mut c)?;
@@ -2493,6 +2516,7 @@ pub async fn generate_weekly_analysis(
     state: State<'_, AppState>,
     week_start: String,
 ) -> Result<String, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
     async_runtime::spawn_blocking(move || {
         let mut c = open_db_rw(&state.0.paths.db_path)?;
@@ -2550,13 +2574,19 @@ pub async fn generate_weekly_report(
     with_ai: bool,
     lang: String,
 ) -> Result<crate::analysis::weekly_report::WeeklyReportDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
     async_runtime::spawn_blocking(move || {
         if with_ai && !state.0.ai_enabled.load(Ordering::Relaxed) {
             return Err("AI 未开启：请先在设置中开启并配置".into());
         }
         let mut c = open_db_rw(&state.0.paths.db_path)?;
-        crate::analysis::weekly_report::generate_weekly_report_into(&mut c, &week_start, with_ai, &lang)
+        crate::analysis::weekly_report::generate_weekly_report_into(
+            &mut c,
+            &week_start,
+            with_ai,
+            &lang,
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2928,7 +2958,13 @@ fn build_assistant_context_ext(
             build_weekly_assistant_context(conn, ws).map(|payload| {
                 payload.map(|payload| AssistantContextExtDto {
                     context_type: "weekly".into(),
-                    date_range: format!("{ws}..{}", payload.get("week_end").and_then(|v| v.as_str()).unwrap_or(ws)),
+                    date_range: format!(
+                        "{ws}..{}",
+                        payload
+                            .get("week_end")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(ws)
+                    ),
                     data_sources: vec!["weekly_analysis".into()],
                     privacy_scope: vec![
                         "aggregated_metrics".into(),
@@ -2940,8 +2976,12 @@ fn build_assistant_context_ext(
             })
         }
         "time_segment" => {
-            let Some(start_ms) = segment_start_ms else { return Ok(None); };
-            let Some(end_ms) = segment_end_ms else { return Ok(None); };
+            let Some(start_ms) = segment_start_ms else {
+                return Ok(None);
+            };
+            let Some(end_ms) = segment_end_ms else {
+                return Ok(None);
+            };
             build_time_segment_assistant_context(conn, date, start_ms, end_ms).map(|payload| {
                 payload.map(|payload| AssistantContextExtDto {
                     context_type: "time_segment".into(),
@@ -3011,6 +3051,7 @@ pub fn get_assistant_history(
 
 #[tauri::command]
 pub fn clear_assistant_history(state: State<'_, AppState>) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let c = open_db_rw(&state.0.paths.db_path)?;
     c.execute("DELETE FROM assistant_history", [])
         .map_err(|e| e.to_string())?;
@@ -3121,13 +3162,19 @@ pub fn get_weekly_briefing(
     let avg_flow_score = normalize_score_pct(ctx.get("avg_flow_score").and_then(|v| v.as_f64()));
     let avg_deep_work_minutes = ctx.get("avg_deep_work_minutes").and_then(|v| v.as_f64());
     let avg_fragmentation_pct = ctx.get("avg_fragmentation_pct").and_then(|v| v.as_f64());
-    let peak_focus_day = ctx.get("peak_focus_day").and_then(|v| v.as_str()).map(str::to_string);
+    let peak_focus_day = ctx
+        .get("peak_focus_day")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let peak_focus_hour_range = ctx
         .get("peak_focus_hour_range")
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let top_app = ctx.get("weekly_top_apps").and_then(top_name_from_top_apps);
-    let valid_days = ctx.get("valid_days").and_then(|v| v.as_i64()).unwrap_or_default();
+    let valid_days = ctx
+        .get("valid_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_default();
 
     let (highlight_key, highlight_params) = if avg_flow_score.unwrap_or_default() >= 70.0 {
         (
@@ -3206,9 +3253,18 @@ pub async fn query_assistant(
     question: String,
     context_date: Option<String>,
 ) -> Result<AssistantMessageDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
     async_runtime::spawn_blocking(move || {
-        query_assistant_sync(&state, question, context_date, "daily".to_string(), None, None, None)
+        query_assistant_sync(
+            &state,
+            question,
+            context_date,
+            "daily".to_string(),
+            None,
+            None,
+            None,
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3224,6 +3280,7 @@ pub async fn query_assistant_v2(
     segment_start_ms: Option<i64>,
     segment_end_ms: Option<i64>,
 ) -> Result<AssistantMessageDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let state = state.inner().clone();
     async_runtime::spawn_blocking(move || {
         query_assistant_sync(
@@ -3266,9 +3323,7 @@ fn query_assistant_sync(
     let history: Vec<crate::analysis::assistant::ChatMessage> = {
         let conn = state.0.read_conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT role, content FROM assistant_history ORDER BY created_at ASC LIMIT 20",
-            )
+            .prepare("SELECT role, content FROM assistant_history ORDER BY created_at ASC LIMIT 20")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -3278,7 +3333,8 @@ fn query_assistant_sync(
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     };
 
     let context_ext = if let Some(date) = context_date.as_deref() {
@@ -3307,7 +3363,9 @@ fn query_assistant_sync(
                 user_id,
                 "user",
                 question,
-                context_ext.as_ref().and_then(|ctx| serde_json::to_string(ctx).ok()),
+                context_ext
+                    .as_ref()
+                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
                 now_ms
             ],
         )
@@ -3331,7 +3389,13 @@ fn query_assistant_sync(
         c.execute(
             "INSERT INTO assistant_history (id, role, content, context_snapshot, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![reply_id, "assistant", answer, Option::<String>::None, reply_ms],
+            params![
+                reply_id,
+                "assistant",
+                answer,
+                Option::<String>::None,
+                reply_ms
+            ],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -3364,6 +3428,7 @@ pub fn set_autostart_enabled(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<AutostartDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_autostart_enabled(&mut c, enabled).map_err(|e| e.to_string())?;
     drop(c);
@@ -3447,11 +3512,11 @@ fn macos_set_autostart(enabled: bool) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn windows_set_autostart(enabled: bool) -> Result<(), String> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
-        HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    };
     use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY_CURRENT_USER,
+        KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
 
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let reg_key_path = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
@@ -3478,17 +3543,9 @@ fn windows_set_autostart(enabled: bool) -> Result<(), String> {
         if enabled {
             let exe_str = exe.to_string_lossy();
             let exe_wide: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
-            let bytes = std::slice::from_raw_parts(
-                exe_wide.as_ptr() as *const u8,
-                exe_wide.len() * 2,
-            );
-            let res = RegSetValueExW(
-                hkey,
-                PCWSTR(wide_name.as_ptr()),
-                0,
-                REG_SZ,
-                Some(bytes),
-            );
+            let bytes =
+                std::slice::from_raw_parts(exe_wide.as_ptr() as *const u8, exe_wide.len() * 2);
+            let res = RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), 0, REG_SZ, Some(bytes));
             let _ = RegCloseKey(hkey);
             if res.is_err() {
                 return Err(format!("写入注册表失败: {:?}", res));
@@ -3516,6 +3573,7 @@ pub fn set_nudge_settings(
     state: State<'_, AppState>,
     config: settings::NudgeConfig,
 ) -> Result<settings::NudgeConfig, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_nudge_config(&mut c, &config).map_err(|e| e.to_string())?;
     state
@@ -3538,6 +3596,7 @@ pub fn set_digest_settings(
     state: State<'_, AppState>,
     config: settings::DigestConfig,
 ) -> Result<settings::DigestConfig, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
     settings::set_digest_config(&mut c, &config).map_err(|e| e.to_string())?;
     drop(c);
@@ -3587,6 +3646,7 @@ pub fn create_custom_intent(
     name: String,
     color: Option<String>,
 ) -> Result<CustomIntentDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut conn = open_db_rw(&state.0.paths.db_path)?;
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
@@ -3595,7 +3655,13 @@ pub fn create_custom_intent(
     )
     .map_err(|e| e.to_string())?;
     let id = conn.last_insert_rowid();
-    Ok(CustomIntentDto { id, name, color, sort_order: 0, created_at: now })
+    Ok(CustomIntentDto {
+        id,
+        name,
+        color,
+        sort_order: 0,
+        created_at: now,
+    })
 }
 
 #[tauri::command]
@@ -3605,14 +3671,21 @@ pub fn update_custom_intent(
     name: Option<String>,
     color: Option<String>,
 ) -> Result<CustomIntentDto, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut conn = open_db_rw(&state.0.paths.db_path)?;
     if let Some(ref n) = name {
-        conn.execute("UPDATE custom_intents SET name = ?1 WHERE id = ?2", rusqlite::params![n, id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE custom_intents SET name = ?1 WHERE id = ?2",
+            rusqlite::params![n, id],
+        )
+        .map_err(|e| e.to_string())?;
     }
     // color can be set to null or a value
-    conn.execute("UPDATE custom_intents SET color = ?1 WHERE id = ?2", rusqlite::params![color, id])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE custom_intents SET color = ?1 WHERE id = ?2",
+        rusqlite::params![color, id],
+    )
+    .map_err(|e| e.to_string())?;
     drop(conn);
     let rconn = state.0.read_conn.lock();
     rconn
@@ -3634,9 +3707,12 @@ pub fn update_custom_intent(
 
 #[tauri::command]
 pub fn delete_custom_intent(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    crate::core::internal::deny_personal_action()?;
     let mut conn = open_db_rw(&state.0.paths.db_path)?;
     let name: String = conn
-        .query_row("SELECT name FROM custom_intents WHERE id = ?1", [id], |r| r.get(0))
+        .query_row("SELECT name FROM custom_intents WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
@@ -3664,9 +3740,57 @@ pub fn auto_match_intents(state: State<'_, AppState>) -> Result<Vec<AutoMatchRes
     let conn = state.0.read_conn.lock();
 
     let keyword_map: Vec<(&str, Vec<&str>)> = vec![
-        ("编码开发", vec!["code", "vs code", "vscode", "xcode", "intellij", "terminal", "iterm", "warp", "cursor", "sublime", "vim", "neovim", "emacs", "android studio", "webstorm", "pycharm", "goland"]),
-        ("研究检索", vec!["chrome", "safari", "firefox", "edge", "arc", "brave", "opera", "notion", "obsidian", "logseq", "roam", "reader", "pdf", "preview", "books"]),
-        ("通讯沟通", vec!["slack", "discord", "teams", "zoom", "wechat", "微信", "telegram", "whatsapp", "mail", "outlook", "thunderbird", "messages", "feishu", "飞书", "钉钉", "dingtalk", "lark"]),
+        (
+            "编码开发",
+            vec![
+                "code",
+                "vs code",
+                "vscode",
+                "xcode",
+                "intellij",
+                "terminal",
+                "iterm",
+                "warp",
+                "cursor",
+                "sublime",
+                "vim",
+                "neovim",
+                "emacs",
+                "android studio",
+                "webstorm",
+                "pycharm",
+                "goland",
+            ],
+        ),
+        (
+            "研究检索",
+            vec![
+                "chrome", "safari", "firefox", "edge", "arc", "brave", "opera", "notion",
+                "obsidian", "logseq", "roam", "reader", "pdf", "preview", "books",
+            ],
+        ),
+        (
+            "通讯沟通",
+            vec![
+                "slack",
+                "discord",
+                "teams",
+                "zoom",
+                "wechat",
+                "微信",
+                "telegram",
+                "whatsapp",
+                "mail",
+                "outlook",
+                "thunderbird",
+                "messages",
+                "feishu",
+                "飞书",
+                "钉钉",
+                "dingtalk",
+                "lark",
+            ],
+        ),
     ];
 
     let unmapped: Vec<(String, Option<String>)> = {
@@ -3680,7 +3804,9 @@ pub fn auto_match_intents(state: State<'_, AppState>) -> Result<Vec<AutoMatchRes
             )
             .map_err(|e| e.to_string())?;
         let rows: Vec<(String, Option<String>)> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
@@ -3702,7 +3828,9 @@ pub fn auto_match_intents(state: State<'_, AppState>) -> Result<Vec<AutoMatchRes
                     break;
                 }
             }
-            if matched.is_some() { break; }
+            if matched.is_some() {
+                break;
+            }
         }
 
         results.push(AutoMatchResult {
@@ -3728,17 +3856,14 @@ pub fn apply_auto_match(
     state: State<'_, AppState>,
     matches: Vec<ApplyMatchItem>,
 ) -> Result<u32, String> {
+    crate::core::internal::deny_personal_action()?;
     let mut conn = open_db_rw(&state.0.paths.db_path)?;
     let mut total = 0u32;
     for m in &matches {
         let bid = m.bundle_id.as_ref();
         let intent_str = m.intent.clone();
-        let cnt = apply_intent_for_app_aggregate_conn(
-            &mut conn,
-            &m.app_name,
-            bid,
-            Some(&intent_str),
-        )?;
+        let cnt =
+            apply_intent_for_app_aggregate_conn(&mut conn, &m.app_name, bid, Some(&intent_str))?;
         total += cnt as u32;
     }
     Ok(total)
@@ -3764,9 +3889,8 @@ mod ocr_search_kw_tests {
             VALUES ('s1','sess',1,'hello world');",
         )
         .unwrap();
-        let bad = conn.prepare(
-            "SELECT 1 FROM snapshot_ocr_fts AS fts WHERE fts MATCH 'hello' LIMIT 1",
-        );
+        let bad =
+            conn.prepare("SELECT 1 FROM snapshot_ocr_fts AS fts WHERE fts MATCH 'hello' LIMIT 1");
         assert!(bad.is_err(), "alias MATCH should fail");
         let good: i32 = conn
             .query_row(

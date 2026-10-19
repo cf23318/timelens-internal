@@ -12,18 +12,11 @@ import { useAppStore } from "./stores/appStore";
 import { useThemeStore } from "./stores/themeStore";
 import * as api from "./services/tauri";
 import HealthPage from "./pages/HealthPage";
-import RecapPage from "./pages/RecapPage";
 import SessionsPage from "./pages/SessionsPage";
 import OcrSearchPage from "./pages/OcrSearchPage";
-import OcrEvalPage from "./pages/OcrEvalPage";
-import IntentManagePage from "./pages/IntentManagePage";
-import TodayLensPage from "./pages/TodayLensPage";
 import TimelinePage from "./pages/TimelinePage";
-import DailyReportPage from "./pages/DailyReportPage";
 import SettingsShellPage from "./pages/SettingsShellPage";
 import AboutPage from "./pages/AboutPage";
-import WeeklyReportPage from "./pages/WeeklyReportPage";
-import AssistantPage from "./pages/AssistantPage";
 import TimeReplayPage from "./pages/TimeReplayPage";
 import FragmentationDetail from "./components/FragmentationDetail";
 import UpdateNotice from "./components/UpdateNotice";
@@ -61,14 +54,6 @@ export default function App() {
         void i18n.changeLanguage(lang);
       }
     }).catch(() => {/* 后端未就绪时静默忽略，保持浏览器检测结果 */});
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 启动时静默检查更新，有新版本时弹窗提醒
-  useEffect(() => {
-    api.checkForUpdate().then((r) => {
-      useAppStore.getState().setUpdateCheckResult(r);
-    }).catch(() => {/* 网络不可用时静默忽略 */});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -199,24 +184,24 @@ export default function App() {
       <UpdateNotice />
       <Routes>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/lens" replace />} />
-          <Route path="/lens" element={<TodayLensPage />} />
+          <Route path="/" element={<Navigate to="/settings" replace />} />
+          <Route path="/lens" element={<Navigate to="/settings" replace />} />
           <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/replay" element={<TimeReplayPage />} />
-          <Route path="/report" element={<DailyReportPage />} />
-          <Route path="/weekly" element={<WeeklyReportPage />} />
-          <Route path="/assistant" element={<AssistantPage />} />
+          <Route path="/report" element={<Navigate to="/settings" replace />} />
+          <Route path="/weekly" element={<Navigate to="/settings" replace />} />
+          <Route path="/assistant" element={<Navigate to="/settings" replace />} />
           <Route path="/settings" element={<SettingsShellPage />} />
-          <Route path="/recap" element={<RecapPage />} />
+          <Route path="/recap" element={<Navigate to="/settings" replace />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/ocr" element={<OcrSearchPage />} />
-          <Route path="/ocr-eval" element={<OcrEvalPage />} />
-          <Route path="/intents" element={<IntentManagePage />} />
+          <Route path="/ocr-eval" element={<Navigate to="/settings" replace />} />
+          <Route path="/intents" element={<Navigate to="/settings" replace />} />
           <Route path="/health" element={<HealthPage />} />
           <Route path="/about" element={<AboutPage />} />
         </Route>
 
-        <Route path="*" element={<Navigate to="/lens" replace />} />
+        <Route path="*" element={<Navigate to="/settings" replace />} />
       </Routes>
     </BrowserRouter>
   );

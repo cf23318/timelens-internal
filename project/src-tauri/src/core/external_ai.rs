@@ -38,13 +38,8 @@ const DOUBAO_APP: ExternalAiProvider = ExternalAiProvider {
 };
 
 pub fn providers(lang: &str) -> Vec<ExternalAiProviderDto> {
-    [DOUBAO_WEB, DOUBAO_APP]
-        .iter()
-        .map(|p| ExternalAiProviderDto {
-            id: p.id.to_string(),
-            label: provider_label(p, lang),
-        })
-        .collect()
+    let _ = lang;
+    Vec::new()
 }
 
 pub fn resolve_provider(id: &str) -> ExternalAiProvider {
@@ -63,12 +58,14 @@ pub fn provider_label(provider: &ExternalAiProvider, lang: &str) -> String {
 }
 
 pub fn write_clipboard_text(text: &str) -> Result<usize, String> {
+    crate::core::internal::deny_external_action()?;
     let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
     cb.set_text(text).map_err(|e| e.to_string())?;
     Ok(text.chars().count())
 }
 
 pub fn launch_provider(provider: &ExternalAiProvider) -> Result<Option<String>, String> {
+    crate::core::internal::deny_external_action()?;
     if provider.id == "doubao_app" {
         launch_doubao_app(provider)
     } else {
@@ -115,8 +112,13 @@ fn launch_doubao_app(provider: &ExternalAiProvider) -> Result<Option<String>, St
 }
 
 pub fn try_auto_paste(provider_id: &str) -> Result<(), String> {
+    crate::core::internal::deny_external_action()?;
     let attempts = if provider_id == "doubao_app" { 4 } else { 3 };
-    let initial_delay = if provider_id == "doubao_app" { 900 } else { 1200 };
+    let initial_delay = if provider_id == "doubao_app" {
+        900
+    } else {
+        1200
+    };
     thread::sleep(Duration::from_millis(initial_delay));
 
     #[cfg(target_os = "macos")]
@@ -159,4 +161,3 @@ pub fn try_auto_paste(provider_id: &str) -> Result<(), String> {
         Err("auto paste unsupported on this platform".to_string())
     }
 }
-

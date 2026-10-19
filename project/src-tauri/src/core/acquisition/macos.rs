@@ -3,8 +3,6 @@ use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::string::CFString;
 use dispatch::Queue;
 use libc::pid_t;
-use std::fs;
-use std::process::Command;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -30,6 +28,7 @@ type AXUIElementRef = *const AxOpaque;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    fn AXValueGetValue(value: CFTypeRef, value_type: u32, out: *mut std::ffi::c_void) -> bool;
     fn AXUIElementCreateApplication(pid: pid_t) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
@@ -44,6 +43,12 @@ unsafe extern "C" {
     /// 自系统启动以来硬件产生的事件计数（`source == NULL` 时）；用于 5s 窗口差分估算键鼠量。
     fn CGEventSourceCounterForEventType(source: *const std::ffi::c_void, event_type: u32) -> u32;
     fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGGetDisplaysWithPoint(
+        point: core_graphics::geometry::CGPoint,
+        max: u32,
+        displays: *mut u32,
+        count: *mut u32,
+    ) -> i32;
     fn CGPreflightScreenCaptureAccess() -> u8;
     fn CGRequestScreenCaptureAccess() -> u8;
 }
@@ -108,127 +113,27 @@ pub fn ax_trusted() -> bool {
 
 pub fn idle_seconds() -> f64 {
     unsafe {
-        CGEventSourceSecondsSinceLastEventType(
-            K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE,
-            u32::MAX,
-        )
+        CGEventSourceSecondsSinceLastEventType(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, u32::MAX)
     }
 }
 
-/// 系统设置里已打开「屏幕录制」后，`CGPreflightScreenCaptureAccess` 仍可能长期返回 false（Apple 论坛多次确认），
-/// 而 `screencapture` 与真实截图链路一致；故在 preflight 为 false 时做一次轻量探针对齐真实能力。
-fn screen_capture_probe_screencapture() -> bool {
-    let tmp = std::env::temp_dir().join(format!(
-        "tl_scr_probe_{}_{}.png",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    let _ = fs::remove_file(&tmp);
-    let ok = match Command::new("/usr/sbin/screencapture")
-        .args(["-x", "-t", "png", "-D", "1"])
-        .arg(&tmp)
-        .status()
-    {
-        Ok(st) if st.success() => fs::metadata(&tmp).map(|m| m.len() > 200).unwrap_or(false),
-        _ => false,
-    };
-    let _ = fs::remove_file(&tmp);
-    ok
-}
-
-/// 仅 `CGPreflightScreenCaptureAccess`，不触发系统弹窗、不执行 `screencapture`。
-/// 用于窗口焦点等高频回调——避免不必要的 `screencapture` 调用。
+/// 权限检查只调用系统 preflight，不创建试探截图。
 pub fn screen_capture_granted() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() != 0 }
 }
 
-/// 用户点击「刷新系统权限」时使用：preflight 为真则真，否则试跑 `screencapture` 对齐真实能力。
-pub fn screen_capture_effective_granted() -> bool {
-    if unsafe { CGPreflightScreenCaptureAccess() != 0 } {
-        return true;
-    }
-    screen_capture_probe_screencapture()
-}
+static REQUESTED_THIS_SESSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// 历史名称保留给 `check_permissions`。
-pub fn screen_capture_refresh_access() -> bool {
-    screen_capture_effective_granted()
-}
-
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-static REQUESTED_THIS_SESSION: AtomicBool = AtomicBool::new(false);
-static LAST_PROBE_EPOCH_S: AtomicU64 = AtomicU64::new(0);
-/// 一旦 screencapture 探针成功过一次，即可信任（跳过后续 preflight 误报）。
-static PROBE_EVER_SUCCEEDED: AtomicBool = AtomicBool::new(false);
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// 用户主动点击「请求屏幕录制权限」时调用。
-/// 每次应用运行只调用一次 `CGRequestScreenCaptureAccess`，防止反复弹框。
-/// 返回 true 表示已授权或弹窗已触发。
+/// 仅由用户点击时触发系统授权对话框；重复请求不通过截图探针验证。
 pub fn request_screen_capture_access() -> bool {
-    if unsafe { CGPreflightScreenCaptureAccess() != 0 } {
+    if screen_capture_granted() {
         return true;
     }
     if REQUESTED_THIS_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return screen_capture_effective_granted();
+        return screen_capture_granted();
     }
-    let result = unsafe { CGRequestScreenCaptureAccess() != 0 };
-    log::info!("CGRequestScreenCaptureAccess => {result}");
-    result
-}
-
-/// .app 包内首次启动时自动调用一次，让系统把本应用加入 TCC 列表并弹出授权弹窗。
-/// 非 .app 环境（如 tauri dev）不做任何事。
-pub fn request_screen_capture_on_first_launch() {
-    if !running_inside_macos_app_bundle() {
-        return;
-    }
-    if unsafe { CGPreflightScreenCaptureAccess() != 0 } {
-        return;
-    }
-    if REQUESTED_THIS_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let r = unsafe { CGRequestScreenCaptureAccess() };
-    log::info!(
-        "first-launch CGRequestScreenCaptureAccess => {}",
-        r != 0
-    );
-}
-
-/// 用于周期轮询（每 30s）：先查 preflight，若 false 且距上次探针 ≥60s 则跑 screencapture 探针。
-/// 避免在高频回调中反复触发 screencapture。
-pub fn screen_capture_poll_check() -> bool {
-    if unsafe { CGPreflightScreenCaptureAccess() != 0 } {
-        PROBE_EVER_SUCCEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
-        return true;
-    }
-    if PROBE_EVER_SUCCEEDED.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    let now = epoch_secs();
-    let last = LAST_PROBE_EPOCH_S.load(std::sync::atomic::Ordering::Relaxed);
-    if now.saturating_sub(last) < 60 {
-        return false;
-    }
-    LAST_PROBE_EPOCH_S.store(now, std::sync::atomic::Ordering::Relaxed);
-    let ok = screen_capture_probe_screencapture();
-    if ok {
-        PROBE_EVER_SUCCEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
-        log::info!("screen_capture_poll_check: screencapture probe succeeded (preflight was false)");
-    }
-    ok
+    unsafe { CGRequestScreenCaptureAccess() != 0 }
 }
 
 unsafe fn ax_copy_attr(element: AXUIElementRef, key: &str) -> Option<CFTypeRef> {
@@ -294,6 +199,65 @@ pub fn sample_front_window() -> Result<FrontWindowState, String> {
             window_title,
             is_fullscreen: false,
         })
+    }
+}
+
+pub fn capture_display_indices(all: bool) -> Result<Vec<u32>, String> {
+    use core_graphics::geometry::{CGPoint, CGSize};
+    unsafe {
+        let mut displays = [0u32; 32];
+        let mut count = 0;
+        if CGGetActiveDisplayList(32, displays.as_mut_ptr(), &mut count) != 0 || count == 0 {
+            return Err("无法枚举显示器".into());
+        }
+        if all {
+            return Ok((1..=count).collect());
+        }
+        if !ax_trusted() {
+            return Err("读取前台窗口所在屏幕需要辅助功能权限".into());
+        }
+        let app = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .ok_or("没有前台应用")?;
+        let app_el = AXUIElementCreateApplication(app.processIdentifier());
+        if app_el.is_null() {
+            return Err("无法读取前台窗口".into());
+        }
+        let focused = ax_copy_attr(app_el, "AXFocusedWindow");
+        CFRelease(app_el as CFTypeRef);
+        let focused = focused.ok_or("无法读取前台窗口")?;
+        let pos_ref = ax_copy_attr(focused as AXUIElementRef, "AXPosition");
+        let size_ref = ax_copy_attr(focused as AXUIElementRef, "AXSize");
+        CFRelease(focused);
+        let mut point = CGPoint::new(0.0, 0.0);
+        let mut size = CGSize::new(0.0, 0.0);
+        let pos_ok = pos_ref.is_some_and(|v| {
+            let ok = AXValueGetValue(v, 1, &mut point as *mut _ as *mut _);
+            CFRelease(v);
+            ok
+        });
+        let size_ok = size_ref.is_some_and(|v| {
+            let ok = AXValueGetValue(v, 2, &mut size as *mut _ as *mut _);
+            CFRelease(v);
+            ok
+        });
+        if !pos_ok || !size_ok {
+            return Err("无法确定前台窗口屏幕".into());
+        }
+        point.x += size.width / 2.0;
+        point.y += size.height / 2.0;
+        let mut selected = [0u32; 32];
+        let mut selected_count = 0;
+        if CGGetDisplaysWithPoint(point, 32, selected.as_mut_ptr(), &mut selected_count) != 0
+            || selected_count == 0
+        {
+            return Err("前台窗口不在可采集屏幕上".into());
+        }
+        displays[..count as usize]
+            .iter()
+            .position(|id| *id == selected[0])
+            .map(|i| vec![i as u32 + 1])
+            .ok_or_else(|| "前台显示器不可用".into())
     }
 }
 
