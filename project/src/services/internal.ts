@@ -9,6 +9,8 @@ export interface InternalConfig {
   screenshotBlockedApps: string[];
   screenshotBlockedDomains: string[];
   uploadUrl: string;
+  uploadSurveyId: string;
+  uploadDeviceId: string;
   encryptionRecipient: string;
   domesticServerConfirmed: boolean;
 }
@@ -33,7 +35,7 @@ export const finishInternalTask = (confirmation: UploadConfirmation) => invoke<v
 export const retryInternalUpload = (confirmation: UploadConfirmation) => invoke<void>("retry_internal_upload", { confirmation });
 
 export const taskStatusLabel: Record<TaskProgress["status"], string> = {
-  ready: "待开始", recording: "录制中", paused: "已暂停", completed: "已停止，待回收", uploading: "正在加密回收", uploaded: "已上传并清理本地采集数据",
+  ready: "待开始", recording: "录制中", paused: "已暂停", completed: "已停止，待上传", uploading: "正在逐张上传", uploaded: "队列截图已上传，本地数据保留",
 };
 
 export function remainingTime(p: TaskProgress): string {
@@ -47,6 +49,8 @@ export interface UploadConfirmation {
   encryptionRecipient: string;
   domesticServerConfirmed: boolean;
   cleanupOnly: boolean;
+  surveyId: string;
+  deviceId: string;
 }
 export interface InternalOverview {
   config: InternalConfig;
@@ -54,5 +58,10 @@ export interface InternalOverview {
   snapshots: { count: number; bytes: number; latestAtMs: number | null };
   captureNotice: { code: string; atMs: number };
   uploadMissing: string[];
+  uploadActive: boolean;
+  uploads: {pending:number; verified:number; blocked:number; legacy:number; lastError:string|null};
 }
 export const getInternalOverview = () => invoke<InternalOverview>("get_internal_overview");
+
+export const startFrameUpload=(confirmation:UploadConfirmation)=>invoke<void>("start_frame_upload",{confirmation});
+export const stopFrameUpload=()=>invoke<void>("stop_frame_upload");

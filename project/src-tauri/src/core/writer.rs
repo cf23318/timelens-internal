@@ -66,7 +66,7 @@ fn event_sort_key(e: &WriteEvent) -> u8 {
         WriteEvent::SessionUpdate(_) => 0,
         WriteEvent::AppSwitch(_) => 1,
         WriteEvent::RawEvent(_) => 2,
-        WriteEvent::Snapshot(_) => 3,
+        WriteEvent::Snapshot(_) | WriteEvent::SnapshotConfirmed { .. } => 3,
         WriteEvent::SnapshotOcr(_) => 4,
         WriteEvent::InputMetric(_) => 5,
         WriteEvent::ClipboardFlow(_) => 6,
@@ -86,6 +86,23 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub fn send_snapshot_confirmed(
+        &self,
+        row: crate::core::models::SnapshotRow,
+        upload: super::frame_upload::UploadDraft,
+    ) -> Result<(), String> {
+        self.check_health()?;
+        let (done, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send_timeout(
+                WriteEvent::SnapshotConfirmed { row, upload, done },
+                std::time::Duration::from_secs(5),
+            )
+            .map_err(|_| "截图数据库队列不可用")?;
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|_| "等待截图数据库提交超时，恢复清单已保留")?
+    }
+
     pub fn check_health(&self) -> Result<(), String> {
         self.metrics.last_error.lock().clone().map_or(Ok(()), Err)
     }
@@ -207,6 +224,11 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             metrics.record_error(format!("数据库写入失败，已禁止自动清理：{e}"));
         }
         let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
+        for event in &batch {
+            if let WriteEvent::SnapshotConfirmed { done, .. } = event {
+                let _ = done.send(result.clone().and(health.clone()));
+            }
+        }
         for done in flushes {
             let _ = done.send(health.clone());
         }
@@ -321,9 +343,9 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                     ],
                 )?;
             }
-            WriteEvent::Snapshot(s) => {
+            WriteEvent::Snapshot(s) | WriteEvent::SnapshotConfirmed { row: s, .. } => {
                 tx.execute(
-                    r#"INSERT INTO snapshots (
+                    r#"INSERT OR IGNORE INTO snapshots (
                         id, session_id, file_path, captured_at_ms, file_size_bytes,
                         trigger_type, resolution, format, perceptual_hash
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
@@ -339,6 +361,9 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                         s.perceptual_hash,
                     ],
                 )?;
+                if let WriteEvent::SnapshotConfirmed { upload, .. } = ev {
+                    super::frame_upload::insert_draft(&tx, s, upload)?;
+                }
             }
             WriteEvent::SnapshotOcr(r) => {
                 tx.execute(

@@ -82,3 +82,11 @@ demo/netlify/我的微信二维码.JPG
 *.tar.gz
 **/data/shots/
 **/exports/
+
+# Local receiver state, credentials, and Python test environments
+.venv/
+.pytest_cache/
+**/upload-token
+**/device-tokens.json
+**/server.env
+upload-server/state/

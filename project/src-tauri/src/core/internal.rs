@@ -21,6 +21,8 @@ pub struct InternalConfig {
     pub screenshot_blocked_apps: Vec<String>,
     pub screenshot_blocked_domains: Vec<String>,
     pub upload_url: String,
+    pub upload_survey_id: String,
+    pub upload_device_id: String,
     pub encryption_recipient: String,
     pub domestic_server_confirmed: bool,
 }
@@ -40,6 +42,9 @@ impl Default for InternalConfig {
                 "keepass",
                 "bitwarden",
                 "lastpass",
+                "dashlane",
+                "keeper",
+                "securityagent",
                 "credentialui",
                 "credwiz",
                 "wechat",
@@ -68,6 +73,8 @@ impl Default for InternalConfig {
             .map(str::to_owned)
             .collect(),
             upload_url: String::new(),
+            upload_survey_id: String::new(),
+            upload_device_id: String::new(),
             encryption_recipient: String::new(),
             domestic_server_confirmed: false,
         }
@@ -145,6 +152,10 @@ impl InternalConfig {
             "网银",
             "网上银行",
             "online banking",
+            "验证码",
+            "支付验证",
+            "verification code",
+            "one-time password",
         ]
         .iter()
         .any(|s| title.contains(s))
@@ -204,6 +215,9 @@ pub struct InternalControl {
     native_jobs: (Mutex<usize>, Condvar),
     pub epoch: AtomicU64,
     pub tracking: Arc<AtomicBool>,
+    /// Authorization is deliberately runtime-only: restart never sends old data.
+    pub frame_upload_active: AtomicBool,
+    pub frame_upload_running: AtomicBool,
     pub progress: Mutex<TaskProgress>,
     pub capture_notice: Mutex<super::desktop::CaptureNotice>,
     root: PathBuf,
@@ -350,7 +364,7 @@ pub fn spawn_task_clock(app: tauri::AppHandle) {
             match state.0.internal.advance(elapsed) {
                 Ok(true) => {
                     if let Err(e) = pause_collection(&app, &state, true)
-                        .and_then(|_| super::transfer::begin_recovery(&app))
+                        .and_then(|_| super::frame_upload::on_task_finished(&app))
                     {
                         log::error!("自动回收失败：{e}");
                     }
@@ -460,6 +474,8 @@ impl InternalControl {
             native_jobs: (Mutex::new(0), Condvar::new()),
             epoch: AtomicU64::new(0),
             tracking,
+            frame_upload_active: AtomicBool::new(false),
+            frame_upload_running: AtomicBool::new(false),
             progress: Mutex::new(progress),
             capture_notice: Mutex::new(super::desktop::CaptureNotice::default()),
             root: root.to_owned(),
@@ -469,6 +485,9 @@ impl InternalControl {
     pub fn save_config(&self, config: InternalConfig) -> Result<(), String> {
         config.validate()?;
         let _guard = self.gate.write();
+        if self.frame_upload_running.load(Ordering::SeqCst) {
+            return Err("请先停止后台上传，再修改设置".into());
+        }
         let mut p = self.progress.lock();
         if matches!(p.status, TaskStatus::Recording | TaskStatus::Uploading) {
             return Err("请先暂停，上传期间不能修改配置".into());
@@ -569,7 +588,8 @@ impl InternalControl {
         let mut notice = self.capture_notice.lock();
         if self.is_current(epoch) {
             *notice = super::desktop::CaptureNotice {
-                code: code.into(), at_ms: chrono::Utc::now().timestamp_millis(),
+                code: code.into(),
+                at_ms: chrono::Utc::now().timestamp_millis(),
             };
         }
     }

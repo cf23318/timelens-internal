@@ -40,7 +40,7 @@ impl DataPaths {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let lock = opts
             .open(self.root.join("instance.lock"))
@@ -69,17 +69,183 @@ impl DataPaths {
     }
 
     pub fn ensure_dirs(&self) -> Result<(), std::io::Error> {
-        use std::fs;
-        fs::create_dir_all(&self.data_dir)?;
-        fs::create_dir_all(&self.shots_dir)?;
-        fs::create_dir_all(&self.exports_dir)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::Permissions::from_mode(0o700);
-            let _ = fs::set_permissions(&self.root, mode.clone());
-            let _ = fs::set_permissions(&self.data_dir, mode);
+            // The pilot token lives under root. Anchor every child creation to an
+            // O_NOFOLLOW directory handle so an existing link cannot redirect it.
+            let root = secure_root(&self.root)?;
+            let data = secure_child(&root, "data")?;
+            let _shots = secure_child(&data, "shots")?;
+            let _exports = secure_child(&root, "exports")?;
+        }
+        #[cfg(not(unix))]
+        {
+            ensure_real_dir(&self.root)?;
+            ensure_real_dir(&self.data_dir)?;
+            ensure_real_dir(&self.shots_dir)?;
+            ensure_real_dir(&self.exports_dir)?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn secure_root(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    if let Err(error) = std::fs::create_dir(path) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    secure_dir_mode(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn secure_child(parent: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name =
+        CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    secure_dir_mode(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn secure_dir_mode(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_real_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::DataPaths;
+
+    fn paths(root: std::path::PathBuf) -> DataPaths {
+        let data_dir = root.join("data");
+        DataPaths {
+            db_path: data_dir.join("db.sqlite"),
+            shots_dir: data_dir.join("shots"),
+            exports_dir: root.join("exports"),
+            root,
+            data_dir,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_dirs_reject_root_and_child_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = temp.path().join(".timelens");
+        symlink(&target, &root).unwrap();
+        assert!(paths(root.clone()).ensure_dirs().is_err());
+        assert!(!target.join("data").exists());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        symlink(&target, root.join("data")).unwrap();
+        assert!(paths(root.clone()).ensure_dirs().is_err());
+        assert!(!target.join("shots").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_dirs_create_private_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".timelens");
+        paths(root.clone()).ensure_dirs().unwrap();
+        for dir in [
+            root.clone(),
+            root.join("data"),
+            root.join("data/shots"),
+            root.join("exports"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+}
+
+/// Create exactly one managed child, never following a pre-existing symlink.
+pub fn private_subdir(parent: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    #[cfg(unix)]
+    {
+        let p = secure_root(parent)?;
+        let _ = secure_child(&p, name)?;
+    }
+    #[cfg(not(unix))]
+    {
+        ensure_real_dir(&parent.join(name))?;
+    }
+    Ok(parent.join(name))
 }

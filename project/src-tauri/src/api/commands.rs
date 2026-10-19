@@ -159,6 +159,8 @@ pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_j
             "config": config, "progress": progress, "snapshots": stats,
             "captureNotice": state.0.internal.capture_notice.lock().clone(),
             "uploadMissing": missing,
+            "uploads": crate::core::frame_upload::stats(&state.0.read_conn.lock(), &progress.task_id)?,
+            "uploadActive": state.0.internal.frame_upload_running.load(Ordering::SeqCst),
         }))
     }).await.map_err(|e| e.to_string())?
 }
@@ -179,8 +181,12 @@ pub async fn finish_internal_task(
                 crate::core::desktop::token_present(),
             )?;
         }
+        { let p=state.0.internal.progress.lock(); if p.receipt.is_some() || p.stored_bundle.is_some() || p.bundle_path.is_some() {return Err("任务含旧版加密包或回执，请先人工核对".into());} }
+        if state.0.internal.frame_upload_running.load(Ordering::SeqCst) && !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {return Err("上一轮后台上传仍在结束，请稍后再结束并上传".into());}
         crate::core::internal::pause_collection(&app, &state, true)?;
-        crate::core::transfer::begin_confirmed_recovery(&app, &confirmation)
+        if state.0.internal.frame_upload_running.load(Ordering::SeqCst) {return Ok(());}
+
+        crate::core::frame_upload::begin(&app, &confirmation)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -188,9 +194,21 @@ pub async fn finish_internal_task(
 
 #[tauri::command]
 pub async fn retry_internal_upload(app: AppHandle, confirmation: crate::core::desktop::UploadConfirmation) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::core::transfer::begin_confirmed_recovery(&app, &confirmation))
+    tauri::async_runtime::spawn_blocking(move || crate::core::frame_upload::begin(&app, &confirmation))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn start_frame_upload(app:AppHandle, confirmation:crate::core::desktop::UploadConfirmation)->Result<(),String> {
+    tauri::async_runtime::spawn_blocking(move||crate::core::frame_upload::begin(&app,&confirmation)).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+pub async fn stop_frame_upload(state:State<'_,AppState>)->Result<(),String> {
+    let state=state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        crate::core::frame_upload::stop(&state.0.internal);
+    }).await.map_err(|e|e.to_string())
 }
 
 #[tauri::command]

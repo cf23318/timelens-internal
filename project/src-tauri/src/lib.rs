@@ -162,9 +162,6 @@ pub fn run() {
             // 桌面端启动后默认开启采集（与产品预期一致）；无采集能力的平台保持 false。
             let tracking = Arc::new(AtomicBool::new(false));
             let internal = core::internal::InternalControl::load(&paths.root, tracking.clone())?;
-            if let Some(e) = internal.progress.lock().integrity_error.clone() {
-                *metrics.last_error.lock() = Some(e);
-            }
             if let Some(e) = metrics.last_error.lock().clone() {
                 internal.edit_progress(|p| {
                     p.integrity_error = Some(e.clone());
@@ -172,6 +169,7 @@ pub fn run() {
                     Ok(())
                 })?;
             }
+            core::recovery::startup(&paths,&writer,&internal)?;
             let running = Arc::new(AtomicBool::new(true));
             let is_afk = Arc::new(AtomicBool::new(false));
             let screen_ok = Arc::new(AtomicBool::new(false));
@@ -416,6 +414,8 @@ pub fn run() {
             api::get_internal_overview,
             api::finish_internal_task,
             api::retry_internal_upload,
+            api::start_frame_upload,
+            api::stop_frame_upload,
             api::start_tracking,
             api::stop_tracking,
             api::is_tracking,

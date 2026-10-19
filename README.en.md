@@ -1,3 +1,5 @@
+> The local internal build now uploads individual raw screenshots and retains local images/database. See [installation](docs/internal-frame-install.md) and [receiver](upload-server/README.md). Encrypted recovery descriptions below document the earlier implementation.
+
 # TimeLens Internal
 
 This repository adapts [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5 (`f8e7107`) and retains its MIT license. See [INTERNAL_REVIEW.md](INTERNAL_REVIEW.md) for implementation and verification limits. The upstream introduction and download links below describe the original project, not this adaptation.

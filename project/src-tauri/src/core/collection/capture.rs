@@ -17,9 +17,7 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
-use crate::core::models::{
-    CapturePriority, CaptureSignal, SnapshotPayload, SnapshotRow, WriteEvent,
-};
+use crate::core::models::{CapturePriority, CaptureSignal, SnapshotPayload, SnapshotRow};
 use crate::core::ocr::OcrJob;
 use crate::core::storage::DataPaths;
 use crate::core::writer::WriterHandle;
@@ -213,11 +211,22 @@ pub fn spawn_capture_thread(
             if !wait_session(read_conn.as_ref(), &sig, &sid) || !control.is_current(sig.epoch) {
                 continue;
             }
+            let plan = match super::screens::plan(cfg.all_displays) {
+                Ok(r) => r,
+                Err(_) => {
+                    control.note_capture(sig.epoch, "privacy");
+                    continue;
+                }
+            };
+            if super::sensitive::permit_capture(&cfg, &plan.regions).is_err() {
+                control.note_capture(sig.epoch, "privacy");
+                continue;
+            }
             let captured = {
                 let Some(_job) = control.begin_native(sig.epoch) else {
                     continue;
                 };
-                super::screens::grab(cfg.all_displays, &|| control.is_current(sig.epoch))
+                super::screens::grab(&plan, &|| control.is_current(sig.epoch))
             };
             let images = match captured {
                 Ok(i) => i,
@@ -228,6 +237,12 @@ pub fn spawn_capture_thread(
                 }
             };
             if !control.is_current(sig.epoch) {
+                continue;
+            }
+            if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
+                || super::sensitive::permit_capture(&cfg, &plan.regions).is_err()
+            {
+                control.note_capture(sig.epoch, "privacy");
                 continue;
             }
             // Drop an image if focus changed during the OS capture operation.
@@ -248,6 +263,13 @@ pub fn spawn_capture_thread(
                 continue;
             };
             for (display, img) in images {
+                if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
+                    || super::sensitive::permit_capture(&cfg, &plan.regions).is_err()
+                {
+                    control.note_capture(sig.epoch, "privacy");
+                    break;
+                }
+
                 let (mut max_w, mut webp_q) = capture_scale_and_quality(&sig);
                 if sig.priority == CapturePriority::Low && sig.trigger_type == "poll" {
                     max_w = cfg.poll_width;
@@ -268,17 +290,15 @@ pub fn spawn_capture_thread(
                             continue;
                         }
                     }
-                    last_phash.insert(key, (hnow, std::time::Instant::now()));
-                    if last_phash.len() > 128 {
-                        last_phash.retain(|_, (_, ts)| ts.elapsed() < Duration::from_secs(300));
-                    }
                 }
                 let day = Utc::now().format("%Y-%m-%d").to_string();
-                let shot_dir = paths.shots_dir.join(&day);
-                if let Err(e) = fs::create_dir_all(&shot_dir) {
-                    warn!("shots dir: {e}");
-                    continue;
-                }
+                let shot_dir = match crate::core::storage::private_subdir(&paths.shots_dir, &day) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        control.note_capture(sig.epoch, "save_error");
+                        continue;
+                    }
+                };
                 let id = Uuid::new_v4().to_string();
                 let fname = format!(
                     "{}_{}_{}.webp",
@@ -287,12 +307,11 @@ pub fn spawn_capture_thread(
                     sig.trigger_type.replace('/', "_")
                 );
                 let out_path = shot_dir.join(&fname);
-                if let Err(e) = write_webp_lossy(&scaled, &out_path, webp_q) {
-                    control.note_capture(sig.epoch, "save_error");
-                    warn!("save webp: {e}");
-                    continue;
-                }
-                let size = fs::metadata(&out_path).map(|m| m.len() as i64).unwrap_or(0);
+                let rgba = scaled.to_rgba8();
+                let bytes = webp::Encoder::from_rgba(rgba.as_raw(), sw, sh)
+                    .encode(webp_q)
+                    .to_vec();
+                let size = bytes.len() as i64;
                 let fp = out_path.to_string_lossy().to_string();
                 let h = hasher.hash_image(&scaled);
                 let perceptual_hash = Some(format!("{h:?}"));
@@ -308,13 +327,35 @@ pub fn spawn_capture_thread(
                     format: "webp".into(),
                     perceptual_hash: perceptual_hash.clone(),
                 };
-                if writer.try_send(WriteEvent::Snapshot(row)).is_err() {
+                let task = control.progress.lock().task_id.clone();
+                let saved = (|| -> Result<(), String> {
+                    let draft =
+                        crate::core::frame_upload::UploadDraft::new(&task, &display, &bytes)?;
+                    crate::core::recovery::stage(&paths, &row, &draft, &bytes)?;
+                    writer.send_snapshot_confirmed(row, draft)?;
+                    crate::core::recovery::committed(&paths, &id)?;
+                    Ok(())
+                })();
+                if let Err(e) = saved {
                     control.note_capture(sig.epoch, "save_error");
-                    let _ = fs::remove_file(&out_path);
+                    let _ = control.edit_progress(|p| {
+                        p.integrity_error = Some(e.clone());
+                        p.last_error = Some(e);
+                        Ok(())
+                    });
                     continue;
                 }
+                if sig.priority == CapturePriority::Low && sig.trigger_type == "poll" {
+                    last_phash.insert(
+                        format!("{}:{display}", sid),
+                        (hasher.hash_image(&scaled), std::time::Instant::now()),
+                    );
+                    if last_phash.len() > 128 {
+                        last_phash.retain(|_, (_, ts)| ts.elapsed() < Duration::from_secs(300));
+                    }
+                }
                 let path_for_ocr = fp.clone();
-                control.note_capture(sig.epoch, "queued");
+                control.note_capture(sig.epoch, "saved");
                 let ocr_snapshot_id = id.clone();
                 let ocr_session_id = sid.clone();
                 let ocr_trigger = sig.trigger_type.clone();
