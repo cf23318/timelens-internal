@@ -205,6 +205,7 @@ pub struct InternalControl {
     pub epoch: AtomicU64,
     pub tracking: Arc<AtomicBool>,
     pub progress: Mutex<TaskProgress>,
+    pub capture_notice: Mutex<super::desktop::CaptureNotice>,
     root: PathBuf,
 }
 
@@ -460,6 +461,7 @@ impl InternalControl {
             epoch: AtomicU64::new(0),
             tracking,
             progress: Mutex::new(progress),
+            capture_notice: Mutex::new(super::desktop::CaptureNotice::default()),
             root: root.to_owned(),
         }))
     }
@@ -510,6 +512,7 @@ impl InternalControl {
         write_json_atomic(&self.root.join("internal-task.json"), &next)?;
         *p = next;
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        *self.capture_notice.lock() = super::desktop::CaptureNotice::default();
         self.tracking.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -517,6 +520,7 @@ impl InternalControl {
     pub fn pause(&self, complete: bool) -> Result<(), String> {
         self.tracking.store(false, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        *self.capture_notice.lock() = super::desktop::CaptureNotice::default();
         let _guard = self.gate.write();
         let mut p = self.progress.lock();
         if matches!(
@@ -559,6 +563,15 @@ impl InternalControl {
 
     pub fn is_current(&self, epoch: u64) -> bool {
         self.tracking.load(Ordering::SeqCst) && self.epoch.load(Ordering::SeqCst) == epoch
+    }
+
+    pub fn note_capture(&self, epoch: u64, code: &str) {
+        let mut notice = self.capture_notice.lock();
+        if self.is_current(epoch) {
+            *notice = super::desktop::CaptureNotice {
+                code: code.into(), at_ms: chrono::Utc::now().timestamp_millis(),
+            };
+        }
     }
 
     pub fn begin_native(&self, epoch: u64) -> Option<NativeJob<'_>> {

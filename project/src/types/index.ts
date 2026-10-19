@@ -227,6 +227,22 @@ export interface ContentRecapItemDto {
   ocrPreview: string;
 }
 
+export interface SnapshotReplayFrame {
+  snapshotId: string;
+  capturedAtMs: number;
+  appName: string;
+  windowTitle: string;
+  ocrPreview: string | null;
+}
+
+export interface SnapshotReplayPage {
+  date: string;
+  offset: number;
+  total: number;
+  ocrEnabled: boolean;
+  items: SnapshotReplayFrame[];
+}
+
 export type ContentRecapSlice = "full_day" | "evening";
 
 export interface ExternalAiProvider {

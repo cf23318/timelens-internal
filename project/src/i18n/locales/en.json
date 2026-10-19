@@ -26,6 +26,7 @@
     "screenshotAlt": "Screenshot"
   },
   "nav": {
+    "productSubtitle": "Screen capture & replay",
     "todayLens": "Today's Lens",
     "todayLensDesc": "Structure · Pipeline · Daily summary",
     "timeline": "Timeline",
@@ -35,7 +36,7 @@
     "dailyReport": "Daily Report",
     "dailyReportDesc": "Fact layer / AI enhanced",
     "settings": "Settings",
-    "settingsDesc": "Permissions · Engines · OCR · AI",
+    "settingsDesc": "Permissions · Capture · Privacy · Collection",
     "recap": "Recap (legacy)",
     "sessions": "Sessions",
     "sessionsDesc": "Dev tools · Sessions & screenshots",
@@ -233,9 +234,20 @@
   "replay": {
     "title": "Time Replay",
     "loading": "Loading replay data…",
-    "empty": "No replayable screenshots/OCR for this date.",
+    "empty": "No saved screenshots for this date.",
     "progress": "Progress {{progress}}%",
-    "ocrPreview": "OCR preview"
+    "ocrPreview": "OCR preview",
+    "position": "Screenshot playback position",
+    "previous": "Previous",
+    "next": "Next",
+    "reload": "Refresh",
+    "ocrDisabled": "OCR is off. Saved screenshots are still available for playback.",
+    "noOcrText": "No recognized text is available for this screenshot.",
+    "unknownApp": "Unknown application",
+    "imageUnavailable": "This screenshot could not be loaded. The file may have been cleaned up.",
+    "frame": "Screenshot {{number}} · {{time}}",
+    "loadedRange": "Thumbnails {{start}}–{{end}} of {{total}}",
+    "thumbnails": "Screenshot thumbnails"
   },
   "ocrSearch": {
     "title": "OCR Search",

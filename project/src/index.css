@@ -138,6 +138,7 @@
 }
 
 [data-theme="white"] {
+  color-scheme: light;
   --tl-bg: #f8fafc;
   --tl-ink: #0f172a;
   --tl-muted: #64748b;

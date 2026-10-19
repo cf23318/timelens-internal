@@ -1,280 +1,71 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import "../desktop.css";
+import { useEffect, useRef, useState } from "react";
+import { NavLink, Outlet, Link, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useDevModeStore } from "../stores/devModeStore";
-import { useThemeStore, type UiTheme } from "../stores/themeStore";
-import { setLanguage, type SupportedLanguage } from "../i18n";
-import * as api from "../services/tauri";
-import { AiTaskBanner } from "../components/AiTaskBanner";
-
-const AUTO_REFRESH_PATHS = ["/lens", "/timeline", "/replay"];
-const REFRESH_DEBOUNCE_MS = 30_000;
-function navCls(active: boolean): string {
-  return [
-    "tl-nav-item tl-interactive-row flex w-full items-center gap-2 rounded-lg border-0 px-2.5 py-2 text-left text-sm font-medium transition-colors",
-    active
-      ? "tl-nav-active bg-[var(--tl-nav-active-bg)] text-[var(--tl-ink)]"
-      : "text-[var(--tl-muted)] hover:bg-[var(--tl-nav-hover-bg)] hover:text-[var(--tl-ink)]",
-  ].join(" ");
-}
+import { useInternalStore, useInternalUpdates } from "../stores/internalStore";
+import { duration, shotTime, taskLabel, captureLabel, useDesktopText } from "../lib/desktop";
+import { TaskControls } from "../components/TaskControls";
+import { DesktopError } from "../components/DesktopFeedback";
+import { DesktopPageBoundary } from "../components/DesktopPageBoundary";
 
 export default function AppShell() {
-  const { t, i18n } = useTranslation();
+  useInternalUpdates();
+  const { t } = useTranslation();
+  const { english, text } = useDesktopText();
   const location = useLocation();
-  const date = useAppStore((s) => s.date);
-  const setDate = useAppStore((s) => s.setDate);
-  const isTracking = useAppStore((s) => s.isTracking);
-  const devEnabled = useDevModeStore((s) => s.enabled);
-  const updateAvailable = useAppStore((s) => s.updateAvailable);
-  const [captureBusy, setCaptureBusy] = useState(false);
-  const theme = useThemeStore((s) => s.theme);
-  const setTheme = useThemeStore((s) => s.setTheme);
-  const [currentLang, setCurrentLang] = useState<SupportedLanguage>(
-    () => (i18n.language === "zh-CN" ? "zh-CN" : "en"),
-  );
+  const { date, setDate, error: appError, clearError } = useAppStore();
+  const devEnabled = useDevModeStore(s => s.enabled);
+  const { data, error, loadError, message, draft, refresh } = useInternalStore();
   const [refreshing, setRefreshing] = useState(false);
-  const lastRefreshRef = useRef(0);
-
+  const lastRefresh = useRef(0);
+  const datedPage = ["/timeline", "/replay"].some(p => location.pathname.startsWith(p));
   useEffect(() => {
-    const shouldRefresh = AUTO_REFRESH_PATHS.some((p) => location.pathname.startsWith(p));
-    if (!shouldRefresh) return;
-    const now = Date.now();
-    if (now - lastRefreshRef.current < REFRESH_DEBOUNCE_MS) return;
-    lastRefreshRef.current = now;
-    setRefreshing(true);
-    useAppStore.getState().refreshSessions().finally(() => setRefreshing(false));
-  }, [location.pathname]);
-
-  useEffect(() => {
-    const onFocus = () => {
-      const path = window.location.pathname;
-      const shouldRefresh = AUTO_REFRESH_PATHS.some((p) => path.startsWith(p));
-      if (!shouldRefresh) return;
-      const now = Date.now();
-      if (now - lastRefreshRef.current < REFRESH_DEBOUNCE_MS) return;
-      lastRefreshRef.current = now;
-      setRefreshing(true);
-      useAppStore.getState().refreshSessions().finally(() => setRefreshing(false));
-    };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, []);
-
-  const MAIN_NAV = [
-    { to: "/timeline", label: t("nav.timeline"), icon: "≡" },
-    { to: "/replay", label: t("nav.timeReplay"), icon: "▷" },
-    { to: "/settings", label: t("nav.settings"), icon: "⚙" },
-    { to: "/about", label: t("nav.about"), icon: "ℹ" },
-  ] as const;
-
-  const DEV_NAV = [
-    { to: "/sessions", label: t("nav.sessions") },
-    { to: "/ocr", label: t("nav.ocrSearch") },
-    { to: "/health", label: t("nav.health") },
-  ] as const;
-
-  function titleForPath(pathname: string): { title: string; sub?: string } {
-    if (pathname.startsWith("/lens")) return { title: t("nav.todayLens"), sub: t("nav.todayLensDesc") };
-    if (pathname.startsWith("/timeline")) return { title: t("nav.timeline"), sub: t("nav.timelineDesc") };
-    if (pathname.startsWith("/replay")) return { title: t("nav.timeReplay"), sub: t("nav.timeReplayDesc") };
-    if (pathname.startsWith("/report")) return { title: t("nav.dailyReport"), sub: t("nav.dailyReportDesc") };
-    if (pathname.startsWith("/weekly")) return { title: t("nav.weeklyReport"), sub: t("nav.weeklyReportDesc") };
-    if (pathname.startsWith("/assistant")) return { title: t("nav.assistant"), sub: t("nav.assistantDesc") };
-    if (pathname.startsWith("/settings")) return { title: t("nav.settings"), sub: t("nav.settingsDesc") };
-    if (pathname.startsWith("/sessions")) return { title: t("nav.sessions"), sub: t("nav.sessionsDesc") };
-    if (pathname.startsWith("/ocr-eval")) return { title: t("nav.ocrEval"), sub: t("nav.devTools") };
-    if (pathname.startsWith("/ocr")) return { title: t("nav.ocrSearch"), sub: t("nav.ocrSearchDesc") };
-    if (pathname.startsWith("/intents")) return { title: t("nav.intents"), sub: t("nav.intentsDesc") };
-    if (pathname.startsWith("/health")) return { title: t("nav.health"), sub: t("nav.devTools") };
-    if (pathname.startsWith("/about")) return { title: t("nav.about"), sub: t("nav.aboutDesc") };
-    return { title: "TimeLens" };
-  }
-
-  const { title, sub } = titleForPath(location.pathname);
-
-  const toggleCapture = useCallback(async () => {
-    if (captureBusy) return;
-    setCaptureBusy(true);
-    try {
-      if (isTracking) await api.stopTracking();
-      else await api.startTracking();
-    } catch (e) {
-      useAppStore.setState({ error: String(e) });
-    } finally {
-      setCaptureBusy(false);
-    }
-  }, [captureBusy, isTracking]);
-
-  return (
-    <div className="tl-app flex h-screen min-h-0 flex-col bg-[var(--tl-bg)] text-[var(--tl-ink)]">
-      <div className="tl-shell mx-auto flex min-h-0 w-full max-w-[1320px] flex-1">
-        <aside
-          className="tl-sidebar tl-shell-blur-surface flex w-[min(278px,100%)] shrink-0 flex-col border-r border-[var(--tl-line)] bg-[var(--tl-sidebar-bg)] backdrop-blur-md"
-          aria-label={t("nav.mainNav")}
-        >
-          <div className="border-b border-[var(--tl-line)] px-4 py-3">
-            <div className="font-mono text-[0.68rem] font-extrabold uppercase tracking-[0.2em] text-[var(--tl-cyan)]">
-              TIMELENS
-            </div>
-            <div className="mt-1 font-mono text-[0.58rem] tracking-wide text-[var(--tl-muted)]">
-              INSIGHT ENGINE
-            </div>
-          </div>
-          <nav className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2 pb-4" aria-label={t("nav.featureModules")}>
-            <div className="px-2 py-2 font-mono text-[0.58rem] font-semibold uppercase tracking-widest text-[var(--tl-muted)]">
-              {t("nav.features")}
-            </div>
-            {MAIN_NAV.map(({ to, label, icon }) =>
-              <NavLink key={to} to={to} className={({ isActive }) => navCls(isActive)}>
-                {({ isActive }) => (
-                  <>
-                    <span
-                      className={`w-5 text-center ${isActive ? "text-[var(--tl-cyan)]" : "text-[var(--tl-cyan-dim)]"}`}
-                    >
-                      {icon}
-                    </span>
-                    <span className="flex-1">{label}</span>
-                    {to === "/about" && updateAvailable && (
-                      <span className="ml-auto h-2 w-2 rounded-full bg-[var(--tl-status-bad)]" />
-                    )}
-                  </>
-                )}
-              </NavLink>
-            )}
-            {devEnabled && (
-              <>
-                <div className="mt-3 px-2 py-2 font-mono text-[0.58rem] font-semibold uppercase tracking-widest text-[var(--tl-muted)]">
-                  {t("nav.devTools")} <span className="text-[var(--tl-purple)]">Dev</span>
-                </div>
-                {DEV_NAV.map(({ to, label }) => (
-                  <NavLink key={to} to={to} className={({ isActive }) => navCls(isActive)}>
-                    <span className="w-5 text-center opacity-60">›</span>
-                    {label}
-                  </NavLink>
-                ))}
-              </>
-            )}
-          </nav>
-        </aside>
-
-        <div className="flex min-w-0 min-h-0 flex-1 flex-col bg-gradient-to-b from-[var(--tl-shell-gradient-from)] to-[var(--tl-bg)]">
-          {refreshing && (
-            <div className="h-0.5 w-full overflow-hidden bg-[var(--tl-line)]">
-              <div className="h-full w-1/3 animate-pulse rounded bg-[var(--tl-cyan)]" style={{ animation: "tl-slide 1s ease-in-out infinite" }} />
-            </div>
-          )}
-          <header className="tl-shell-blur-surface flex flex-wrap items-center justify-between gap-3 border-b border-[var(--tl-line)] bg-[var(--tl-header-bg)] px-5 py-3 backdrop-blur-md">
-            <div className="min-w-0 flex-1">
-              <h1 className="text-[1.05rem] font-bold tracking-wide">{title}</h1>
-              {sub ? (
-                <p className="mt-0.5 font-mono text-[0.72rem] text-[var(--tl-muted)]">{sub}</p>
-              ) : null}
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-3">
-              <button
-                type="button"
-                onClick={() => void toggleCapture()}
-                disabled={captureBusy}
-                aria-pressed={isTracking}
-                title={isTracking ? t("nav.clickToStop") : t("nav.clickToStart")}
-                className={[
-                  "tl-interactive-row flex min-w-[9.5rem] flex-col items-stretch rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-50",
-                  isTracking
-                    ? "border-[var(--tl-capture-on-border)] bg-[var(--tl-capture-on-bg)] hover:bg-[var(--tl-capture-on-hover)]"
-                    : "border-[var(--tl-capture-idle-border)] bg-[var(--tl-capture-idle-bg)] hover:bg-[var(--tl-capture-idle-hover)]",
-                ].join(" ")}
-              >
-                <span className="font-mono text-[0.58rem] font-semibold uppercase tracking-[0.12em] text-[var(--tl-muted)]">
-                  {t("nav.captureStatus")}
-                </span>
-                <span
-                  className={[
-                    "mt-0.5 text-sm font-semibold",
-                    isTracking ? "text-[var(--tl-tracking-on-text)]" : "text-[var(--tl-muted)]",
-                  ].join(" ")}
-                >
-                  {captureBusy ? "…" : isTracking ? t("nav.capturing") : t("nav.stopCapture")}
-                </span>
-              </button>
-              <div className="flex flex-col gap-0.5 rounded-lg border border-[var(--tl-line)] bg-[var(--tl-input-fill)] px-1.5 py-1">
-                <div className="flex items-center gap-1">
-                  <span className="text-[0.55rem] text-[var(--tl-muted)]">☀</span>
-                  {([
-                    ["white", "#0d9488"],
-                    ["claude", "#c96442"],
-                    ["cursor", "#f54e00"],
-                    ["catppuccin", "#1e66f5"],
-                    ["rosepine", "#286983"],
-                    ["gruvbox-light", "#076678"],
-                  ] as [UiTheme, string][]).map(([id, color]) => (
-                    <button
-                      key={id}
-                      type="button"
-                      onClick={() => setTheme(id)}
-                      className={`rounded-full p-0.5 transition-opacity ${theme === id ? "ring-1 ring-[var(--tl-ink)] ring-offset-1 ring-offset-[var(--tl-bg)]" : "opacity-50 hover:opacity-100"}`}
-                      title={t(`settings.theme${id.replace(/-./g, c => c[1].toUpperCase()).replace(/^./, c => c.toUpperCase())}` as any)}
-                    >
-                      <span className="block h-2.5 w-2.5 rounded-full" style={{ background: color }} />
-                    </button>
-                  ))}
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="text-[0.55rem] text-[var(--tl-muted)]">☾</span>
-                  {([
-                    ["tech", "#00f5d4"],
-                    ["raycast", "#FF6363"],
-                    ["spotify", "#1ed760"],
-                    ["linear", "#5e6ad2"],
-                    ["dracula", "#bd93f9"],
-                    ["nord", "#88c0d0"],
-                    ["tokyo-night", "#7aa2f7"],
-                    ["gruvbox-dark", "#83a598"],
-                    ["one-dark", "#61afef"],
-                  ] as [UiTheme, string][]).map(([id, color]) => (
-                    <button
-                      key={id}
-                      type="button"
-                      onClick={() => setTheme(id)}
-                      className={`rounded-full p-0.5 transition-opacity ${theme === id ? "ring-1 ring-[var(--tl-ink)] ring-offset-1 ring-offset-[var(--tl-bg)]" : "opacity-50 hover:opacity-100"}`}
-                      title={t(`settings.theme${id.replace(/-./g, c => c[1].toUpperCase()).replace(/^./, c => c.toUpperCase())}` as any)}
-                    >
-                      <span className="block h-2.5 w-2.5 rounded-full" style={{ background: color }} />
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="flex items-center gap-1 rounded-lg border border-[var(--tl-line)] bg-[var(--tl-input-fill)] px-1 py-1">
-                {(["zh-CN", "en"] as SupportedLanguage[]).map((lang) => (
-                  <button
-                    key={lang}
-                    type="button"
-                    onClick={() => { setLanguage(lang); setCurrentLang(lang); }}
-                    className={`rounded px-2 py-1 text-[0.65rem] transition-colors ${currentLang === lang ? "bg-[var(--tl-accent-12)] text-[var(--tl-ink)]" : "text-[var(--tl-muted)] hover:text-[var(--tl-ink)]"}`}
-                  >
-                    {lang === "zh-CN" ? "中文" : "EN"}
-                  </button>
-                ))}
-              </div>
-              <label className="flex items-center gap-2 font-mono text-xs text-[var(--tl-muted)]">
-                {t("common.date")}
-                <input
-                  type="date"
-                  value={date}
-                  onChange={(e) => setDate(e.target.value)}
-                  className="rounded-lg border border-[var(--tl-line)] bg-[var(--tl-input-fill)] px-2 py-1.5 text-[var(--tl-ink)]"
-                />
-              </label>
-            </div>
-          </header>
-          <div className="flex min-h-0 flex-1">
-            <main className="min-h-0 flex-1 overflow-hidden">
-              <Outlet />
-            </main>
-          </div>
-          <AiTaskBanner />
-        </div>
+    if (!datedPage || Date.now() - lastRefresh.current < 30000) return;
+    lastRefresh.current = Date.now(); setRefreshing(true);
+    void useAppStore.getState().refreshSessions().finally(() => setRefreshing(false));
+  }, [location.pathname, datedPage]);
+  const nav = [
+    { to: "/task", title: text("采集任务", "Collection task"), icon: "▣", sub: text("进度、权限与上传", "Progress, permissions and upload") },
+    { to: "/timeline", title: t("nav.timeline"), icon: "≡", sub: t("nav.timelineDesc") },
+    { to: "/replay", title: t("nav.timeReplay"), icon: "▷", sub: t("nav.timeReplayDesc") },
+    { to: "/settings", title: t("nav.settings"), icon: "⚙", sub: t("nav.settingsDesc") },
+    { to: "/about", title: t("nav.about"), icon: "ⓘ", sub: text("内部版本与开源说明", "Internal build and attribution") },
+  ];
+  const current = nav.find(n => location.pathname.startsWith(n.to));
+  const p = data?.progress;
+  const percentage = p ? Math.min(100, Math.max(0, p.elapsedMs / Math.max(1, p.targetMs) * 100)) : 0;
+  return <div className="tl-app desktop-app">
+    <aside className="desktop-sidebar" aria-label={t("nav.mainNav")}>
+      <Link className="desktop-brand" to="/task"><span className="desktop-logo" aria-hidden="true">T</span><span><strong>TimeLens</strong><small>{text("屏幕记录 · 内部版", "Screen capture · Internal")}</small></span></Link>
+      <div className="desktop-nav-label">{text("工作空间", "Workspace")}</div>
+      <nav className="desktop-nav" aria-label={t("nav.featureModules")}>
+        {nav.map(n => <NavLink key={n.to} to={n.to} className={({ isActive }) => `desktop-nav-link ${isActive ? "is-active" : ""}`}><span aria-hidden="true">{n.icon}</span>{n.title}{n.to === "/settings" && draft && <span className="desktop-unsaved-dot" aria-label={text("有未保存设置", "Unsaved settings")} />}</NavLink>)}
+        {devEnabled && <><div className="desktop-nav-label">{text("开发工具", "Developer tools")}</div>{[["/sessions", t("nav.sessions")], ["/ocr", t("nav.ocrSearch")], ["/health", t("nav.health")]].map(([to,label]) => <NavLink key={to} to={to} className="desktop-nav-link">{label}</NavLink>)}</>}
+      </nav>
+      <div className="desktop-sidebar-bottom">
+        <div className="flex justify-between gap-2"><span className="desktop-caption">{text("任务进度", "Task progress")}</span><strong className="text-xs tabular-nums">{percentage.toFixed(1)}%</strong></div>
+        <div className="desktop-progress mt-3"><span style={{ width: `${percentage}%` }} /></div>
+        <p className="desktop-caption mt-3">{p ? `${text("剩余", "Remaining")} ${duration(Math.ceil(Math.max(0,p.targetMs-p.elapsedMs)/60000)*60000, english)}` : text("正在读取任务…", "Loading task…")}</p>
+        <Link to="/settings?tab=admin" className="desktop-server-state"><span className={`desktop-dot ${data && !data.uploadMissing.length ? "is-green" : "is-amber"}`} />{data && !data.uploadMissing.length ? text("上传配置就绪", "Upload configured") : text("上传配置待完成", "Upload setup incomplete")}</Link>
+        <p className="desktop-caption text-[11px] mt-3">{text("关闭窗口后仍在后台运行", "Closing the window keeps the app running")}</p>
       </div>
+    </aside>
+    <div className="desktop-workspace">
+      <header className="desktop-toolbar">
+        <div className="min-w-0"><h1>{current?.title ?? "TimeLens"}</h1><p>{current?.sub}</p></div>
+        <div className="flex items-center gap-3 shrink-0">
+          <span className={`desktop-status ${p?.status === "recording" ? "is-recording" : ""}`} role="status"><span className={`desktop-dot ${p?.status === "recording" ? "is-green" : ""}`} />{p ? taskLabel(p.status, english) : text("读取中", "Loading")}</span>
+          {draft && <Link to="/settings" className="desktop-text-link text-xs">{text("设置未保存", "Unsaved settings")}</Link>}
+          <TaskControls />
+        </div>
+      </header>
+      {datedPage && <div className="desktop-page-tools"><label htmlFor="workspace-date">{text("查看日期", "Date")}</label><input id="workspace-date" type="date" value={date} onChange={e => setDate(e.target.value)} className="desktop-input"/><button className="desktop-button" disabled={refreshing} onClick={() => { setRefreshing(true); void Promise.all([useAppStore.getState().refreshSessions(), refresh()]).finally(() => setRefreshing(false)); }}>{refreshing ? text("刷新中…", "Refreshing…") : text("刷新", "Refresh")}</button></div>}
+      {(error || loadError || appError) && <div className="desktop-global-notice"><DesktopError error={error || loadError || appError || ""} onRetry={() => { clearError(); void refresh(); }} onDismiss={() => { clearError(); useInternalStore.setState({ error: "", loadError: "" }); }}/></div>}
+      {message && !(error || loadError || appError) && <div className="desktop-global-success" role="status"><span>✓ {message}</span><button className="desktop-icon-button" aria-label={text("关闭提示", "Dismiss notice")} onClick={() => useInternalStore.setState({ message: "" })}>×</button></div>}
+      <main className="desktop-main"><DesktopPageBoundary key={location.pathname} resetKey={location.search}><Outlet /></DesktopPageBoundary></main>
+      <footer className="desktop-statusbar"><span>{data ? `${data.snapshots.count} ${text("张截图", "frames")} · ${text("最近入库截图", "Latest stored frame")} ${shotTime(data.snapshots.latestAtMs,english)}` : text("正在读取本地数据…", "Loading local data…")}</span><span className="truncate" title={p?.status === "recording" ? captureLabel(data?.captureNotice.code ?? "", english) : undefined}>{p?.status === "recording" ? `${text("最近尝试", "Last attempt")}: ${captureLabel(data?.captureNotice.code ?? "",english)}` : p?.status === "uploaded" ? text("服务器已确认接收，本地清理完成", "Server receipt confirmed; local cleanup complete") : text("当前未采集屏幕", "Screen collection is inactive")}</span></footer>
     </div>
-  );
+  </div>;
 }

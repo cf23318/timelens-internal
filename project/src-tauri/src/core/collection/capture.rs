@@ -187,13 +187,16 @@ pub fn spawn_capture_thread(
                 url.as_deref(),
                 browser::is_browser(&front),
             ) {
+                control.note_capture(sig.epoch, "privacy");
                 continue;
             }
             if is_afk.load(Ordering::Relaxed) {
+                control.note_capture(sig.epoch, "idle");
                 warn!("capture skipped (afk): trigger={}", sig.trigger_type);
                 continue;
             }
             if !screen_ok.load(Ordering::Relaxed) {
+                control.note_capture(sig.epoch, "permission");
                 warn!(
                     "capture skipped (screen recording not allowed / not refreshed): trigger={}",
                     sig.trigger_type
@@ -219,6 +222,7 @@ pub fn spawn_capture_thread(
             let images = match captured {
                 Ok(i) => i,
                 Err(e) => {
+                    control.note_capture(sig.epoch, "capture_error");
                     warn!("screen grab: {e}");
                     continue;
                 }
@@ -260,6 +264,7 @@ pub fn spawn_capture_thread(
                     let key = format!("{}:{display}", sid);
                     if let Some((prev, saved)) = last_phash.get(&key) {
                         if hnow.dist(prev) < 5 && saved.elapsed() < Duration::from_secs(60) {
+                            control.note_capture(sig.epoch, "duplicate");
                             continue;
                         }
                     }
@@ -283,6 +288,7 @@ pub fn spawn_capture_thread(
                 );
                 let out_path = shot_dir.join(&fname);
                 if let Err(e) = write_webp_lossy(&scaled, &out_path, webp_q) {
+                    control.note_capture(sig.epoch, "save_error");
                     warn!("save webp: {e}");
                     continue;
                 }
@@ -303,10 +309,12 @@ pub fn spawn_capture_thread(
                     perceptual_hash: perceptual_hash.clone(),
                 };
                 if writer.try_send(WriteEvent::Snapshot(row)).is_err() {
+                    control.note_capture(sig.epoch, "save_error");
                     let _ = fs::remove_file(&out_path);
                     continue;
                 }
                 let path_for_ocr = fp.clone();
+                control.note_capture(sig.epoch, "queued");
                 let ocr_snapshot_id = id.clone();
                 let ocr_session_id = sid.clone();
                 let ocr_trigger = sig.trigger_type.clone();
