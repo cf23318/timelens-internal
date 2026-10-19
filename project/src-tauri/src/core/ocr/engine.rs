@@ -9,11 +9,12 @@ use std::process::Command;
 
 use image::DynamicImage;
 use serde_json::json;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use uuid::Uuid;
 
-use super::pipeline::{build_gated_from_word_lines, OcrPipelineConfig, OcrPipelineOutput};
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use super::pipeline::build_gated_text;
+use super::pipeline::{build_gated_from_word_lines, OcrPipelineConfig, OcrPipelineOutput};
 use super::preprocess::{maybe_invert_dark_ui, scale_up_if_small};
 use super::redact::{pick_summary_line, redact_screen_text};
 
@@ -58,7 +59,8 @@ fn run_tesseract_tsv_png(image_path: &Path, lang: &str, psm: i32) -> Result<Stri
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "未找到 tesseract：请安装 Tesseract OCR 并加入 PATH（或设置 TIMELENS_TESSERACT）".to_string()
+                "未找到 tesseract：请安装 Tesseract OCR 并加入 PATH（或设置 TIMELENS_TESSERACT）"
+                    .to_string()
             } else {
                 format!("tesseract 启动失败: {e}")
             }
@@ -74,14 +76,17 @@ fn run_tesseract_tsv_png(image_path: &Path, lang: &str, psm: i32) -> Result<Stri
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn try_tesseract_with_lang_fallback(image_path: &Path, primary_lang: &str, psm: i32) -> Result<String, String> {
+fn try_tesseract_with_lang_fallback(
+    image_path: &Path,
+    primary_lang: &str,
+    psm: i32,
+) -> Result<String, String> {
     match run_tesseract_tsv_png(image_path, primary_lang, psm) {
         Ok(s) => Ok(s),
         Err(e) => {
             if primary_lang != "eng" {
-                run_tesseract_tsv_png(image_path, "eng", psm).map_err(|e2| {
-                    format!("OCR 失败（{primary_lang}）：{e}；回退 eng：{e2}")
-                })
+                run_tesseract_tsv_png(image_path, "eng", psm)
+                    .map_err(|e2| format!("OCR 失败（{primary_lang}）：{e}；回退 eng：{e2}"))
             } else {
                 Err(e)
             }
@@ -104,7 +109,12 @@ fn build_meta(cfg: &OcrPipelineConfig, pipe: &OcrPipelineOutput, engine: &str) -
     let avg: f32 = if kept == 0 {
         0.0
     } else {
-        let sum: f32 = pipe.lines.iter().filter(|l| l.kept).map(|l| l.avg_conf).sum();
+        let sum: f32 = pipe
+            .lines
+            .iter()
+            .filter(|l| l.kept)
+            .map(|l| l.avg_conf)
+            .sum();
         sum / kept as f32
     };
     json!({
@@ -156,7 +166,11 @@ pub fn load_image_for_ocr(path: &Path) -> Result<DynamicImage, String> {
 }
 
 /// 对磁盘图像（WebP/PNG 等）执行完整管线。
-pub fn ocr_image_file(image_path: &Path, cfg: &OcrPipelineConfig) -> Result<OcrWebpOutcome, String> {
+pub fn ocr_image_file(
+    image_path: &Path,
+    cfg: &OcrPipelineConfig,
+    scratch_root: &Path,
+) -> Result<OcrWebpOutcome, String> {
     let mut img = load_image_for_ocr(image_path)?;
     if cfg.preprocess_scale {
         img = scale_up_if_small(&img, 900, 1400, 2400);
@@ -164,7 +178,12 @@ pub fn ocr_image_file(image_path: &Path, cfg: &OcrPipelineConfig) -> Result<OcrW
     if cfg.preprocess_dark_invert {
         img = maybe_invert_dark_ui(&img, 70);
     }
-    let tmp = std::env::temp_dir().join(format!("tl_ocr_{}.png", Uuid::new_v4()));
+    fs::create_dir_all(scratch_root).map_err(|e| e.to_string())?;
+    let scratch = tempfile::Builder::new()
+        .prefix("ocr-")
+        .tempdir_in(scratch_root)
+        .map_err(|e| e.to_string())?;
+    let tmp = scratch.path().join("capture.png");
     img.save_with_format(&tmp, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
 

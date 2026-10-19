@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>TimeLens 内部版需要读取前台浏览器的网址，用于定位工作流程和排除网银页面；不读取网页输入内容。</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>TimeLens 需要屏幕录制权限以进行会话截图与活动记录。</string>
 	<key>NSAccessibilityUsageDescription</key>

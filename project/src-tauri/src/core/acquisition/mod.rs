@@ -82,11 +82,3 @@ pub fn sample_ambient_extras() -> AmbientExtras {
 pub fn notifications_listener_access_granted() -> bool {
     false
 }
-
-#[cfg(target_os = "windows")]
-pub fn spawn_low_level_input_hooks(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    win::spawn_low_level_input_hooks(running);
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn spawn_low_level_input_hooks(_running: std::sync::Arc<std::sync::atomic::AtomicBool>) {}

@@ -1,8 +1,6 @@
 //! Phase 10: AI 对话助手 — 专属分析师模式。
 //! 消耗本地聚合快照 + 对话历史，向 OpenAI 兼容端点提问。
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 const SYSTEM_PROMPT_ZH: &str = r#"你是 TimeLens 专属分析师，深度了解用户的工作习惯与效率数据。
@@ -72,7 +70,11 @@ pub fn query_assistant(
     lang: &str,
 ) -> Result<String, String> {
     let is_en = lang == "en";
-    let system_prompt = if is_en { SYSTEM_PROMPT_EN } else { SYSTEM_PROMPT_ZH };
+    let system_prompt = if is_en {
+        SYSTEM_PROMPT_EN
+    } else {
+        SYSTEM_PROMPT_ZH
+    };
 
     let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system_prompt})];
 
@@ -89,7 +91,11 @@ pub fn query_assistant(
     }
 
     // Append conversation history (limited to last 10 turns to control token budget)
-    let history_slice = if history.len() > 10 { &history[history.len() - 10..] } else { history };
+    let history_slice = if history.len() > 10 {
+        &history[history.len() - 10..]
+    } else {
+        history
+    };
     for msg in history_slice {
         messages.push(json!({"role": msg.role, "content": msg.content}));
     }
@@ -98,10 +104,7 @@ pub fn query_assistant(
     messages.push(json!({"role": "user", "content": question}));
 
     let url = normalize_chat_url(base_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::core::internal::external_ai_client()?;
 
     let body = json!({
         "model": model,

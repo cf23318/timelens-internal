@@ -1,3 +1,11 @@
+# TimeLens Internal
+
+This repository adapts [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5 (`f8e7107`) and retains its MIT license. See [INTERNAL_REVIEW.md](INTERNAL_REVIEW.md) for implementation and verification limits. The upstream introduction and download links below describe the original project, not this adaptation.
+
+Collection starts manually and uses periodic screenshots, with a default cumulative target of 16 hours. Foreground-app screenshot blocking is independent of OCR and does not mask other visible windows. Original screenshot pixels are not redacted. External AI and online updates are disabled; internal upload configuration is empty by default. Runtime data and credentials are excluded from source publication. A Mac build and short local trial have been completed; Windows runtime and full two-workday acceptance remain unverified.
+
+---
+
 <!-- markdownlint-disable MD033 MD041 MD036 MD060 -->
 
 <div align="center">

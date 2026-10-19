@@ -8,16 +8,14 @@ use parking_lot::Mutex;
 use std::time::Instant;
 
 use chrono::Utc;
-use rusqlite::Connection;
 use log::warn;
+use rusqlite::Connection;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use crate::core::intent_mapping::resolve_intent;
-use crate::core::models::{
-    AggregationCmd, SessionUpdateOp, WindowSession, WriteEvent,
-};
+use crate::core::models::{AggregationCmd, SessionUpdateOp, WindowSession, WriteEvent};
 use crate::core::writer::WriterHandle;
 
 struct AggState {
@@ -35,6 +33,22 @@ impl Default for AggState {
             last_app: String::new(),
             last_bundle: None,
         }
+    }
+}
+
+impl AggState {
+    fn take_active_close(&mut self, timestamp_ms: i64) -> Option<SessionUpdateOp> {
+        let id = self.active_id.take()?;
+        let end_ms = timestamp_ms.max(self.start_ms);
+        let duration_ms = end_ms - self.start_ms;
+        self.start_ms = 0;
+        self.last_app.clear();
+        self.last_bundle = None;
+        Some(SessionUpdateOp::Close {
+            id,
+            end_ms,
+            duration_ms,
+        })
     }
 }
 
@@ -121,12 +135,7 @@ fn resolved_intent_for_insert(
     bundle_id: &Option<String>,
 ) -> Option<String> {
     let g = read_conn.lock();
-    resolve_intent(
-        &g,
-        app_name,
-        bundle_id.as_deref(),
-    )
-    .unwrap_or(None)
+    resolve_intent(&g, app_name, bundle_id.as_deref()).unwrap_or(None)
 }
 
 fn handle_cmd(
@@ -140,12 +149,20 @@ fn handle_cmd(
 ) {
     match cmd {
         AggregationCmd::Shutdown => {}
-        AggregationCmd::EnterAfk { timestamp_ms, idle_seconds } => {
-            if is_afk.load(Ordering::Relaxed) {
-                return;
-            }
-            if let Some(ref id) = st.active_id {
-                close_session(writer, id, st.start_ms, timestamp_ms);
+        AggregationCmd::Barrier(done) => {
+            let _ = done.send(());
+        }
+        AggregationCmd::SessionReady(done) => {
+            let _ = done.send(st.active_id.clone());
+        }
+        AggregationCmd::EnterAfk {
+            timestamp_ms,
+            idle_seconds,
+        } => {
+            // The tracker publishes the shared flag before this queued command is consumed.
+            // Close by actor-owned session state, rather than skipping an already-published flag.
+            if let Some(close) = st.take_active_close(timestamp_ms) {
+                let _ = writer.try_send(WriteEvent::SessionUpdate(close));
             }
             let _ = writer.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::DeactivateAll));
             st.active_id = None;
@@ -199,11 +216,14 @@ fn handle_cmd(
                 true,
             );
             emit_session(app, &w);
-            let _ = app.emit("afk_state_changed", json!({ "isAfk": false, "idleSeconds": 0.0 }));
+            let _ = app.emit(
+                "afk_state_changed",
+                json!({ "isAfk": false, "idleSeconds": 0.0 }),
+            );
         }
         AggregationCmd::EnterRecordingBlackout { timestamp_ms } => {
-            if let Some(ref id) = st.active_id {
-                close_session(writer, id, st.start_ms, timestamp_ms);
+            if let Some(close) = st.take_active_close(timestamp_ms) {
+                let _ = writer.try_send(WriteEvent::SessionUpdate(close));
             }
             let _ = writer.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::DeactivateAll));
             st.active_id = None;
@@ -231,7 +251,8 @@ fn handle_cmd(
                     if let Some(ref id) = st.active_id {
                         close_session(writer, id, st.start_ms, timestamp_ms);
                     }
-                    let _ = writer.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::DeactivateAll));
+                    let _ =
+                        writer.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::DeactivateAll));
                     let new_id = Uuid::new_v4().to_string();
                     let intent = resolved_intent_for_insert(read_conn, &app_name, &bundle_id);
                     insert_session(
@@ -267,12 +288,7 @@ fn handle_cmd(
                 }
                 "poll" | "title_change" => {
                     if let Some(ref id) = st.active_id {
-                        if same_app(
-                            &st.last_app,
-                            &st.last_bundle,
-                            &app_name,
-                            &bundle_id,
-                        ) {
+                        if same_app(&st.last_app, &st.last_bundle, &app_name, &bundle_id) {
                             let end = timestamp_ms;
                             let dur = (end - st.start_ms).max(0);
                             let _ = writer.try_send(WriteEvent::SessionUpdate(
@@ -289,10 +305,12 @@ fn handle_cmd(
                             if let Some(ref oid) = st.active_id.clone() {
                                 close_session(writer, oid, st.start_ms, timestamp_ms);
                             }
-                            let _ =
-                                writer.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::DeactivateAll));
+                            let _ = writer.try_send(WriteEvent::SessionUpdate(
+                                SessionUpdateOp::DeactivateAll,
+                            ));
                             let new_id = Uuid::new_v4().to_string();
-                            let intent = resolved_intent_for_insert(read_conn, &app_name, &bundle_id);
+                            let intent =
+                                resolved_intent_for_insert(read_conn, &app_name, &bundle_id);
                             insert_session(
                                 writer,
                                 &new_id,
@@ -379,9 +397,9 @@ fn compensate(
     let conn = read_conn.lock();
     let now = Utc::now().timestamp_millis();
     let stale_ms = 10 * 60 * 1000;
-    let mut stmt = match conn.prepare(
-        "SELECT id, start_ms, end_ms FROM window_sessions WHERE is_active = 1",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT id, start_ms, end_ms FROM window_sessions WHERE is_active = 1")
+    {
         Ok(s) => s,
         Err(e) => {
             warn!("compensate prepare: {e}");
@@ -389,7 +407,11 @@ fn compensate(
         }
     };
     let rows = match stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     }) {
         Ok(r) => r,
         Err(e) => {
@@ -453,7 +475,38 @@ pub fn spawn_aggregation_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::same_app;
+    use super::*;
+
+    #[test]
+    fn afk_closes_active_session_even_when_tracker_already_published_flag() {
+        let is_afk = AtomicBool::new(true);
+        let mut st = AggState {
+            active_id: Some("session".into()),
+            start_ms: 1000,
+            ..Default::default()
+        };
+        assert!(is_afk.load(Ordering::Relaxed));
+        match st.take_active_close(2000).unwrap() {
+            SessionUpdateOp::Close {
+                id,
+                end_ms,
+                duration_ms,
+            } => {
+                assert_eq!(id, "session");
+                assert_eq!(end_ms, 2000);
+                assert_eq!(duration_ms, 1000);
+            }
+            _ => panic!("expected close"),
+        }
+        // A subsequent pause or duplicate AFK command must not extend the old session.
+        assert!(st.take_active_close(500_000).is_none());
+        st.active_id = Some("new".into());
+        st.start_ms = 500_000;
+        match st.take_active_close(2000).unwrap() {
+            SessionUpdateOp::Close { duration_ms, .. } => assert_eq!(duration_ms, 0),
+            _ => panic!("expected close"),
+        }
+    }
 
     #[test]
     fn same_app_matches_bundle_id() {

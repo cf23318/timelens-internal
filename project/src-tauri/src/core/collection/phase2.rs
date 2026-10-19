@@ -6,6 +6,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
+use crate::core::internal::InternalControl;
 use crate::core::settings::app_name_blacklisted;
 use std::thread;
 use std::time::Duration;
@@ -15,10 +16,10 @@ use crc32fast::Hasher as CrcHasher;
 use log::warn;
 use uuid::Uuid;
 
-use crate::core::acquisition::{self, active_display_count, hardware_input_delta, sample_ambient_extras};
-use crate::core::models::{
-    AmbientContextRow, ClipboardFlowRow, InputMetricRow, WriteEvent,
+use crate::core::acquisition::{
+    self, active_display_count, hardware_input_delta, sample_ambient_extras,
 };
+use crate::core::models::{AmbientContextRow, ClipboardFlowRow, InputMetricRow, WriteEvent};
 use crate::core::writer::WriterHandle;
 
 pub struct Phase2EngineFlags {
@@ -35,6 +36,7 @@ pub fn spawn_phase2_collectors(
     current_session: Arc<RwLock<Option<String>>>,
     flags: Phase2EngineFlags,
     app_blacklist: Arc<RwLock<Vec<String>>>,
+    control: Arc<InternalControl>,
 ) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -43,14 +45,16 @@ pub fn spawn_phase2_collectors(
         let r = running.clone();
         let cs = current_session.clone();
         let fi = flags.input.clone();
-        thread::spawn(move || input_loop(w, t, r, cs, fi));
+        let ctl = control.clone();
+        thread::spawn(move || input_loop(w, t, r, cs, fi, ctl));
 
         let w = writer.clone();
         let t = tracking.clone();
         let r = running.clone();
         let fc = flags.clipboard.clone();
         let bl = app_blacklist.clone();
-        thread::spawn(move || clipboard_loop(w, t, r, fc, bl));
+        let ctl = control.clone();
+        thread::spawn(move || clipboard_loop(w, t, r, fc, bl, ctl));
 
         let w = writer.clone();
         let t = tracking.clone();
@@ -67,17 +71,33 @@ fn input_loop(
     running: Arc<AtomicBool>,
     current_session: Arc<RwLock<Option<String>>>,
     enabled: Arc<AtomicBool>,
+    control: Arc<InternalControl>,
 ) {
     let interval = Duration::from_secs(5);
+    let mut last_epoch = None;
     while running.load(Ordering::Relaxed) {
         thread::sleep(interval);
+        let (keys, clicks) = hardware_input_delta();
         if !tracking.load(Ordering::Relaxed) || !enabled.load(Ordering::Relaxed) {
+            last_epoch = None;
+            continue;
+        }
+        let epoch = control.epoch.load(Ordering::SeqCst);
+        let Some(_active) = control.active(epoch) else {
+            last_epoch = None;
+            continue;
+        };
+        if last_epoch != Some(epoch) {
+            last_epoch = Some(epoch);
+            continue;
+        }
+        // Internal Windows build uses GetLastInputInfo only, without keyboard/mouse hooks.
+        if cfg!(target_os = "windows") {
             continue;
         }
         if !acquisition::ax_trusted() {
             continue;
         }
-        let (keys, clicks) = hardware_input_delta();
         let ts = Utc::now().timestamp_millis();
         let sid = current_session.read().ok().and_then(|g| g.clone());
         let secs = 5.0_f64;
@@ -113,6 +133,7 @@ fn clipboard_loop(
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     app_blacklist: Arc<RwLock<Vec<String>>>,
+    control: Arc<InternalControl>,
 ) {
     use arboard::Clipboard;
     let mut clip = loop {
@@ -133,11 +154,25 @@ fn clipboard_loop(
     // 当前剪贴板内容对应的 copy 边（与后续 paste 共用 `flow_pair_id`）。
     let mut open_pair: Option<(String, Option<String>, String)> = None;
     let mut pasted_for_open_pair = false;
+    let mut last_epoch = u64::MAX;
 
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(3));
         if !tracking.load(Ordering::Relaxed) || !enabled.load(Ordering::Relaxed) {
+            last_sig = None;
+            open_pair = None;
+            pasted_for_open_pair = false;
             continue;
+        }
+        let epoch = control.epoch.load(Ordering::SeqCst);
+        let Some(_active) = control.active(epoch) else {
+            continue;
+        };
+        if last_epoch != epoch {
+            last_epoch = epoch;
+            last_sig = None;
+            open_pair = None;
+            pasted_for_open_pair = false;
         }
         let list = app_blacklist
             .read()

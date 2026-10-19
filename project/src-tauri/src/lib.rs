@@ -61,11 +61,15 @@ fn timelens_uri_response<R: tauri::Runtime>(
 }
 
 pub struct AppStateInner {
+    pub _data_lock: std::fs::File,
+    pub exiting: AtomicBool,
     pub paths: core::storage::DataPaths,
     pub read_conn: Arc<Mutex<rusqlite::Connection>>,
     pub writer: core::writer::WriterHandle,
     pub writer_metrics: Arc<core::writer::WriterMetrics>,
     pub tracking: Arc<AtomicBool>,
+    pub internal: Arc<core::internal::InternalControl>,
+    pub aggregation_tx: std::sync::mpsc::Sender<core::models::AggregationCmd>,
     pub running: Arc<AtomicBool>,
     pub is_afk: Arc<AtomicBool>,
     pub screen_ok: Arc<AtomicBool>,
@@ -90,6 +94,11 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("internal-navigation")
+                .on_navigation(|_, url| core::internal::allow_webview_navigation(url))
+                .build(),
+        )
         .register_uri_scheme_protocol("timelens", timelens_uri_response)
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -105,21 +114,22 @@ pub fn run() {
             // `tauri.conf.json` + `tauri.windows.conf.json` 中声明，不再在运行时注入。
             let paths = core::storage::DataPaths::new().map_err(|e| format!("{e}"))?;
             paths.ensure_dirs().map_err(|e| format!("{e}"))?;
+            let data_lock = paths.lock_exclusive()?;
             let wconn =
                 core::storage::db::open_write(&paths.db_path).map_err(|e| format!("{e}"))?;
             let metrics = Arc::new(core::writer::WriterMetrics::default());
             let writer = core::writer::spawn_writer_thread(wconn, metrics.clone());
             let read_conn =
                 core::storage::db::open_read(&paths.db_path).map_err(|e| format!("{e}"))?;
-            let (ei, ec, en, ea, ai_on) = {
+            let (ei, ec, _, _, _) = {
                 let g = read_conn.lock();
                 core::settings::load_flags(&g)
             };
-            let engine_input = Arc::new(AtomicBool::new(ei));
+            let engine_input = Arc::new(AtomicBool::new(ei && !cfg!(target_os = "windows")));
             let engine_clipboard = Arc::new(AtomicBool::new(ec));
-            let engine_notifications = Arc::new(AtomicBool::new(en));
-            let engine_ambient = Arc::new(AtomicBool::new(ea));
-            let ai_enabled = Arc::new(AtomicBool::new(ai_on));
+            let engine_notifications = Arc::new(AtomicBool::new(false));
+            let engine_ambient = Arc::new(AtomicBool::new(false));
+            let ai_enabled = Arc::new(AtomicBool::new(false));
             let app_blacklist = Arc::new(RwLock::new({
                 let g = read_conn.lock();
                 core::settings::get_app_blacklist(&g)
@@ -131,15 +141,20 @@ pub fn run() {
             let ocr_last_success_ms = Arc::new(AtomicI64::new(-1));
             let ocr_last_error = Arc::new(Mutex::new(None));
             let ocr_pending = Arc::new(AtomicUsize::new(0));
-            let nudge_enabled = Arc::new(AtomicBool::new({
-                let g = read_conn.lock();
-                core::settings::get_nudge_config(&g).enabled
-            }));
+            let nudge_enabled = Arc::new(AtomicBool::new(false));
             // 桌面端启动后默认开启采集（与产品预期一致）；无采集能力的平台保持 false。
-            let tracking = Arc::new(AtomicBool::new(cfg!(any(
-                target_os = "macos",
-                target_os = "windows"
-            ))));
+            let tracking = Arc::new(AtomicBool::new(false));
+            let internal = core::internal::InternalControl::load(&paths.root, tracking.clone())?;
+            if let Some(e) = internal.progress.lock().integrity_error.clone() {
+                *metrics.last_error.lock() = Some(e);
+            }
+            if let Some(e) = metrics.last_error.lock().clone() {
+                internal.edit_progress(|p| {
+                    p.integrity_error = Some(e.clone());
+                    p.last_error = Some(e);
+                    Ok(())
+                })?;
+            }
             let running = Arc::new(AtomicBool::new(true));
             let is_afk = Arc::new(AtomicBool::new(false));
             let screen_ok = Arc::new(AtomicBool::new(false));
@@ -150,12 +165,9 @@ pub fn run() {
                     Ordering::Relaxed,
                 );
             }
-            #[cfg(target_os = "macos")]
-            core::acquisition::request_screen_capture_on_first_launch();
             let current_session = Arc::new(RwLock::new(None));
             let (agg_tx, agg_rx) = std::sync::mpsc::channel::<core::models::AggregationCmd>();
-            let (cap_tx, cap_rx) =
-                crossbeam_channel::bounded::<core::models::CaptureSignal>(64);
+            let (cap_tx, cap_rx) = crossbeam_channel::bounded::<core::models::CaptureSignal>(64);
             let handle = app.handle().clone();
             core::aggregation::spawn_aggregation_thread(
                 handle.clone(),
@@ -177,6 +189,7 @@ pub fn run() {
                     ocr_last_success_ms.clone(),
                     ocr_last_error.clone(),
                     ocr_pending.clone(),
+                    internal.clone(),
                 );
                 core::collection::capture::spawn_capture_thread(
                     cap_rx,
@@ -186,21 +199,16 @@ pub fn run() {
                     is_afk.clone(),
                     screen_ok.clone(),
                     handle.clone(),
-                    Some((
-                        ocr_tx,
-                        ocr_enabled.clone(),
-                        ocr_pending.clone(),
-                    )),
+                    internal.clone(),
+                    Some((ocr_tx, ocr_enabled.clone(), ocr_pending.clone())),
                 );
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            std::thread::spawn(move || {
-                while cap_rx.recv().is_ok() {}
-            });
+            std::thread::spawn(move || while cap_rx.recv().is_ok() {});
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             core::collection::tracker::spawn_tracker_thread(
                 handle.clone(),
-                agg_tx,
+                agg_tx.clone(),
                 cap_tx.clone(),
                 writer.clone(),
                 tracking.clone(),
@@ -209,6 +217,7 @@ pub fn run() {
                 current_session.clone(),
                 engine_notifications.clone(),
                 app_blacklist.clone(),
+                internal.clone(),
             );
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             core::collection::phase2::spawn_phase2_collectors(
@@ -222,36 +231,24 @@ pub fn run() {
                     ambient: engine_ambient.clone(),
                 },
                 app_blacklist.clone(),
+                internal.clone(),
             );
             #[cfg(target_os = "windows")]
             {
-                core::acquisition::spawn_low_level_input_hooks(running.clone());
-                core::collection::notifications_listener::spawn_system_notification_listener(
-                    writer.clone(),
-                    tracking.clone(),
-                    running.clone(),
-                    engine_notifications.clone(),
-                );
+                // Internal build deliberately uses idle detection without low-level input hooks.
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            core::nudge::spawn_nudge_thread(
-                handle.clone(),
-                read_conn.clone(),
-                writer.clone(),
-                tracking.clone(),
-                running.clone(),
-                is_afk.clone(),
-                current_session.clone(),
-                nudge_enabled.clone(),
-            );
             let screen_ok_on_focus = screen_ok.clone();
             let wm_emit = metrics.clone();
             let state = AppState(Arc::new(AppStateInner {
+                _data_lock: data_lock,
+                exiting: AtomicBool::new(false),
                 paths,
                 read_conn,
                 writer,
                 writer_metrics: metrics,
                 tracking,
+                internal,
+                aggregation_tx: agg_tx,
                 running,
                 is_afk,
                 screen_ok,
@@ -270,6 +267,7 @@ pub fn run() {
                 nudge_enabled: nudge_enabled.clone(),
             }));
             app.manage(state);
+            core::internal::spawn_task_clock(handle.clone());
             if let Some(s) = handle.try_state::<AppState>() {
                 if s.0.tracking.load(Ordering::Relaxed) {
                     let _ = handle.emit(
@@ -283,7 +281,7 @@ pub fn run() {
                 win.on_window_event(move |e| {
                     if matches!(e, tauri::WindowEvent::Focused(true)) {
                         screen_ok_on_focus.store(
-                            core::acquisition::screen_capture_poll_check(),
+                            core::acquisition::screen_capture_granted(),
                             Ordering::Relaxed,
                         );
                     }
@@ -301,7 +299,7 @@ pub fn run() {
                     }
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     {
-                        let sr = core::acquisition::screen_capture_poll_check();
+                        let sr = core::acquisition::screen_capture_granted();
                         if let Some(s) = wh.try_state::<AppState>() {
                             s.0.screen_ok.store(sr, Ordering::Relaxed);
                         }
@@ -328,7 +326,8 @@ pub fn run() {
             let ps = core::models::PermissionStatus {
                 accessibility_granted: core::acquisition::ax_trusted(),
                 screen_recording_granted: core::acquisition::screen_capture_granted(),
-                notification_listener_granted: core::acquisition::notifications_listener_access_granted(),
+                notification_listener_granted:
+                    core::acquisition::notifications_listener_access_granted(),
             };
             let _ = handle.emit("permissions_required", ps);
             #[cfg(all(desktop, any(target_os = "macos", target_os = "windows")))]
@@ -359,24 +358,30 @@ pub fn run() {
                                 }
                             }
                             "start" => {
-                                if let Some(s) = app.try_state::<AppState>() {
-                                    s.0.tracking.store(true, Ordering::Relaxed);
-                                    let _ = app.emit(
-                                        "tracking_state_changed",
-                                        serde_json::json!({ "isRunning": true }),
-                                    );
-                                }
+                                let app = app.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(s) = app.try_state::<AppState>() {
+                                        if let Err(e) = core::internal::start_collection(&app, &s) {
+                                            log::warn!("无法开始采集：{e}");
+                                        }
+                                    }
+                                });
                             }
                             "stop" => {
-                                if let Some(s) = app.try_state::<AppState>() {
-                                    s.0.tracking.store(false, Ordering::Relaxed);
-                                    let _ = app.emit(
-                                        "tracking_state_changed",
-                                        serde_json::json!({ "isRunning": false }),
-                                    );
-                                }
+                                let app = app.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(s) = app.try_state::<AppState>() {
+                                        if let Err(e) =
+                                            core::internal::pause_collection(&app, &s, false)
+                                        {
+                                            log::warn!("暂停采集失败：{e}");
+                                        }
+                                    }
+                                });
                             }
-                            "quit" => app.exit(0),
+                            "quit" => {
+                                app.exit(0);
+                            }
                             _ => {}
                         }
                     })
@@ -386,6 +391,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            api::get_internal_config,
+            api::save_internal_config,
+            api::get_internal_progress,
+            api::finish_internal_task,
+            api::retry_internal_upload,
             api::start_tracking,
             api::stop_tracking,
             api::is_tracking,
@@ -478,6 +488,24 @@ pub fn run() {
             api::auto_match_intents,
             api::apply_auto_match,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if !state.0.exiting.swap(true, Ordering::SeqCst) {
+                        api.prevent_exit();
+                        let app = app.clone();
+                        let state = state.inner().clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = core::internal::pause_collection(&app, &state, false) {
+                                log::error!("退出前保存失败：{e}");
+                            }
+                            state.0.running.store(false, Ordering::SeqCst);
+                            app.exit(0);
+                        });
+                    }
+                }
+            }
+        });
 }

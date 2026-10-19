@@ -3,12 +3,10 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useDevModeStore } from "../stores/devModeStore";
-import { useAssistantSidebarStore } from "../stores/assistantSidebarStore";
 import { useThemeStore, type UiTheme } from "../stores/themeStore";
 import { setLanguage, type SupportedLanguage } from "../i18n";
 import * as api from "../services/tauri";
 import { AiTaskBanner } from "../components/AiTaskBanner";
-import { AssistantSidebar } from "../components/assistant/AssistantSidebar";
 
 const AUTO_REFRESH_PATHS = ["/lens", "/timeline", "/replay"];
 const REFRESH_DEBOUNCE_MS = 30_000;
@@ -37,8 +35,6 @@ export default function AppShell() {
   );
   const [refreshing, setRefreshing] = useState(false);
   const lastRefreshRef = useRef(0);
-  const sidebarOpen = useAssistantSidebarStore((s) => s.isOpen);
-  const toggleSidebar = useAssistantSidebarStore((s) => s.toggle);
 
   useEffect(() => {
     const shouldRefresh = AUTO_REFRESH_PATHS.some((p) => location.pathname.startsWith(p));
@@ -66,13 +62,8 @@ export default function AppShell() {
   }, []);
 
   const MAIN_NAV = [
-    { to: "/lens", label: t("nav.todayLens"), icon: "◉" },
     { to: "/timeline", label: t("nav.timeline"), icon: "≡" },
     { to: "/replay", label: t("nav.timeReplay"), icon: "▷" },
-    { to: "/report", label: t("nav.dailyReport"), icon: "¶" },
-    { to: "/weekly", label: t("nav.weeklyReport"), icon: "⊞" },
-    { to: "/assistant", label: t("nav.assistant"), icon: "✦" },
-    { to: "/intents", label: t("nav.intents"), icon: "⌗" },
     { to: "/settings", label: t("nav.settings"), icon: "⚙" },
     { to: "/about", label: t("nav.about"), icon: "ℹ" },
   ] as const;
@@ -80,7 +71,6 @@ export default function AppShell() {
   const DEV_NAV = [
     { to: "/sessions", label: t("nav.sessions") },
     { to: "/ocr", label: t("nav.ocrSearch") },
-    { to: "/ocr-eval", label: t("nav.ocrEval") },
     { to: "/health", label: t("nav.health") },
   ] as const;
 
@@ -136,19 +126,6 @@ export default function AppShell() {
               {t("nav.features")}
             </div>
             {MAIN_NAV.map(({ to, label, icon }) =>
-              to === "/assistant" ? (
-                <button
-                  key={to}
-                  type="button"
-                  onClick={toggleSidebar}
-                  className={navCls(sidebarOpen)}
-                >
-                  <span className={`w-5 text-center ${sidebarOpen ? "text-[var(--tl-cyan)]" : "text-[var(--tl-cyan-dim)]"}`}>
-                    {icon}
-                  </span>
-                  <span className="flex-1">{label}</span>
-                </button>
-              ) : (
               <NavLink key={to} to={to} className={({ isActive }) => navCls(isActive)}>
                 {({ isActive }) => (
                   <>
@@ -164,7 +141,6 @@ export default function AppShell() {
                   </>
                 )}
               </NavLink>
-              )
             )}
             {devEnabled && (
               <>
@@ -289,21 +265,12 @@ export default function AppShell() {
                   className="rounded-lg border border-[var(--tl-line)] bg-[var(--tl-input-fill)] px-2 py-1.5 text-[var(--tl-ink)]"
                 />
               </label>
-              <button
-                type="button"
-                onClick={toggleSidebar}
-                title={t("assistant.toggleSidebar")}
-                className={`rounded-lg border px-2.5 py-1.5 font-mono text-sm transition-colors ${sidebarOpen ? "border-[var(--tl-cyan)] bg-[var(--tl-accent-15)] text-[var(--tl-cyan)]" : "border-[var(--tl-line)] text-[var(--tl-muted)] hover:text-[var(--tl-ink)]"}`}
-              >
-                ✦
-              </button>
             </div>
           </header>
           <div className="flex min-h-0 flex-1">
             <main className="min-h-0 flex-1 overflow-hidden">
               <Outlet />
             </main>
-            {sidebarOpen && <AssistantSidebar />}
           </div>
           <AiTaskBanner />
         </div>

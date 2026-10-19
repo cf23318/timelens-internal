@@ -5,7 +5,7 @@
 export type ClientDesktopOs = "windows" | "macos" | "other";
 
 /** 与 `src-tauri/tauri.conf.json` 的 `identifier` 保持一致，用于 macOS 权限排障文案（TCC 按此 ID 记录授权）。 */
-export const MACOS_APP_BUNDLE_ID = "com.timelens.desktop";
+export const MACOS_APP_BUNDLE_ID = "com.timelens.internal";
 
 export function detectClientDesktopOs(): ClientDesktopOs {
   if (typeof navigator === "undefined") return "other";
@@ -124,10 +124,10 @@ export function ocrPsmFieldHint(os: ClientDesktopOs): string {
 /** 健康页底部平台提示 */
 export function pipelineHealthPlatformNote(os: ClientDesktopOs): string {
   if (os === "windows") {
-    return "Windows：Tracker 依赖前台窗口与空闲检测；截图依赖屏幕 API；通知引擎需在系统设置中允许应用访问通知；输入计数依赖底层钩子（部分安全软件可能拦截）。";
+    return "Windows 内部版：Tracker 使用前台窗口与空闲检测；截图使用屏幕 API；不启用通知监听、键盘或鼠标计数钩子。";
   }
   if (os === "macos") {
-    return "macOS：Tracker 依赖辅助功能权限；截图依赖屏幕录制权限；通知监听需在系统设置中授权。";
+    return "macOS 内部版：Tracker 依赖辅助功能权限；截图依赖屏幕录制权限；不启用通知监听。";
   }
   return "请在支持的桌面系统（macOS / Windows）上使用完整采集能力。";
 }
