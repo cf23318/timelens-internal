@@ -2,6 +2,8 @@ mod analysis;
 mod api;
 mod core;
 mod export;
+#[cfg(desktop)]
+mod native_menu;
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -13,6 +15,21 @@ use tauri::{Emitter, Manager};
 
 #[derive(Clone)]
 pub struct AppState(pub Arc<AppStateInner>);
+
+/// A closed main window stays alive in the tray and must be explicitly restored on reopen.
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    #[cfg(target_os = "macos")]
+    if let Err(e) = app.show() {
+        log::warn!("无法显示 TimeLens 应用：{e}");
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        for result in [window.unminimize(), window.show(), window.set_focus()] {
+            if let Err(e) = result {
+                log::warn!("无法恢复 TimeLens 主窗口：{e}");
+            }
+        }
+    }
+}
 
 /// 为截图 WebP 提供 `timelens://localhost/snapshot/{id}` 响应（按 id 查库读盘）。
 /// 注意：WebView2 / Android 上 `<img>` 等子资源须使用 `http://timelens.localhost/snapshot/{id}`，
@@ -268,6 +285,11 @@ pub fn run() {
             }));
             app.manage(state);
             core::internal::spawn_task_clock(handle.clone());
+            #[cfg(desktop)]
+            {
+                let language = core::settings::get_language(&handle.state::<AppState>().0.read_conn.lock());
+                native_menu::install(&handle, &language)?;
+            }
             if let Some(s) = handle.try_state::<AppState>() {
                 if s.0.tracking.load(Ordering::Relaxed) {
                     let _ = handle.emit(
@@ -337,7 +359,7 @@ pub fn run() {
                 let h = app.handle();
                 let show = MenuItem::with_id(h, "show", "打开主窗口", true, None::<&str>)?;
                 let start = MenuItem::with_id(h, "start", "开始采集", true, None::<&str>)?;
-                let stop = MenuItem::with_id(h, "stop", "停止采集", true, None::<&str>)?;
+                let stop = MenuItem::with_id(h, "stop", "暂停采集", true, None::<&str>)?;
                 let quit = MenuItem::with_id(h, "quit", "退出", true, None::<&str>)?;
                 let menu = Menu::with_items(h, &[&show, &start, &stop, &quit])?;
                 let mut tray = TrayIconBuilder::with_id("timelens_tray")
@@ -352,10 +374,7 @@ pub fn run() {
                         let id = event.id.as_ref();
                         match id {
                             "show" => {
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.set_focus();
-                                }
+                                show_main_window(app);
                             }
                             "start" => {
                                 let app = app.clone();
@@ -394,6 +413,7 @@ pub fn run() {
             api::get_internal_config,
             api::save_internal_config,
             api::get_internal_progress,
+            api::get_internal_overview,
             api::finish_internal_task,
             api::retry_internal_upload,
             api::start_tracking,
@@ -438,6 +458,7 @@ pub fn run() {
             api::generate_daily_report,
             api::get_daily_report,
             api::get_content_recap,
+            api::get_snapshot_replay,
             api::list_external_ai_providers,
             api::export_external_ai_summary_bundle,
             api::send_to_external_ai_summary,
@@ -491,6 +512,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(&event, tauri::RunEvent::Reopen { .. }) {
+                // Dock / Finder launches an already-running app through this event.
+                // Restore even a minimized window, without changing collection state.
+                show_main_window(app);
+            }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 if let Some(state) = app.try_state::<AppState>() {
                     if !state.0.exiting.swap(true, Ordering::SeqCst) {

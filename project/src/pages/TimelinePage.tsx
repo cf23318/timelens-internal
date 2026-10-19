@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import type { ExternalAiProvider, Snapshot, WindowSession } from "../types";
+import type { Snapshot, WindowSession } from "../types";
 import type { CustomIntent } from "../services/tauri";
 import { snapshotTimelensUrl } from "../types";
 import {
@@ -14,7 +13,6 @@ import {
 import { BUILTIN_INTENT_COLORS, INTENT_FALLBACK_COLOR } from "../lib/intentPresets";
 import * as api from "../services/tauri";
 import { useAppStore } from "../stores/appStore";
-import { InlineAskButton } from "../components/assistant/InlineAskButton";
 
 function fmtTime(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, {
@@ -80,7 +78,6 @@ function sessionRulerSeg(
 
 export default function TimelinePage() {
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const date = useAppStore((s) => s.date);
   const [sessions, setSessions] = useState<WindowSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -94,11 +91,6 @@ export default function TimelinePage() {
     return "summary";
   });
   const [customIntents, setCustomIntents] = useState<CustomIntent[]>([]);
-  const [providers, setProviders] = useState<ExternalAiProvider[]>([]);
-  const [providerId, setProviderId] = useState("doubao_web");
-  const [sending, setSending] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [aiMsg, setAiMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   const intentColorMap = useMemo(() => buildIntentColorMap(customIntents), [customIntents]);
 
@@ -124,82 +116,6 @@ export default function TimelinePage() {
     const timer = setInterval(() => void load(), 10_000);
     return () => clearInterval(timer);
   }, [load, date, isTracking]);
-
-  useEffect(() => {
-    let mounted = true;
-    api
-      .listExternalAiProviders()
-      .then((list) => {
-        if (!mounted) return;
-        setProviders(list);
-        if (list.length > 0) {
-          setProviderId((prev) =>
-            list.some((p) => p.id === prev) ? prev : list[0].id,
-          );
-        }
-      })
-      .catch(() => {
-        if (!mounted) return;
-        setProviders([]);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  const handleSendToAi = useCallback(async () => {
-    setAiMsg(null);
-    setSending(true);
-    try {
-      const res = await api.sendToExternalAiSummary({
-        date,
-        slice: "full_day",
-        providerId,
-        autoPaste: true,
-      });
-      if (res.warning) {
-        setAiMsg({
-          ok: true,
-          text: t("timeline.externalAi.sendWarning", {
-            provider: res.providerLabel,
-            warning: res.warning,
-            path: res.exportDir,
-          }),
-        });
-      } else {
-        setAiMsg({
-          ok: true,
-          text: t("timeline.externalAi.sendSuccess", {
-            provider: res.providerLabel,
-            count: res.screenshotCount,
-          }),
-        });
-      }
-    } catch (e) {
-      setAiMsg({ ok: false, text: String(e) });
-    } finally {
-      setSending(false);
-    }
-  }, [date, providerId, t]);
-
-  const handleExportBundle = useCallback(async () => {
-    setAiMsg(null);
-    setExporting(true);
-    try {
-      const res = await api.exportExternalAiSummaryBundle(date, "full_day", true);
-      setAiMsg({
-        ok: true,
-        text: t("timeline.externalAi.exportSuccess", {
-          count: res.screenshotCount,
-          path: res.exportDir,
-        }),
-      });
-    } catch (e) {
-      setAiMsg({ ok: false, text: String(e) });
-    } finally {
-      setExporting(false);
-    }
-  }, [date, t]);
 
   const byPart = useMemo(() => {
     const m: Record<Daypart, WindowSession[]> = {
@@ -388,14 +304,6 @@ export default function TimelinePage() {
       ) : null}
 
       <div className="mx-auto w-full max-w-[640px]">
-        <Link
-          to="/lens"
-          className="mb-5 inline-flex items-center gap-1.5 text-[0.78rem] font-medium tracking-wide text-[var(--tl-muted)] hover:text-[var(--tl-ink)]"
-        >
-          <span aria-hidden className="opacity-75">←</span>
-          {t("timeline.backToLens")}
-        </Link>
-
         <header className="mb-5 flex flex-wrap items-start justify-between gap-4 border-b border-[var(--tl-line)] pb-4">
           <div>
             <h1 className="text-[1.25rem] font-bold leading-snug tracking-wide text-[var(--tl-ink)]">
@@ -409,7 +317,6 @@ export default function TimelinePage() {
             <strong className="mb-0.5 block text-[0.95rem] font-semibold text-[var(--tl-ink)]">
               {zhDateLabel(date)}
             </strong>
-            <InlineAskButton contextType="daily" date={date} />
           </div>
         </header>
 
@@ -578,58 +485,6 @@ export default function TimelinePage() {
               );
             })}
           </div>
-        ) : null}
-
-        <nav
-          className="mt-7 flex flex-wrap gap-x-4 gap-y-2 border-t border-[var(--tl-line)] pt-5"
-          aria-label={t("timeline.openReport")}
-        >
-          <button
-            type="button"
-            className="border-0 bg-transparent p-0 text-[0.78rem] font-medium text-[var(--tl-p3-accent)] hover:underline"
-            onClick={() => navigate("/report")}
-          >
-            {t("timeline.openReport")}
-          </button>
-          <label className="inline-flex items-center gap-2 text-[0.72rem] text-[var(--tl-muted)]">
-            <span>{t("timeline.externalAi.target")}</span>
-            <select
-              value={providerId}
-              onChange={(e) => setProviderId(e.target.value)}
-              className="rounded border border-[var(--tl-line)] bg-[var(--tl-input-fill)] px-2 py-1 text-[0.72rem] text-[var(--tl-ink)]"
-            >
-              {(providers.length > 0 ? providers : [{ id: "doubao_web", label: "Doubao (Web)" }]).map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button
-            type="button"
-            disabled={sending}
-            className="rounded border border-[var(--tl-line)] px-2.5 py-1 text-[0.72rem] text-[var(--tl-ink)] hover:bg-[var(--tl-surface)] disabled:opacity-40"
-            onClick={() => void handleSendToAi()}
-          >
-            {sending ? t("common.processing") : t("timeline.externalAi.send")}
-          </button>
-          <button
-            type="button"
-            disabled={exporting}
-            className="rounded border border-[var(--tl-line)] px-2.5 py-1 text-[0.72rem] text-[var(--tl-ink)] hover:bg-[var(--tl-surface)] disabled:opacity-40"
-            onClick={() => void handleExportBundle()}
-          >
-            {exporting ? t("common.processing") : t("timeline.externalAi.export")}
-          </button>
-        </nav>
-        {aiMsg ? (
-          <p
-            className={`mt-2 text-[0.68rem] ${
-              aiMsg.ok ? "text-[var(--tl-success,#4ade80)]" : "text-[var(--tl-warn-amber-text)]"
-            }`}
-          >
-            {aiMsg.text}
-          </p>
         ) : null}
 
         <p className="mt-5 text-center text-[0.6rem] tracking-wide text-[var(--tl-muted)]">

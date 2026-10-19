@@ -9,7 +9,7 @@ export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
 const LANG_STORAGE_KEY = "timelens_ui_lang";
 
-/** 优先读取用户保存的语言偏好，否则从 navigator.language 推断，匹配不到则 fallback 到 en */
+/** 优先使用用户保存的语言偏好；首次启动统一使用中文。 */
 function resolveInitialLanguage(): SupportedLanguage {
   try {
     const saved = localStorage.getItem(LANG_STORAGE_KEY);
@@ -17,20 +17,17 @@ function resolveInitialLanguage(): SupportedLanguage {
   } catch {
     /* ignore */
   }
-  const lang = navigator.language ?? "";
-  if (lang.startsWith("zh")) return "zh-CN";
-  return "en";
+  return "zh-CN";
 }
 
-export function setLanguage(lang: SupportedLanguage): void {
+export async function setLanguage(lang: SupportedLanguage): Promise<void> {
+  await setBackendLanguage(lang);
   try {
     localStorage.setItem(LANG_STORAGE_KEY, lang);
   } catch {
     /* ignore */
   }
-  void i18n.changeLanguage(lang);
-  // Phase 12: 同步到后端，让 AI 助手等使用对应语言
-  void setBackendLanguage(lang).catch(() => {});
+  await i18n.changeLanguage(lang);
 }
 
 i18n.use(initReactI18next).init({
@@ -39,7 +36,7 @@ i18n.use(initReactI18next).init({
     en: { translation: en },
   },
   lng: resolveInitialLanguage(),
-  fallbackLng: "en",
+  fallbackLng: "zh-CN",
   interpolation: { escapeValue: false },
 });
 

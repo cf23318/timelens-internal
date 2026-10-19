@@ -22,6 +22,7 @@ import type {
   RawEvent,
   SessionOcrContextDto,
   Snapshot,
+  SnapshotReplayPage,
   StorageStats,
   TestAiConnectionResponse,
   WindowSession,
@@ -335,6 +336,14 @@ export async function getContentRecap(
   slice: ContentRecapSlice = "full_day",
 ): Promise<ContentRecapDto> {
   return invoke<ContentRecapDto>("get_content_recap", { date, slice });
+}
+
+export async function getSnapshotReplay(
+  date: string,
+  offset = 0,
+  limit = 100,
+): Promise<SnapshotReplayPage> {
+  return invoke<SnapshotReplayPage>("get_snapshot_replay", { date, offset, limit });
 }
 
 export async function listExternalAiProviders(): Promise<ExternalAiProvider[]> {

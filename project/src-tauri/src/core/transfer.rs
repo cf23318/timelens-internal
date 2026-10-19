@@ -456,8 +456,19 @@ fn recover(state: &crate::AppState) -> Result<(), String> {
 }
 
 pub fn begin_recovery(app: &tauri::AppHandle) -> Result<(), String> {
+    begin_recovery_inner(app, None)
+}
+
+pub fn begin_confirmed_recovery(app: &tauri::AppHandle, confirmation: &super::desktop::UploadConfirmation) -> Result<(), String> {
+    begin_recovery_inner(app, Some(confirmation))
+}
+
+fn begin_recovery_inner(app: &tauri::AppHandle, confirmation: Option<&super::desktop::UploadConfirmation>) -> Result<(), String> {
     let state = app.state::<crate::AppState>().inner().clone();
     let exclusive = state.0.internal.gate.write();
+    if let Some(expected) = confirmation {
+        super::desktop::validate_confirmation(expected, &state.0.internal.config.read(), &state.0.internal.progress.lock(), super::desktop::token_present())?;
+    }
     state.0.internal.edit_progress(|p| {
         if p.status != TaskStatus::Completed {
             return Err("请先结束采集；回收过程中不能重复发起".into());

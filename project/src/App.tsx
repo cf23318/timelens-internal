@@ -19,7 +19,7 @@ import SettingsShellPage from "./pages/SettingsShellPage";
 import AboutPage from "./pages/AboutPage";
 import TimeReplayPage from "./pages/TimeReplayPage";
 import FragmentationDetail from "./components/FragmentationDetail";
-import UpdateNotice from "./components/UpdateNotice";
+import InternalTaskPage from "./pages/InternalTaskPage";
 import { detectClientDesktopOs } from "./lib/platform";
 
 export default function App() {
@@ -47,13 +47,17 @@ export default function App() {
     }
   }, []);
 
-  // 从后端读取持久化语言偏好，覆盖浏览器自动检测结果
+  useEffect(() => {
+    document.documentElement.lang = i18n.resolvedLanguage ?? "zh-CN";
+  }, [i18n.resolvedLanguage]);
+
+  // 从后端读取持久化语言偏好；未保存时同样默认中文。
   useEffect(() => {
     api.getLanguage().then((lang) => {
       if (lang && lang !== i18n.language) {
         void i18n.changeLanguage(lang);
       }
-    }).catch(() => {/* 后端未就绪时静默忽略，保持浏览器检测结果 */});
+    }).catch(() => {/* 后端未就绪时保持当前界面语言。 */});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -181,10 +185,10 @@ export default function App() {
   return (
     <BrowserRouter>
       <FragmentationDetail />
-      <UpdateNotice />
       <Routes>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/settings" replace />} />
+          <Route path="/" element={<Navigate to="/task" replace />} />
+          <Route path="/task" element={<InternalTaskPage />} />
           <Route path="/lens" element={<Navigate to="/settings" replace />} />
           <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/replay" element={<TimeReplayPage />} />

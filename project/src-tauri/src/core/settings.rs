@@ -27,7 +27,7 @@ const K_OCR_PREPROCESS_SCALE: &str = "ocr_preprocess_scale";
 const K_OCR_PREPROCESS_INVERT: &str = "ocr_preprocess_dark_invert";
 
 const K_LANGUAGE: &str = "ui_language";
-const DEFAULT_LANGUAGE: &str = "en";
+const DEFAULT_LANGUAGE: &str = "zh-CN";
 
 const K_WEEK_START_DAY: &str = "week_start_day";
 const K_AUTOSTART_ENABLED: &str = "autostart_enabled";
@@ -336,9 +336,13 @@ pub fn apply_ocr_pipeline_overrides(
     Ok(())
 }
 
-/// UI 语言偏好（"zh-CN" 或 "en"），缺省返回 "en"。
+/// UI 语言偏好（"zh-CN" 或 "en"），缺省或无效时返回中文。
 pub fn get_language(conn: &Connection) -> String {
-    get_setting_str(conn, K_LANGUAGE, DEFAULT_LANGUAGE)
+    let language = get_setting_str(conn, K_LANGUAGE, DEFAULT_LANGUAGE);
+    match language.as_str() {
+        "zh-CN" | "en" => language,
+        _ => DEFAULT_LANGUAGE.to_string(),
+    }
 }
 
 pub fn set_language(conn: &mut Connection, lang: &str) -> rusqlite::Result<()> {

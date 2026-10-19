@@ -1,6 +1,7 @@
 pub mod aggregation;
 pub mod browser;
 pub mod collection;
+pub mod desktop;
 pub mod external_ai;
 pub mod intent_builtin_catalog;
 pub mod intent_mapping;
@@ -9,6 +10,7 @@ pub mod models;
 pub mod nudge;
 pub mod ocr;
 pub mod privacy;
+pub mod replay;
 pub mod settings;
 pub mod transfer;
 pub mod writer;

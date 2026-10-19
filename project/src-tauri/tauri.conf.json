@@ -14,12 +14,16 @@
       {
         "label": "main",
         "title": "TimeLens",
+        "theme": "Light",
+        "backgroundColor": "#f8fafc",
         "width": 1120,
         "height": 720,
+        "minWidth": 920,
+        "minHeight": 640,
         "resizable": true,
         "transparent": false,
         "decorations": true,
-        "shadow": false,
+        "shadow": true,
         "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-renderer-backgrounding"
       }
     ],

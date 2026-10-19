@@ -1,75 +1,81 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { useInternalStore } from "../stores/internalStore";
+import { useThemeStore, type UiTheme } from "../stores/themeStore";
+import { setLanguage } from "../i18n";
+import { useDesktopText, duration, missingLabel } from "../lib/desktop";
 import * as internal from "../services/internal";
 import * as api from "../services/tauri";
-import { SystemPermissionPanel } from "./SystemPermissionPanel";
 
+const themes: [UiTheme, string][] = [["white", "标准浅色 / Light"], ["tech", "标准深色 / Dark"], ["claude", "Claude"], ["cursor", "Cursor"], ["catppuccin", "Catppuccin"], ["rosepine", "Rosé Pine"], ["gruvbox-light", "Gruvbox Light"], ["raycast", "Raycast"], ["spotify", "Spotify"], ["linear", "Linear"], ["dracula", "Dracula"], ["nord", "Nord"], ["tokyo-night", "Tokyo Night"], ["gruvbox-dark", "Gruvbox Dark"], ["one-dark", "One Dark"], ["sakura", "Sakura"], ["cotton-candy", "Cotton Candy"], ["peach-milk", "Peach Milk"]];
 export function InternalSettings() {
-  const [config, setConfig] = useState<internal.InternalConfig | null>(null);
-  const [progress, setProgress] = useState<internal.TaskProgress | null>(null);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [blockedAppsText, setBlockedAppsText] = useState("");
-  const [blockedDomainsText, setBlockedDomainsText] = useState("");
-  const [ocrEnabled, setOcrEnabled] = useState(false);
+  const { text, english } = useDesktopText();
+  const [params, setParams] = useSearchParams();
+  const tabs = [["capture", text("采集", "Capture")], ["privacy", text("隐私", "Privacy")], ["appearance", text("外观与语言", "Appearance & language")], ["admin", text("管理员配置", "Administrator")]];
+  const tab = tabs.some(([key]) => key === params.get("tab")) ? params.get("tab")! : "capture";
+  const { data, draft, busy, edit, discard, act, refresh } = useInternalStore();
+  const { theme, setTheme } = useThemeStore();
+  const [ocrEnabled, setOcrEnabled] = useState<boolean | null>(null);
+  const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
     let cancelled = false;
-    Promise.all([internal.getInternalConfig(), internal.getInternalProgress(), api.getOcrSettings()]).then(([c, p, ocr]) => {
-      if (!cancelled) { setConfig(c); setProgress(p); setOcrEnabled(ocr.enabled); setBlockedAppsText(c.screenshotBlockedApps.join("\n")); setBlockedDomainsText(c.screenshotBlockedDomains.join("\n")); }
-    }).catch(e => { if (!cancelled) setError(String(e)); });
-    const unlisten = listen<internal.TaskProgress>("internal_task_changed", e => { if (!cancelled) setProgress(e.payload); });
-    return () => { cancelled = true; void unlisten.then(fn => fn()); };
+    void api.getOcrSettings().then(ocr => { if (!cancelled) setOcrEnabled(ocr.enabled); }).catch(error => { if (!cancelled) useInternalStore.setState({ error: String(error) }); });
+    return () => { cancelled = true; };
   }, []);
-  async function act(fn: () => Promise<unknown>, success: string) {
-    setBusy(true); setError(""); setMessage("");
-    try { await fn(); setProgress(await internal.getInternalProgress()); setMessage(success); }
-    catch (e) { setError(String(e)); }
-    finally { setBusy(false); }
-  }
-  if (!config || !progress) return <div className="p-5" role="status">{error || "正在读取采集任务…"}</div>;
-  const locked = busy || progress.status === "recording" || progress.status === "uploading";
-  const fieldClass = "rounded border border-[var(--tl-line)] bg-[var(--tl-panel)] p-2 text-[var(--tl-ink)]";
-  const buttonClass = "rounded border border-[var(--tl-line)] px-4 py-2 disabled:opacity-40";
-  const set = <K extends keyof internal.InternalConfig>(key: K, value: internal.InternalConfig[K]) => setConfig({ ...config, [key]: value });
-  const lines = (text: string) => text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  return <div className="space-y-6 p-5 text-[var(--tl-ink)]">
-    <section className="space-y-3 rounded-lg border border-[var(--tl-line)] p-4">
-      <h2 className="font-semibold">两工作日屏幕记录 · 内部版</h2>
-      <p aria-live="polite">{internal.taskStatusLabel[progress.status]} · 剩余 {internal.remainingTime(progress)}</p>
-      <p className="text-sm text-[var(--tl-muted)]">累计录制 {2 * config.workdayHours} 小时后自动停止。暂停、退出与系统睡眠不计时，重新打开后保持暂停。记录包括定时截图、应用与窗口信息、网址，以及复制粘贴流向估计；不保存按键内容或剪贴板正文。</p>
-      <div className="flex flex-wrap gap-3">
-        <button className={buttonClass} disabled={busy || !["ready", "paused"].includes(progress.status)} onClick={() => void act(api.startTracking, "已开始采集")}>开始 / 继续</button>
-        <button className={buttonClass} disabled={busy || !(progress.status === "recording" || (progress.needsFlush && !["uploading", "uploaded"].includes(progress.status)))} onClick={() => void act(api.stopTracking, "已暂停采集")}>{progress.status !== "recording" ? "重试保存暂停" : "暂停"}</button>
-        <button className={buttonClass} disabled={busy || !["ready", "recording", "paused"].includes(progress.status)} onClick={() => void act(internal.finishInternalTask, "已结束采集，开始回收")}>结束并回收</button>
-        <button className={buttonClass} disabled={busy || progress.status !== "completed"} onClick={() => void act(internal.retryInternalUpload, "已启动回收")}>重试回收</button>
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); if (draft && !busy) form.current?.requestSubmit(); } };
+    window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
+  }, [draft,busy]);
+  if (!data) return <div className="desktop-page"><div className="desktop-card desktop-empty" role="status"><h2>{text("正在读取设置…", "Loading settings…")}</h2><button className="desktop-button" onClick={() => void refresh()}>{text("重新读取", "Reload")}</button></div></div>;
+  const config = draft ?? data.config;
+  const p = data.progress;
+  const locked = busy || ["recording", "uploading", "uploaded"].includes(p.status) || Boolean(p.storedBundle || p.receipt);
+  const languageLocked = busy || ["uploading", "uploaded"].includes(p.status) || Boolean(p.storedBundle || p.receipt);
+  const lines = (list: string[]) => list.map(s => s.trim()).filter(Boolean);
+  const save = async () => {
+    if (!draft || locked) return;
+    const next = { ...draft, screenshotBlockedApps: lines(draft.screenshotBlockedApps), screenshotBlockedDomains: lines(draft.screenshotBlockedDomains) };
+    const ok = await act(() => internal.saveInternalConfig(next), text("设置已保存", "Settings saved"));
+    if (ok) useInternalStore.setState({ draft: null });
+  };
+  const updateOcr = async (enabled: boolean) => {
+    const ok = await act(async () => { if (enabled) await api.setOcrPrivacyAcknowledged(true); const result = await api.setOcrSettings({ enabled, allowExportToAi: false }); setOcrEnabled(result.enabled); }, text("本地文字识别设置已保存", "Local text recognition setting saved"));
+    if (!ok) void api.getOcrSettings().then(value => setOcrEnabled(value.enabled)).catch(() => {});
+  };
+  return <div className="desktop-settings-page">
+    <div className="desktop-settings-tabs" role="tablist" aria-label={text("设置分类", "Settings categories")}>{tabs.map(([key,label]) => <button key={key} id={`tab-${key}`} role="tab" aria-selected={tab===key} aria-controls="settings-panel" className={tab===key ? "is-active" : ""} tabIndex={tab===key ? 0 : -1} onKeyDown={e => { const index=tabs.findIndex(([value]) => value===key); const next=e.key === "ArrowRight" ? (index+1)%tabs.length : e.key === "ArrowLeft" ? (index+tabs.length-1)%tabs.length : e.key === "Home" ? 0 : e.key === "End" ? tabs.length-1 : -1; if (next>=0) { e.preventDefault(); setParams({tab:tabs[next][0]}); window.requestAnimationFrame(() => document.getElementById(`tab-${tabs[next][0]}`)?.focus()); } }} onClick={() => setParams({ tab: key })}>{label}</button>)}</div>
+    <form ref={form} className="desktop-settings-form" onSubmit={e => { e.preventDefault(); void save(); }}>
+      <div className="desktop-page" id="settings-panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
+        {locked && tab !== "appearance" && <div className="desktop-alert desktop-alert-info">{p.status === "recording" ? text("采集中暂不能修改这些设置。请先点击右上角“暂停采集”。", "Pause collection before editing these settings.") : text("回收已开始或任务已完成，这些设置暂时锁定。", "Recovery has begun or the task is complete. These settings are locked.")}</div>}
+        {tab === "capture" && <>
+          <div className="desktop-settings-intro"><h2>{text("采集设置", "Capture settings")}</h2><p>{text("调整采样频率与画质。修改后点击底部“保存全部修改”。", "Adjust sampling and image quality, then save all changes below.")}</p></div>
+          <fieldset disabled={locked} className="desktop-card desktop-fieldset"><legend className="sr-only">{text("截图参数", "Screenshot parameters")}</legend><h3>{text("截图与显示器", "Screenshots and displays")}</h3>
+            <div className="desktop-form-grid mt-5"><label className="desktop-field">{text("截图间隔（秒）", "Screenshot interval (seconds)")}<input className="desktop-input" type="number" required min={10} max={15} step={1} value={config.captureIntervalSecs} onChange={e => edit({ captureIntervalSecs: Number(e.target.value) })}/><small>{text("每 10–15 秒尝试采样，近似画面会去重。", "Samples every 10–15 seconds; similar frames are deduplicated.")}</small></label><label className="desktop-field">{text("定时截图最大宽度（像素）", "Periodic image width (pixels)")}<input className="desktop-input" type="number" required min={1600} max={7680} step={1} value={config.pollWidth} onChange={e => edit({ pollWidth: Number(e.target.value) })}/><small>{text("切换窗口的截图保留原始分辨率。", "Window-change images retain native resolution.")}</small></label><label className="desktop-field">{text("定时截图质量", "Periodic image quality")}<input className="desktop-input" type="number" required min={85} max={100} step={1} value={config.pollQuality} onChange={e => edit({ pollQuality: Number(e.target.value) })}/><small>{text("85–100，越高占用空间越大。", "85–100. Higher quality uses more space.")}</small></label><label className="desktop-field">{text("每个工作日的小时数", "Hours per workday")}<input className="desktop-input" type="number" required min={1} max={24} step={1} disabled={locked || p.elapsedMs>0} value={config.workdayHours} onChange={e => edit({ workdayHours: Number(e.target.value) })}/><small>{p.elapsedMs>0 ? `${text("任务已开始，当前目标固定为", "The task has started; fixed target:")} ${duration(p.targetMs,english)}` : text("两个工作日累计时长，暂停与睡眠不计时。", "Two workdays of accumulated time, excluding pause and sleep.")}</small></label></div>
+            <label className="desktop-checkbox-row mt-6"><input type="checkbox" checked={config.allDisplays} onChange={e => edit({ allDisplays: e.target.checked })}/><span><strong>{text("采集所有显示器", "Capture all displays")}</strong><small>{text("默认关闭，只采集前台窗口所在的屏幕。多屏模式会包含其他屏幕上的内容。", "Off by default. Captures the active window's display; all-display mode includes other displays.")}</small></span></label>
+          </fieldset>
+          <div className="desktop-alert desktop-alert-info">{text("定时间隔是采样尝试频率。相近画面最多约 60 秒保存一张；原屏不足 1600 像素宽时会放大，放大不会增加文字细节。", "The interval controls sampling attempts. Similar frames may be saved about once per 60 seconds. Upscaling a display below 1600 pixels does not add text detail.")}</div>
+          <Link className="desktop-text-link" to="/task#permissions">{text("查看任务进度与系统权限 →", "View progress and system permissions →")}</Link>
+        </>}
+        {tab === "privacy" && <>
+          <div className="desktop-settings-intro"><h2>{text("隐私与过滤规则", "Privacy and filtering")}</h2><p>{text("规则命中时跳过整张截图；应用时长和复制流向估计仍可能记录。", "Matching rules skip the entire screenshot. Application duration and estimated clipboard flows may still be recorded.")}</p></div>
+          <div className="desktop-alert desktop-alert-warning"><strong>{text("请了解过滤的边界", "Understand the filtering limits")}</strong><p>{text("黑名单依据当前前台应用和网页判断，无法遮住背景窗口。已保存的历史截图不会因修改规则而被自动删除。截图像素尚未做敏感内容打码。", "Rules check the foreground app and website, not background windows. Rule changes do not delete existing screenshots. Screenshot pixels are not masked.")}</p></div>
+          <fieldset disabled={locked} className="desktop-card desktop-fieldset"><legend className="sr-only">{text("截图黑名单", "Screenshot exclusions")}</legend><h3>{text("不截图的应用与网站", "Excluded applications and websites")}</h3><div className="desktop-form-grid mt-5"><label className="desktop-field">{text("应用名称或标识（每行一项）", "Application names or identifiers (one per line)")}<textarea className="desktop-input font-mono text-xs" rows={9} value={config.screenshotBlockedApps.join("\n")} onChange={e => edit({ screenshotBlockedApps: e.target.value.split(/\r?\n/) })}/><small>{text("按名称或标识匹配，例如微信、钉钉、密码管理器。", "Matches names or identifiers, such as messaging apps and password managers.")}</small></label><label className="desktop-field">{text("网站域名（每行一项）", "Website domains (one per line)")}<textarea className="desktop-input font-mono text-xs" rows={9} value={config.screenshotBlockedDomains.join("\n")} onChange={e => edit({ screenshotBlockedDomains: e.target.value.split(/\r?\n/) })}/><small>{text("包含该域名的子域名。浏览器网址无法读取时，也会跳过截图。", "Includes subdomains. An unreadable browser URL also skips the screenshot.")}</small></label></div></fieldset>
+          <section className="desktop-card"><div className="desktop-section-heading"><div><h3>{text("本地屏幕文字识别", "Local screen text recognition")}</h3><p>{text("可选能力，关闭后仍可查看截图回放。", "Optional. Screenshot playback works with this turned off.")}</p></div><span className="desktop-status">{ocrEnabled === null ? text("读取中", "Loading") : ocrEnabled ? text("已开启", "On") : text("已关闭", "Off")}</span></div><label className="desktop-checkbox-row"><input type="checkbox" checked={ocrEnabled ?? false} disabled={locked || ocrEnabled === null} onChange={e => void updateOcr(e.target.checked)}/><span><strong>{text("启用本地文字识别与识别文字脱敏", "Enable local OCR and recognized-text redaction")}</strong><small>{text("此开关即时保存。仅处理识别后的文字，原始截图仍未打码；不会发送到外部 AI。", "Saved immediately. Only recognized text is redacted; image pixels are unchanged. No external AI submission.")}</small></span></label></section>
+        </>}
+        {tab === "appearance" && <>
+          <div className="desktop-settings-intro"><h2>{text("外观与语言", "Appearance and language")}</h2><p>{text("首次启动使用中文和浅色；你主动选择的偏好会保留。", "New installations use Chinese and light appearance. Explicit preferences are preserved.")}</p></div>
+          <section className="desktop-card"><h3>{text("界面外观", "Appearance")}</h3><div className="desktop-appearance-options" role="group" aria-label={text("浅色或深色主题", "Light or dark theme")}>{[["white", text("标准浅色", "Standard light"), text("默认 · 清晰明亮", "Default · Clear and bright")], ["tech", text("标准深色", "Standard dark"), text("适合暗光环境", "For low-light environments")]].map(([id,label,desc]) => <button type="button" key={id} className={`desktop-theme-preview ${id === "tech" ? "is-dark" : ""} ${theme===id ? "is-selected" : ""}`} aria-pressed={theme===id} onClick={() => setTheme(id as UiTheme)}><span className="desktop-theme-mini"><i/><i/><i/></span><strong>{label}</strong><small>{desc}</small></button>)}</div><label className="desktop-field mt-5 max-w-sm">{text("其他主题", "Other themes")}<select className="desktop-input" value={theme} onChange={e => setTheme(e.target.value as UiTheme)}>{themes.map(([id,label]) => <option key={id} value={id}>{label}</option>)}</select></label><p className="desktop-caption mt-3">{text("外观设置立即生效并保存到本机。", "Appearance applies immediately and is saved locally.")}</p></section>
+          <section className="desktop-card"><h3>{text("显示语言", "Display language")}</h3><label className="desktop-field mt-4 max-w-sm">{text("界面与系统菜单语言", "Interface and native menu language")}<select className="desktop-input" value={english ? "en" : "zh-CN"} disabled={languageLocked} onChange={e => { const language=e.target.value as "en"|"zh-CN"; void act(() => setLanguage(language), language === "en" ? "Language preference saved" : "语言偏好已保存"); }}><option value="zh-CN">简体中文（默认）</option><option value="en">English</option></select><small>{languageLocked ? text("回收期间语言设置暂时锁定。", "Language changes are locked during recovery.") : text("语言选择会立即保存，重新打开后继续使用。", "Language is saved immediately and used after reopening.")}</small></label></section>
+        </>}
+        {tab === "admin" && <>
+          <div className="desktop-settings-intro"><h2>{text("管理员上传配置", "Administrator upload settings")}</h2><p>{text("请由负责人提供内部服务器地址与加密公钥。普通使用者无需填写。", "The administrator provides the internal endpoint and public key. Ordinary users do not need to configure these.")}</p></div>
+          <div className={`desktop-alert ${data.uploadMissing.length ? "desktop-alert-warning" : "desktop-alert-info"}`}><strong>{data.uploadMissing.length ? text("上传准备未完成", "Upload setup incomplete") : text("本地上传配置已就绪", "Local upload setup ready")}</strong><p>{data.uploadMissing.length ? data.uploadMissing.map(c => missingLabel(c,english)).join("、") : text("配置齐全不代表服务器连通性或凭证已在线验证。", "Complete settings do not imply verified connectivity or credentials.")}</p></div>
+          <fieldset disabled={locked} className="desktop-card desktop-fieldset"><legend className="sr-only">{text("上传配置", "Upload configuration")}</legend><h3>{text("目的地与加密", "Destination and encryption")}</h3><label className="desktop-field mt-5">{text("内部服务器上传地址（HTTPS）", "Internal upload endpoint (HTTPS)")}<input className="desktop-input" type="url" placeholder="https://" value={config.uploadUrl} onChange={e => edit({ uploadUrl:e.target.value })}/><small>{text("仅使用已批准的内部地址，不支持账号、查询参数或跳转。", "Use an approved internal endpoint, without embedded accounts, query parameters or redirects.")}</small></label><label className="desktop-field mt-5">{text("服务器加密公钥", "Server encryption public key")}<input className="desktop-input font-mono text-xs" spellCheck={false} autoComplete="off" placeholder="age1…" value={config.encryptionRecipient} onChange={e => edit({ encryptionRecipient:e.target.value })}/><small>{text("客户端只保存公钥；解密私钥由接收方保管。", "Only the public key is stored here. The recipient holds the private decryption key.")}</small></label><label className="desktop-checkbox-row mt-6"><input type="checkbox" checked={config.domesticServerConfirmed} onChange={e => edit({ domesticServerConfirmed:e.target.checked })}/><span>{text("管理员已核实该地址属于国内内部服务器", "An administrator verified that this is a domestic internal server")}</span></label></fieldset>
+          <section className="desktop-card"><h3>{text("上传凭证", "Upload credential")}</h3><p className="desktop-muted mt-2">{data.uploadMissing.includes("credential") ? text("尚未检测到有效配置。请管理员在运行环境中配置上传凭证后重启应用。", "No credential configuration detected. Ask the administrator to configure the runtime credential and restart.") : text("已检测到非空上传凭证，未进行在线有效性验证。", "A non-empty credential was detected. Its validity has not been verified online.")}</p><p className="desktop-caption mt-3">{text("凭证不会在界面显示，也不会写入采集数据包。", "The credential is neither displayed nor included in collected packages.")}</p></section>
+          <div className="desktop-alert desktop-alert-info">{text("数据使用加密包上传。失败时保留本地原始数据；只有服务器返回匹配回执后才清理。本页保存配置不会发起上传。", "Data is uploaded in encrypted packages. Failures retain local originals; cleanup requires a matching receipt. Saving settings does not upload data.")}</div>
+        </>}
       </div>
-      {progress.lastError && <p role="alert" className="text-amber-500">{progress.lastError}</p>}
-      <p className="text-sm text-[var(--tl-muted)]">上传失败时保留本地数据，只有服务器确认接收完整文件后才清理。</p>
-    </section>
-    <SystemPermissionPanel />
-    <label className="flex gap-2"><input type="checkbox" checked={ocrEnabled} disabled={busy || ["uploading", "uploaded"].includes(progress.status)} onChange={e => { const enabled = e.target.checked; void act(async () => { if (enabled) await api.setOcrPrivacyAcknowledged(true); const next = await api.setOcrSettings({ enabled, allowExportToAi: false }); setOcrEnabled(next.enabled); }, "本地 OCR 设置已保存"); }}/>启用本地 OCR 和识别文字脱敏（原始截图本身仍未打码）</label>
-    <fieldset disabled={locked} className="space-y-4 rounded-lg border border-[var(--tl-line)] p-4 disabled:opacity-60">
-      <legend className="px-2 font-semibold">采集设置（暂停后可修改）</legend>
-      <div className="flex flex-wrap gap-4">
-        <label className="flex flex-col gap-1">截图间隔（秒）<input className={fieldClass} type="number" min={10} max={15} value={config.captureIntervalSecs} onChange={e => set("captureIntervalSecs", Number(e.target.value))}/></label>
-        <label className="flex flex-col gap-1">定时截图最大宽度<input className={fieldClass} type="number" min={1600} max={7680} value={config.pollWidth} onChange={e => set("pollWidth", Number(e.target.value))}/></label>
-        <label className="flex flex-col gap-1">截图质量<input className={fieldClass} type="number" min={85} max={100} value={config.pollQuality} onChange={e => set("pollQuality", Number(e.target.value))}/></label>
-        <label className="flex flex-col gap-1">每个工作日的小时数<input className={fieldClass} type="number" min={1} max={24} disabled={progress.elapsedMs > 0} value={config.workdayHours} onChange={e => set("workdayHours", Number(e.target.value))}/></label>
-      </div>
-      <label className="flex gap-2"><input type="checkbox" checked={config.allDisplays} onChange={e => set("allDisplays", e.target.checked)}/>采集所有显示器（默认只采集前台窗口所在屏幕）</label>
-      <p className="text-sm text-[var(--tl-muted)]">切换窗口保留原始分辨率。所有屏幕模式会包含其他屏幕上的窗口；隐私规则按当前前台应用和网页判断。</p>
-      <p className="text-sm text-[var(--tl-muted)]">间隔表示定时尝试截图；相近画面会去重，最多间隔约 60 秒保存一张。低于 1600 像素宽的原屏会放大，放大不会增加文字细节。</p>
-      <label className="flex flex-col gap-1">不截图的应用（每行一项）<textarea className={fieldClass} rows={5} value={blockedAppsText} onChange={e => setBlockedAppsText(e.target.value)}/></label>
-      <label className="flex flex-col gap-1">不截图的网站域名（每行一项，包含其子域名）<textarea className={fieldClass} rows={4} value={blockedDomainsText} onChange={e => setBlockedDomainsText(e.target.value)}/></label>
-      <p className="text-sm text-[var(--tl-muted)]">默认不截图密码管理器、微信、钉钉和已列出的网银网站；应用时长和流向估计仍会记录。网银名单需要按实际使用补充。无法读取浏览器网址时跳过截图。截图本身尚未做敏感文字打码。</p>
-      <label className="flex flex-col gap-1">国内服务器上传地址（HTTPS）<input className={fieldClass} type="url" value={config.uploadUrl} onChange={e => set("uploadUrl", e.target.value)}/></label>
-      <label className="flex flex-col gap-1">接收服务器的加密公钥<input className={fieldClass} spellCheck={false} value={config.encryptionRecipient} onChange={e => set("encryptionRecipient", e.target.value)}/></label>
-      <label className="flex gap-2"><input type="checkbox" checked={config.domesticServerConfirmed} onChange={e => set("domesticServerConfirmed", e.target.checked)}/>已由管理员确认该上传地址属于国内内部服务器</label>
-      <button className={buttonClass} onClick={() => void act(() => internal.saveInternalConfig({ ...config, screenshotBlockedApps: lines(blockedAppsText), screenshotBlockedDomains: lines(blockedDomainsText) }), "设置已保存")}>保存设置</button>
-    </fieldset>
-    <p className="text-sm text-[var(--tl-muted)]">内部版已停用外部 AI、豆包自动粘贴和在线更新。Windows 使用空闲检测，不统计按键与点击次数。</p>
-    {error && <p role="alert" className="text-red-500">{error}</p>}
-    {message && <p role="status">{message}</p>}
+      {draft && <div className="desktop-savebar" role="status"><div><strong>{text("有未保存的修改", "Unsaved changes")}</strong><p>{text("保存后才会应用到采集与上传。", "Collection and upload use saved settings.")}</p></div><div className="flex gap-2"><button type="button" className="desktop-button" disabled={busy} onClick={discard}>{text("放弃修改", "Discard changes")}</button><button type="submit" className="desktop-button desktop-button-primary" disabled={locked}>{busy ? text("保存中…", "Saving…") : text("保存全部修改", "Save all changes")}</button></div></div>}
+    </form>
   </div>;
 }

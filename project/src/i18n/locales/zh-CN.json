@@ -26,6 +26,7 @@
     "screenshotAlt": "截图大图"
   },
   "nav": {
+    "productSubtitle": "屏幕记录与回放",
     "todayLens": "今日透视",
     "todayLensDesc": "结构 · 管线 · 当日摘要",
     "timeline": "时间线",
@@ -35,7 +36,7 @@
     "dailyReport": "日报告",
     "dailyReportDesc": "事实层 / AI 增强",
     "settings": "设置",
-    "settingsDesc": "权限 · 引擎 · OCR · AI",
+    "settingsDesc": "权限 · 采集 · 隐私 · 回收",
     "recap": "复盘（旧入口）",
     "sessions": "会话",
     "sessionsDesc": "开发工具 · 会话与截图",
@@ -233,9 +234,20 @@
   "replay": {
     "title": "时间回放",
     "loading": "正在加载回放数据…",
-    "empty": "当前日期没有可用于回放的截图与 OCR。",
+    "empty": "当前日期没有已保存的截图。",
     "progress": "进度 {{progress}}%",
-    "ocrPreview": "OCR 摘要"
+    "ocrPreview": "OCR 摘要",
+    "position": "截图回放位置",
+    "previous": "上一张",
+    "next": "下一张",
+    "reload": "刷新",
+    "ocrDisabled": "OCR 已关闭，仍可正常回放已保存的截图。",
+    "noOcrText": "这张截图暂无可显示的识别文字。",
+    "unknownApp": "未知应用",
+    "imageUnavailable": "无法读取这张截图，文件可能已被清理。",
+    "frame": "第 {{number}} 张截图 · {{time}}",
+    "loadedRange": "当前缩略图：第 {{start}}–{{end}} 张，共 {{total}} 张",
+    "thumbnails": "截图缩略图"
   },
   "ocrSearch": {
     "title": "OCR 检索",

@@ -144,22 +144,51 @@ pub fn get_internal_progress(state: State<'_, AppState>) -> crate::core::interna
 }
 
 #[tauri::command]
+pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (config, progress) = {
+            let _gate = state.0.internal.gate.read();
+            let progress = state.0.internal.progress.lock().clone();
+            let config = state.0.internal.config.read().clone();
+            (config, progress)
+        };
+        let stats = crate::core::desktop::snapshot_stats(&state.0.read_conn.lock())?;
+        let missing = crate::core::desktop::upload_missing(&config, crate::core::desktop::token_present());
+        Ok(serde_json::json!({
+            "config": config, "progress": progress, "snapshots": stats,
+            "captureNotice": state.0.internal.capture_notice.lock().clone(),
+            "uploadMissing": missing,
+        }))
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn finish_internal_task(
     app: AppHandle,
     state: State<'_, AppState>,
+    confirmation: crate::core::desktop::UploadConfirmation,
 ) -> Result<(), String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        {
+            let _gate = state.0.internal.gate.read();
+            let progress = state.0.internal.progress.lock().clone();
+            crate::core::desktop::validate_confirmation(
+                &confirmation, &state.0.internal.config.read(), &progress,
+                crate::core::desktop::token_present(),
+            )?;
+        }
         crate::core::internal::pause_collection(&app, &state, true)?;
-        crate::core::transfer::begin_recovery(&app)
+        crate::core::transfer::begin_confirmed_recovery(&app, &confirmation)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn retry_internal_upload(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::core::transfer::begin_recovery(&app))
+pub async fn retry_internal_upload(app: AppHandle, confirmation: crate::core::desktop::UploadConfirmation) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::core::transfer::begin_confirmed_recovery(&app, &confirmation))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -583,10 +612,21 @@ pub fn get_language(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-pub fn set_language(state: State<'_, AppState>, lang: String) -> Result<(), String> {
+pub fn set_language(app: AppHandle, state: State<'_, AppState>, lang: String) -> Result<(), String> {
+    if !matches!(lang.as_str(), "zh-CN" | "en") { return Err("不支持的界面语言".into()); }
     let _configuration_guard = state.0.internal.configuration_write()?;
     let mut c = open_db_rw(&state.0.paths.db_path)?;
-    settings::set_language(&mut c, &lang).map_err(|e| e.to_string())
+    settings::set_language(&mut c, &lang).map_err(|e| e.to_string())?;
+    #[cfg(desktop)]
+    {
+        let handle = app.clone();
+        app.run_on_main_thread(move || {
+            if let Err(error) = crate::native_menu::install(&handle, &lang) {
+                log::warn!("无法更新菜单语言：{error}");
+            }
+        }).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1633,6 +1673,17 @@ pub fn get_daily_report(
         .optional()
         .map_err(|e| e.to_string())?;
     Ok(row)
+}
+
+#[tauri::command]
+pub fn get_snapshot_replay(
+    state: State<'_, AppState>,
+    date: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<crate::core::replay::ReplayPage, String> {
+    let conn = state.0.read_conn.lock();
+    crate::core::replay::read_page(&conn, &date, offset, limit)
 }
 
 #[tauri::command]
