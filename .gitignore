@@ -90,3 +90,7 @@ demo/netlify/我的微信二维码.JPG
 **/device-tokens.json
 **/server.env
 upload-server/state/
+
+# Device-scoped bearer upload grants and administrator credentials
+*.timelens-upload.json
+oss-admin-credentials*.json

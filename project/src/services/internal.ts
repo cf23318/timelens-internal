@@ -4,13 +4,15 @@ export interface InternalConfig {
   captureIntervalSecs: number;
   pollWidth: number;
   pollQuality: number;
-  workdayHours: number;
+  targetHours: number;
   allDisplays: boolean;
   screenshotBlockedApps: string[];
   screenshotBlockedDomains: string[];
+  uploadMode: "receiver" | "ossDirect";
   uploadUrl: string;
   uploadSurveyId: string;
   uploadDeviceId: string;
+  archiveEndAt: string;
   encryptionRecipient: string;
   domesticServerConfirmed: boolean;
 }
@@ -19,6 +21,7 @@ export interface TaskProgress {
   taskId: string;
   elapsedMs: number;
   targetMs: number;
+  endedAtMs: number | null;
   status: "ready" | "recording" | "paused" | "completed" | "uploading" | "uploaded";
   lastError: string | null;
   bundlePath: string | null;
@@ -35,7 +38,7 @@ export const finishInternalTask = (confirmation: UploadConfirmation) => invoke<v
 export const retryInternalUpload = (confirmation: UploadConfirmation) => invoke<void>("retry_internal_upload", { confirmation });
 
 export const taskStatusLabel: Record<TaskProgress["status"], string> = {
-  ready: "待开始", recording: "录制中", paused: "已暂停", completed: "已停止，待上传", uploading: "正在逐张上传", uploaded: "队列截图已上传，本地数据保留",
+  ready: "待开始", recording: "录制中", paused: "已暂停", completed: "已停止，待上传", uploading: "正在逐张上传", uploaded: "归档清单已对账，按期删除",
 };
 
 export function remainingTime(p: TaskProgress): string {
@@ -44,6 +47,8 @@ export function remainingTime(p: TaskProgress): string {
 }
 
 export interface UploadConfirmation {
+  uploadMode: "receiver" | "ossDirect";
+  grantFingerprint: string;
   taskId: string;
   uploadUrl: string;
   encryptionRecipient: string;
@@ -51,17 +56,23 @@ export interface UploadConfirmation {
   cleanupOnly: boolean;
   surveyId: string;
   deviceId: string;
+  archiveEndAt: string;
 }
 export interface InternalOverview {
+  fixedDeviceId: string;
+  ossGrant: {valid:boolean; userId?:string; deviceId?:string; prefix?:string; endpoint?:string; expiresAt?:string; archiveEndAt?:string; fingerprint?:string; error?:string};
   config: InternalConfig;
   progress: TaskProgress;
   snapshots: { count: number; bytes: number; latestAtMs: number | null };
   captureNotice: { code: string; atMs: number };
+  archive: {deadlineMs:number;effectiveEndMs:number;reconciled:boolean;deleted:boolean}|null;
   uploadMissing: string[];
   uploadActive: boolean;
-  uploads: {pending:number; verified:number; blocked:number; legacy:number; lastError:string|null};
+  uploads: {pending:number; verified:number; ossAccepted:number; blocked:number; legacy:number; lastError:string|null};
 }
 export const getInternalOverview = () => invoke<InternalOverview>("get_internal_overview");
 
 export const startFrameUpload=(confirmation:UploadConfirmation)=>invoke<void>("start_frame_upload",{confirmation});
 export const stopFrameUpload=()=>invoke<void>("stop_frame_upload");
+
+export const importOssUploadGrant=(grantJson:string)=>invoke<void>("import_oss_upload_grant",{grantJson});

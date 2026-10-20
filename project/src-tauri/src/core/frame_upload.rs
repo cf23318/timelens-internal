@@ -75,6 +75,7 @@ pub struct FrameReceipt {
 }
 #[derive(Debug, Clone)]
 pub struct Frame {
+    pub task_id: String,
     pub id: String,
     pub path: String,
     pub captured_at_ms: i64,
@@ -91,8 +92,8 @@ impl Frame {
             .ok_or("截图时间无效")?
             .format("%Y/%m/%d");
         Ok(format!(
-            "timelens/v1/surveys/{}/devices/{}/{}/{}.webp",
-            cfg.upload_survey_id, cfg.upload_device_id, date, self.id
+            "timelens/v2/surveys/{}/devices/{}/tasks/{}/{}/{}.webp",
+            cfg.upload_survey_id, cfg.upload_device_id, self.task_id, date, self.id
         ))
     }
     fn verify(&self, cfg: &InternalConfig, receipt: &FrameReceipt) -> Result<(), String> {
@@ -112,17 +113,19 @@ impl Frame {
 pub struct UploadStats {
     pub pending: i64,
     pub verified: i64,
+    pub oss_accepted: i64,
     pub blocked: i64,
     pub legacy: i64,
     pub last_error: Option<String>,
 }
 pub fn stats(conn: &Connection, task_id: &str) -> Result<UploadStats, String> {
-    let (pending,verified,blocked)=conn.query_row("SELECT COALESCE(SUM(status='pending'),0), COALESCE(SUM(status='verified'),0), COALESCE(SUM(status='blocked'),0) FROM frame_upload_outbox WHERE task_id=?",[task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
+    let (pending,verified,blocked)=conn.query_row("SELECT COALESCE(SUM(status='pending' AND NOT EXISTS(SELECT 1 FROM oss_direct_receipts d WHERE d.snapshot_id=frame_upload_outbox.snapshot_id)),0), COALESCE(SUM(status='verified'),0), COALESCE(SUM(status='blocked'),0) FROM frame_upload_outbox WHERE task_id=?",[task_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
     let legacy=conn.query_row("SELECT COUNT(*) FROM snapshots s LEFT JOIN frame_upload_outbox q ON q.snapshot_id=s.id WHERE q.snapshot_id IS NULL",[],|r|r.get(0)).map_err(|e|e.to_string())?;
     let last_error=conn.query_row("SELECT last_error FROM frame_upload_outbox WHERE task_id=? AND last_error IS NOT NULL ORDER BY next_retry_ms DESC LIMIT 1",[task_id],|r|r.get(0)).unwrap_or(None);
     Ok(UploadStats {
         pending,
         verified,
+        oss_accepted: conn.query_row("SELECT COUNT(*) FROM oss_direct_receipts WHERE task_id=?",[task_id],|r|r.get(0)).map_err(|e|e.to_string())?,
         blocked,
         legacy,
         last_error,
@@ -244,6 +247,8 @@ fn send_with_client(
         .post(url)
         .bearer_auth(token)
         .header("Content-Type", "image/webp")
+        .header("X-TimeLens-Task",&frame.task_id)
+        .header("X-TimeLens-Archive-End",&cfg.archive_end_at)
         .header("X-TimeLens-Survey", &cfg.upload_survey_id)
         .header("X-TimeLens-Device", &cfg.upload_device_id)
         .header("X-TimeLens-Captured-At", captured)
@@ -276,7 +281,7 @@ fn send_with_client(
     frame.verify(cfg, &receipt)?;
     Ok(receipt)
 }
-fn db(paths: &DataPaths) -> Result<Connection, String> {
+pub(super) fn db(paths: &DataPaths) -> Result<Connection, String> {
     let c = Connection::open(&paths.db_path).map_err(|e| e.to_string())?;
     c.busy_timeout(Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
@@ -289,9 +294,9 @@ pub fn retry_delay_ms(attempts: u32) -> i64 {
 }
 fn next(conn: &Connection, task: &str) -> Result<Option<Frame>, String> {
     use rusqlite::OptionalExtension;
-    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?})).optional().map_err(|e|e.to_string())
+    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts,q.task_id FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{task_id:r.get(7)?,id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?})).optional().map_err(|e|e.to_string())
 }
-fn bind(conn: &Connection, frame: &Frame, cfg: &InternalConfig) -> Result<(), String> {
+pub(super) fn bind(conn: &Connection, frame: &Frame, cfg: &InternalConfig) -> Result<(), String> {
     conn.execute("UPDATE frame_upload_outbox SET destination=?2,survey_id=?3,device_id=?4 WHERE snapshot_id=?1 AND destination IS NULL",params![frame.id,cfg.upload_url,cfg.upload_survey_id,cfg.upload_device_id]).map_err(|e|e.to_string())?;
     let same:bool=conn.query_row("SELECT destination=?2 AND survey_id=?3 AND device_id=?4 FROM frame_upload_outbox WHERE snapshot_id=?1",params![frame.id,cfg.upload_url,cfg.upload_survey_id,cfg.upload_device_id],|r|r.get(0)).map_err(|e|e.to_string())?;
     if !same {
@@ -299,6 +304,87 @@ fn bind(conn: &Connection, frame: &Frame, cfg: &InternalConfig) -> Result<(), St
     }
     Ok(())
 }
+
+#[derive(Deserialize)]
+struct RemoteArchive {
+    task_id:String,survey:String,device:String,planned_end_ms:i64,
+    effective_end_ms:i64,deadline_ms:i64,deleted:i64,
+}
+fn archive_request(client:&reqwest::blocking::Client,base:&reqwest::Url,cfg:&InternalConfig,token:&str,task:&str,suffix:&str,post:bool)->Result<reqwest::blocking::RequestBuilder,String>{
+    uuid::Uuid::parse_str(task).map_err(|_|"归档任务无效")?;
+    let url=base.join(&format!("v1/archives/{task}{suffix}")).map_err(|_|"归档地址无效")?;
+    let r=if post {client.post(url)} else {client.get(url)};
+    Ok(r.bearer_auth(token).header("X-TimeLens-Survey",&cfg.upload_survey_id).header("X-TimeLens-Device",&cfg.upload_device_id).header("X-TimeLens-Archive-End",&cfg.archive_end_at))
+}
+fn archive_json(mut response:reqwest::blocking::Response)->Result<serde_json::Value,String>{
+    if !response.status().is_success(){return Err(format!("归档服务返回 HTTP {}",response.status().as_u16()))}
+    let mut bytes=Vec::new();response.by_ref().take(524289).read_to_end(&mut bytes).map_err(|_|"归档响应读取失败")?;
+    if bytes.len()>524288{return Err("归档清单响应过大".into())}
+    serde_json::from_slice(&bytes).map_err(|_|"归档响应无效".into())
+}
+fn validate_remote(value:&serde_json::Value,cfg:&InternalConfig,task:&str)->Result<RemoteArchive,String>{
+    let r:RemoteArchive=serde_json::from_value(value.clone()).map_err(|_|"归档状态格式无效")?;
+    if r.task_id!=task||r.survey!=cfg.upload_survey_id||r.device!=cfg.upload_device_id||r.planned_end_ms!=super::archive::end_ms(cfg)?||r.effective_end_ms<=0||r.effective_end_ms>r.planned_end_ms||r.deadline_ms!=r.effective_end_ms.checked_add(super::archive::RETENTION_MS).ok_or("删除截止无效")?||r.deleted!=0||Utc::now().timestamp_millis()>=r.deadline_ms{
+        return Err("服务器归档身份或截止不匹配".into())
+    }Ok(r)
+}
+fn register_archive(client:&reqwest::blocking::Client,base:&reqwest::Url,cfg:&InternalConfig,token:&str,task:&str)->Result<(),String>{
+    let v=archive_json(archive_request(client,base,cfg,token,task,"/register",true)?.send().map_err(|_|"归档登记连接失败")?)?;
+    validate_remote(&v,cfg,task)?;Ok(())
+}
+fn finish_archive(client:&reqwest::blocking::Client,base:&reqwest::Url,cfg:&InternalConfig,token:&str,task:&str,ended:i64,root:&Path)->Result<RemoteArchive,String>{
+    let ended=ended.min(super::archive::end_ms(cfg)?);
+    let ended=Utc.timestamp_millis_opt(ended).single().ok_or("结束时间无效")?.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    let v=archive_json(archive_request(client,base,cfg,token,task,"/finish",true)?.json(&serde_json::json!({"ended_at":ended})).send().map_err(|_|"归档结束时间同步失败，将重试")?)?;
+    let state=validate_remote(&v,cfg,task)?;
+    super::archive::accept_end(root,task,state.effective_end_ms,state.deadline_ms)?;
+    Ok(state)
+}
+/// Only lifecycle metadata for an already explicitly enrolled task; never drains raw frames.
+pub fn sync_end_metadata(paths:&super::storage::DataPaths,cfg:&InternalConfig,p:&super::internal::TaskProgress)->Result<(),String>{
+    let Some(b)=super::archive::load(&paths.root)? else{return Ok(())};
+    if b.task_id!=p.task_id || b.upload_url!=cfg.upload_url || b.survey_id!=cfg.upload_survey_id || b.device_id!=cfg.upload_device_id{return Err("归档结束同步身份不匹配".into())}
+    super::archive::ensure_live(&paths.root,&p.task_id,Utc::now().timestamp_millis())?;
+    let base=destination(cfg)?;
+    let client=reqwest::blocking::Client::builder().https_only(true).no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build().map_err(|_|"无法创建结束同步连接")?;
+    finish_archive(&client,&base,cfg,&read_token(&paths.root)?,&p.task_id,p.ended_at_ms.ok_or("任务未结束")?,&paths.root)?;
+    Ok(())
+}
+fn reconcile_archive(client:&reqwest::blocking::Client,base:&reqwest::Url,cfg:&InternalConfig,token:&str,task:&str,ended:i64,conn:&Connection,root:&Path)->Result<(),String>{
+    let ended=ended.min(super::archive::end_ms(cfg)?);
+    let ended=Utc.timestamp_millis_opt(ended).single().ok_or("结束时间无效")?.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    let finish=archive_json(archive_request(client,base,cfg,token,task,"/finish",true)?.json(&serde_json::json!({"ended_at":ended})).send().map_err(|_|"归档结案连接失败")?)?;
+    let final_state=validate_remote(&finish,cfg,task)?;
+    let mut local:std::collections::HashMap<String,(String,i64)>=conn.prepare("SELECT snapshot_id,sha256,size_bytes FROM frame_upload_outbox WHERE task_id=? AND status='verified'").map_err(|e|e.to_string())?
+        .query_map([task],|r|Ok((r.get::<_,String>(0)?,(r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())?;
+    let summary=stats(conn,task)?;
+    if summary.pending!=0||summary.blocked!=0{return Err("仍有未确认图片，不能完成对账".into())}
+    let remote=archive_json(archive_request(client,base,cfg,token,task,"/reconcile",false)?.send().map_err(|_|"云端对象对账连接失败")?)?;
+    if remote["missing"]!=0 || remote["unexpected"]!=0 || remote["frame_count"].as_u64()!=Some(local.len() as u64){return Err("OSS对象数量不匹配，不能完成归档".into())}
+    let mut after=String::new();let mut seen=std::collections::HashSet::new();
+    loop {
+        super::archive::ensure_live(root,task,Utc::now().timestamp_millis())?;
+        let page=archive_json(archive_request(client,base,cfg,token,task,"/manifest",false)?.query(&[("after",&after)]).send().map_err(|_|"云端清单读取失败")?)?;
+        let state=validate_remote(&page["archive"],cfg,task)?;
+        if state.deadline_ms!=final_state.deadline_ms{return Err("对账过程中截止发生变化，请重新核对".into())}
+        let frames=page["frames"].as_array().ok_or("云端清单无效")?;
+        if frames.len()>500{return Err("云端清单分页过大".into())}
+        for item in frames{
+            let id=item["snapshot_id"].as_str().ok_or("云端截图编号无效")?;
+            if !seen.insert(id.to_string()){return Err("云端清单重复截图".into())}
+            let (sha,size)=local.remove(id).ok_or("云端包含本地任务之外的图片")?;
+            if item["task_id"]!=task||item["survey"]!=cfg.upload_survey_id||item["device"]!=cfg.upload_device_id||item["sha256"]!=sha||item["size_bytes"]!=size{return Err("云端图片对账不匹配".into())}
+        }
+        match page["next_after"].as_str(){
+            None if page["next_after"].is_null()=>break,
+            Some(next) if next>after.as_str() && uuid::Uuid::parse_str(next).is_ok()=>after=next.to_string(),
+            _=>return Err("云端清单游标无效".into())
+        }
+    }
+    if !local.is_empty(){return Err("云端缺少部分本地图片，请检查后重试".into())}
+    super::archive::mark_reconciled(root,task,final_state.effective_end_ms,final_state.deadline_ms)
+}
+
 fn permanent_failure(error: &str) -> bool {
     let status = error
         .split("HTTP ")
@@ -322,7 +408,14 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
             .build()
             .map_err(|_| "无法创建上传连接")?;
         let conn = db(&state.0.paths)?;
+        register_archive(&client,&base,&cfg,&read_token(&state.0.paths.root)?,&task)?;
         while state.0.internal.frame_upload_active.load(Ordering::SeqCst) {
+            super::archive::ensure_live(&state.0.paths.root,&task,Utc::now().timestamp_millis())?;
+            let progress=state.0.internal.progress.lock().clone();
+            super::archive::shorten(&state.0.paths.root,&progress)?;
+            if !progress.needs_flush && progress.ended_at_ms.is_some() && super::archive::load(&state.0.paths.root)?.is_some_and(|b| !b.end_synced) {
+                finish_archive(&client,&base,&cfg,&read_token(&state.0.paths.root)?,&task,progress.ended_at_ms.unwrap(),&state.0.paths.root)?;
+            }
             state.0.writer.check_health()?;
             if state.0.internal.progress.lock().integrity_error.is_some() {
                 return Err("数据完整性待审核，已停止上传".into());
@@ -339,6 +432,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                     });
                 match result {
                     Ok(receipt) => {
+                        super::archive::ensure_live(&state.0.paths.root,&task,Utc::now().timestamp_millis())?;
                         conn.execute("UPDATE frame_upload_outbox SET status='verified',receipt_json=?2,last_error=NULL,next_retry_ms=0 WHERE snapshot_id=?1",params![frame.id,serde_json::to_string(&receipt).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
                     }
                     Err(error) => {
@@ -364,6 +458,9 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                     );
                 if ended {
                     if summary.pending == 0 && summary.blocked == 0 {
+                        super::archive::shorten(&state.0.paths.root,&progress)?;
+                        let end=progress.ended_at_ms.ok_or("旧任务没有明确结束时间，需人工核对")?;
+                        reconcile_archive(&client,&base,&cfg,&read_token(&state.0.paths.root)?,&task,end,&conn,&state.0.paths.root)?;
                         state.0.internal.edit_progress(|p| {
                             p.status = TaskStatus::Uploaded;
                             p.last_error = None;
@@ -399,7 +496,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
         state.0.internal.progress.lock().clone(),
     );
 }
-fn start_run(control: &super::internal::InternalControl) -> Result<(), String> {
+pub(super) fn start_run(control: &super::internal::InternalControl) -> Result<(), String> {
     if control
         .frame_upload_running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -410,7 +507,7 @@ fn start_run(control: &super::internal::InternalControl) -> Result<(), String> {
     control.frame_upload_active.store(true, Ordering::SeqCst);
     Ok(())
 }
-fn finish_run(control: &super::internal::InternalControl) {
+pub(super) fn finish_run(control: &super::internal::InternalControl) {
     control.frame_upload_active.store(false, Ordering::SeqCst);
     // Release last, so an old worker can never switch off its successor.
     control.frame_upload_running.store(false, Ordering::SeqCst);
@@ -424,6 +521,7 @@ pub fn begin(
     expected: &super::desktop::UploadConfirmation,
 ) -> Result<(), String> {
     let state = app.state::<crate::AppState>().inner().clone();
+    if state.0.internal.config.read().upload_mode == "ossDirect" { return super::oss_direct::begin(app,expected); }
     let _gate = state.0.internal.gate.read();
     let cfg = state.0.internal.config.read().clone();
     let p = state.0.internal.progress.lock().clone();
@@ -440,6 +538,7 @@ pub fn begin(
         return Err("数据保存或完整性检查未完成".into());
     }
     destination(&cfg)?;
+    super::archive::bind(&state.0.paths,&cfg,&p)?;
     start_run(&state.0.internal)?;
     let reset=db(&state.0.paths).and_then(|c|c.execute("UPDATE frame_upload_outbox SET status='pending',next_retry_ms=0,last_error=NULL WHERE task_id=? AND status!='verified'",[&p.task_id]).map(|_|()).map_err(|e|e.to_string()));
     if let Err(e) = reset {
@@ -544,6 +643,7 @@ mod tests {
                 .arg("tests/contract_server.py")
                 .current_dir(&server)
                 .env("PYTHONPATH", &server)
+                .env_remove("OSS_ACCESS_KEY_ID").env_remove("OSS_ACCESS_KEY_SECRET").env_remove("OSS_SECURITY_TOKEN")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -563,7 +663,9 @@ mod tests {
         let mut cfg = InternalConfig::default();
         cfg.upload_survey_id = "fixture-survey".into();
         cfg.upload_device_id = "fixture-device".into();
+        cfg.archive_end_at="2099-12-31T17:00:00Z".into();
         let frame = Frame {
+            task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: uuid::Uuid::new_v4().to_string(),
             path: String::new(),
             captured_at_ms: 1000,
@@ -590,6 +692,20 @@ mod tests {
             .json()
             .unwrap();
         assert_eq!(state["put_count"], 1);
+        let readback=archive_request(&client,&base,&cfg,token,&frame.task_id,&format!("/frames/{}",frame.id),false).unwrap().send().unwrap();
+        assert_eq!(readback.status().as_u16(),200);
+        assert_eq!(readback.bytes().unwrap().as_ref(),bytes.as_slice());
+        let t=tempfile::tempdir().unwrap();
+        let mut conn=Connection::open_in_memory().unwrap();
+        super::super::storage::migrations::run_migrations(&mut conn).unwrap();
+        conn.execute("INSERT INTO window_sessions(id,app_name,window_title,start_ms,end_ms,duration_ms,is_active) VALUES('s','fixture','synthetic',1,2,1,0)",[]).unwrap();
+        conn.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s','fixture',1000,?2,'poll')",params![frame.id,frame.size_bytes as i64]).unwrap();
+        conn.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,status) VALUES(?1,?2,?3,?4,?5,'verified')",params![frame.id,frame.task_id,frame.display_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+        let end=Utc::now().timestamp_millis();
+        let binding=super::super::archive::ArchiveBinding{upload_mode:"receiver".into(),task_id:frame.task_id.clone(),upload_url:cfg.upload_url.clone(),survey_id:cfg.upload_survey_id.clone(),device_id:cfg.upload_device_id.clone(),planned_end_ms:super::super::archive::end_ms(&cfg).unwrap(),effective_end_ms:end,deadline_ms:end+super::super::archive::RETENTION_MS,reconciled:false,deleted:false,end_synced:false,target_ms:None};
+        super::super::internal::write_json_atomic(&t.path().join("archive-binding.json"),&binding).unwrap();
+        reconcile_archive(&client,&base,&cfg,token,&frame.task_id,end,&conn,t.path()).unwrap();
+        assert!(super::super::archive::load(t.path()).unwrap().unwrap().reconciled);
         let mut changed = frame.clone();
         changed.captured_at_ms += 86_400_000;
         assert!(
@@ -634,6 +750,7 @@ mod tests {
         c.upload_survey_id = "survey".into();
         c.upload_device_id = "device".into();
         let f = Frame {
+            task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: uuid::Uuid::new_v4().to_string(),
             path: String::new(),
             captured_at_ms: 1000,
@@ -687,6 +804,7 @@ mod tests {
         let draft =
             UploadDraft::new(&uuid::Uuid::new_v4().to_string(), "display-1", &bytes).unwrap();
         let f = Frame {
+            task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: id.clone(),
             path: path.to_string_lossy().into(),
             captured_at_ms: 1000,

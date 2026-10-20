@@ -56,6 +56,9 @@ fn timelens_uri_response<R: tauri::Runtime>(
     let Some(state) = ctx.app_handle().try_state::<AppState>() else {
         return nf();
     };
+    let task=state.0.internal.progress.lock().task_id.clone();
+    let _gate=state.0.internal.gate.read();
+    if core::archive::ensure_live(&state.0.paths.root,&task,chrono::Utc::now().timestamp_millis()).is_err(){return nf()}
     let fp: rusqlite::Result<String> = state.0.read_conn.lock().query_row(
         "SELECT file_path FROM snapshots WHERE id = ?1",
         [id],
@@ -68,12 +71,13 @@ fn timelens_uri_response<R: tauri::Runtime>(
         return nf();
     }
     match std::fs::read(&fp) {
-        Ok(data) => Response::builder()
+        Ok(data) if core::archive::ensure_live(&state.0.paths.root,&task,chrono::Utc::now().timestamp_millis()).is_ok() => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "image/webp")
+            .header(header::CACHE_CONTROL,"no-store")
             .body(Cow::from(data))
             .unwrap(),
-        Err(_) => nf(),
+        _ => nf(),
     }
 }
 
@@ -177,6 +181,7 @@ pub fn run() {
                     Ok(())
                 })?;
             }
+            core::archive::initialize_owner(&paths,&read_conn.lock(),&internal.progress.lock().task_id)?;
             core::recovery::startup(&paths,&writer,&internal)?;
             let running = Arc::new(AtomicBool::new(true));
             let is_afk = Arc::new(AtomicBool::new(false));
@@ -291,6 +296,7 @@ pub fn run() {
             }));
             app.manage(state);
             core::internal::spawn_task_clock(handle.clone());
+            core::archive::spawn(handle.clone());
             #[cfg(desktop)]
             {
                 let language = core::settings::get_language(&handle.state::<AppState>().0.read_conn.lock());
@@ -420,6 +426,7 @@ pub fn run() {
             api::save_internal_config,
             api::get_internal_progress,
             api::get_internal_overview,
+            api::import_oss_upload_grant,
             api::finish_internal_task,
             api::retry_internal_upload,
             api::start_frame_upload,

@@ -54,7 +54,7 @@ impl DataPaths {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory")
         })?;
         // Internal tasks must not include historical data from a personal upstream installation.
-        let root = home.join(".timelens-internal");
+        let root = match std::env::var_os("TIMELENS_PROFILE_DIR") { Some(p)=>{let p=PathBuf::from(p); if !p.is_absolute(){return Err(std::io::ErrorKind::InvalidInput.into())} p},None=>home.join(".timelens-internal")};
         let data_dir = root.join("data");
         let db_path = data_dir.join("db.sqlite");
         let shots_dir = data_dir.join("shots");

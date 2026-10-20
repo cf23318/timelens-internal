@@ -3,6 +3,8 @@ import hmac
 import json
 import os
 import re
+import time
+from typing import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +34,8 @@ class Settings:
     tokens_file: Path
     bucket: str
     endpoint: str = "https://oss-cn-beijing.aliyuncs.com"
+    ends_file: Path | None = None
+    clock: Callable[[], float] = time.time
     max_frame_bytes: int = 20 * 1024 * 1024
     max_inflight: int = 4
     min_free_bytes: int = 256 * 1024 * 1024
@@ -42,7 +46,7 @@ class Settings:
     def from_env(cls):
         # Explicit persistent storage and bucket are required; never inherit a real bucket.
         settings = cls(Path(os.environ["TIMELENS_SPOOL_DIR"]), Path(os.environ["TIMELENS_DEVICE_TOKENS_FILE"]),
-                       os.environ["TIMELENS_OSS_BUCKET"], os.environ.get("TIMELENS_OSS_ENDPOINT", "https://oss-cn-beijing.aliyuncs.com"))
+                       os.environ["TIMELENS_OSS_BUCKET"], os.environ.get("TIMELENS_OSS_ENDPOINT", "https://oss-cn-beijing.aliyuncs.com"), ends_file=Path(os.environ["TIMELENS_ARCHIVE_ENDS_FILE"]))
         settings.validate()
         return settings
 

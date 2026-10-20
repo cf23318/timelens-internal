@@ -738,6 +738,7 @@ mod tests {
         db.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES('shot','s',?1,1,47,'poll')", [shot.to_str().unwrap()]).unwrap();
         db.execute("INSERT INTO settings(key,value,updated_at) VALUES('test_credential','fixture-secret',1)", []).unwrap();
         let progress = TaskProgress {
+            ended_at_ms: None,
             task_id: uuid::Uuid::new_v4().to_string(),
             elapsed_ms: 1000,
             target_ms: 1000,

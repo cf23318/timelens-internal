@@ -1,68 +1,75 @@
-# TimeLens Internal 逐张截图接收服务
+# TimeLens Internal 原图归档接收服务（v2）
 
-从交付源码中适配 OSS 私有存储校验、设备 token 和幂等回执；接收原始 WebP，经 HTTPS 传输。客户端不再制作 age 加密包；OSS 仍启用服务端 AES256 存储加密。
+逐张接收原始 WebP，通过 SHA256、大小、CRC64、私有 ACL 和 SSE 验真后返回精简回执。归档增加任务身份、云端清单、原图回读、数量对账和到期删除。客户端不保存 OSS AccessKey，不上传活动数据库；新任务默认本机累计48小时，保留手动开始和屏幕选择，不加入云端有效覆盖计时/排班/强制多屏。
 
-此版本不依赖排班、服务器累计 48 小时或 30 天到期删除。采集目标、屏幕选择和手动开始仍由客户端现有规则控制。服务只接收图片及必要的调研/设备、时间、显示器和校验元数据，活动数据库保留在本地。上传成功后客户端也保留本地图片，不自动清理。
+完整流程、期限、旧数据边界和异常限制见 [归档与留存](../docs/archive-retention.md)。
 
-## 本地假数据测试
+## 假数据验证
 
-在独立虚拟环境安装 `.[test]` 后执行：
+    python -m pip install -e './upload-server[test]'
+    python -m pytest -q upload-server/tests
 
-```sh
-python -m pip install '.[test]'
-python -m pytest -q
-```
+FakeBucket 仅在内存保存合成图片，不访问 OSS 或读取真实凭据。跨语言合同：
 
-测试的 FakeBucket 仅存内存，不访问真实 OSS 或凭据。测试图片由 Pillow 或 Rust 编码器合成，不截图。
+    TIMELENS_TEST_PYTHON=/path/to/isolated/venv/bin/python cargo test --manifest-path project/src-tauri/Cargo.toml --features frame-contract-tests --lib
 
-跨语言合同测试从项目根目录执行（将 Python 路径替换为该虚拟环境）：
+合同临时启动仅监听回环地址的假服务，测试结束停止；普通构建不启用该测试功能。
 
-```sh
-TIMELENS_TEST_PYTHON=/absolute/path/to/venv/bin/python cargo test --manifest-path project/src-tauri/Cargo.toml --features frame-contract-tests --lib
-```
+## 接口与兼容性
 
-其中 `rust_to_python_receiver_to_fake_oss_roundtrip` 自动启动仅监听 127.0.0.1 的假服务，测试完成停止。普通应用构建不启用该测试功能。
+v2 客户端和接收器需配套升级，不能只改 URL 使用旧服务。POST /v1/frames/<snapshot UUID> 仍接收单张原始 WebP（默认20MiB上限），回执为 snapshot_id/object_key/sha256/size_bytes/verified。
 
-## 接口
+请求必须有 Bearer 设备token、Survey/Device、Captured-At、Sha256、Size-Bytes、Capture-Group-ID、Group-Elapsed-Ms、Expected-Displays、Display-ID，以及新增的 X-TimeLens-Task（UUID）和 X-TimeLens-Archive-End（含时区）。不将旧v1对象或旧数据库行自动纳入归档删除。
 
-`POST /v1/frames/{规范小写截图 UUID}`，请求体为单个原始 WebP，最大默认 20 MiB。必须携带：
+客户端每张图为独立组、时长0、屏数1；这些字段不计工作时长，不强制采全部显示器。服务器对task/survey/device及批准结束上界进行持久绑定，身份不可换，结束只能提前，删除日不能因补传/重试延期。
 
-- `Authorization: Bearer <设备 token>`
-- `X-TimeLens-Survey`、`X-TimeLens-Device`
-- `X-TimeLens-Captured-At`（含时区的 RFC3339）
-- `X-TimeLens-Sha256`、`X-TimeLens-Size-Bytes`
-- `X-TimeLens-Capture-Group-ID`、`X-TimeLens-Group-Elapsed-Ms`
-- `X-TimeLens-Expected-Displays`、`X-TimeLens-Display-ID`
+- POST /v1/archives/<task>/register：登记，不发送图片。
+- POST /v1/archives/<task>/finish：小型JSON ended_at；同步提前结束，允许其后补传截止前图片。结束同步不依赖图片队列全部成功。
+- GET /v1/archives/<task>：状态和删除截止。
+- GET /v1/archives/<task>/manifest?after=<UUID>：分页清单，最多500帧，每帧重新核验OSS HEAD。
+- GET /v1/archives/<task>/reconcile：比对持久清单和OSS任务前缀，报告缺失/额外对象数量。
+- GET /v1/archives/<task>/frames/<snapshot>：完整回读校验后返回WebP。
 
-当前客户端将每张去重后保存的图片作为独立组，组时长为 0、组屏数为 1；这些字段只作元数据，不累计工作时长，也不要求每次采集全部显示器。
+所有归档接口要求同设备有效token，逐请求重读，禁止缓存。撤销后不能读取/上传；清理按持久截止继续，不依赖token。错误请求不会返回验收回执。服务器在请求结束后补偿无确认孤儿写入；迟到请求与清理以同一主机OS锁串行。
 
-成功回执仅包含 `snapshot_id/object_key/sha256/size_bytes/verified`。客户端逐项匹配才持久标记 verified；不接受额外的 48 小时调查状态字段。同 UUID 的身份、内容和日期不可更改；同组同屏不可换 UUID。相同请求重试会重新核验 OSS，对象不覆盖。接收中或 PUT 后鉴权撤销不会返回成功回执。
+## 配置（本次未部署）
 
-客户端严格使用 HTTPS 根地址，禁止嵌入账号、路径、查询、重定向和系统代理。HTTP 仅用于内部测试函数的回环假服务，生产配置不接受 HTTP。408/429/5xx退避重试，身份、数据冲突及非法图片拒绝后需核对再重试。token 不出现在图片、日志、回执或界面。
+Linux 单主机，一个Uvicorn worker。独立服务身份、可信HTTPS反向代理，Uvicorn只监听127.0.0.1。spool必须是持久、0700目录，不能使用临时盘。token和批准结束配置为0600、当前服务身份拥有。示例：
 
-## 部署配置（本次未部署）
+    TIMELENS_SPOOL_DIR=/var/lib/timelens-frame
+    TIMELENS_DEVICE_TOKENS_FILE=/etc/timelens-frame/device-tokens.json
+    TIMELENS_ARCHIVE_ENDS_FILE=/etc/timelens-frame/archive-ends.json
+    TIMELENS_OSS_BUCKET=umall-video-record
+    TIMELENS_OSS_ENDPOINT=https://oss-cn-beijing-internal.aliyuncs.com
 
-仅适用于 Linux 单机受控部署、一个 Uvicorn worker。使用独立服务账户及可信 HTTPS 反向代理，Uvicorn只监听 127.0.0.1。`TIMELENS_SPOOL_DIR` 必须显式指定持久目录；接收清单与 SQLite 不能放临时盘。数据库、token 和状态须按需要备份，但本服务没有自动留存删除策略，负责人须另行定义数据保留和处置。
+token JSON形状为 survey -> device -> token（至少32字符）；archive-ends JSON为 survey -> device -> RFC3339批准结束。凭据只在服务器安全环境配置 OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET。不要放到源码、日志、客户端、安装包或工单。
 
-```sh
-TIMELENS_SPOOL_DIR=/var/lib/timelens-frame
-TIMELENS_DEVICE_TOKENS_FILE=/etc/timelens-frame/device-tokens.json
-TIMELENS_OSS_BUCKET=umall-video-record
-TIMELENS_OSS_ENDPOINT=https://oss-cn-beijing-internal.aliyuncs.com
-```
+桶名和北京端点是交付目标，没有在本次核实真实资源。仅北京阿里云同地域资源可用内网端点，其他位置用 https://oss-cn-beijing.aliyuncs.com。upload.timelens.internal 仍是客户端示例，未核实DNS/TLS/部署。
 
-上述桶名 `umall-video-record`、北京地域和内网端点沿用交付包的指定目标，保留在 [部署模板](deploy/server.env.example) 中；尚未核实真实资源、权限或连通性。北京地域阿里云主机可使用内网端点，其他网络位置应使用 `https://oss-cn-beijing.aliyuncs.com`。
+需要私有Bucket、阻止公共访问、无Bucket Policy、版本控制从未开启；每个对象显式private且AES256。身份需要限定任务前缀的写入/读取/列举/删除与安全属性查询权限。版本开启/曾开启时清理拒绝，不能声称删掉历史版本。
 
-[客户端配置示例](deploy/client-config.json.example) 保留交付包的 `https://upload.timelens.internal` 地址，作为管理员配置参考；该地址在原包中也位于 example 文件，未验证其 DNS/TLS 或实际服务。调研/设备编号仍留空，国内目的地确认仍为 false。示例不会自动载入，不能覆盖现有用户配置。有效上传 token 和 OSS AccessKey 不在交付包中，须由环境负责人另行配置。
+接收：
 
-本接收服务已去掉原版的 48 小时记账和 30 天自动删除，并使用精简回执。若该地址当前运行对方原版服务，需先按约定部署兼容版本；只复制 URL 不能保证兼容。此次没有对线上服务做任何修改。
+    uvicorn timelens_upload.app:create_app --factory --host 127.0.0.1 --port 8791 --workers 1
 
-设备 token 文件格式为 `{"survey-id":{"device-id":"<独立随机token，至少32字符>"}}`，0600且属于服务账户。每次接收和回执前重读，可轮换/撤销。文件错误时拒绝接收。不要将实际文件放进源码。OSS 凭据仅在服务器环境提供 `OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET`，客户端不保存 AccessKey。
+必须同时安装并启用 deploy/timelens-retention.service.example 的持续清理服务。两服务共用spool与进程间锁，禁止直接扩多机多副本。代理只开放必要/v1路径，限制21MiB请求体、连接/总时限，不记录Authorization或请求体。healthz只表示协议能力和需要worker，不证明清理任务在运行。
 
-仅支持北京地域指定公网/内网 OSS HTTPS endpoint。Bucket ACL需private、阻止公共访问开启、没有Bucket Policy、版本控制从未启用；每次验真检查对象 ACL、AES256、大小、SHA256元数据及CRC64，并在PUT后复核Bucket。专用RAM身份仅授所需前缀读写及安全属性查询权限。服务没有自动删除权限需求或到期清理守护进程。
+## 归档运维
 
-启动：`uvicorn timelens_upload.app:create_app --factory --host 127.0.0.1 --port 8791 --workers 1`。反向代理配置可信TLS、21 MiB请求上限、上传时限，隐藏Authorization并不记录请求体。健康接口`/healthz`不读取图片。
+    timelens-archive manifest --task <UUID> --survey <survey> --device <device>
+    timelens-archive reconcile --task <UUID> --survey <survey> --device <device>
+    timelens-archive verify --task <UUID> --survey <survey> --device <device>
+    timelens-archive restore --task <UUID> --survey <survey> --device <device>
+    timelens-archive retention
+    timelens-archive retention --execute
+    timelens-archive retention-daemon
 
-并发默认4、单请求120秒/空闲5秒、待接收预算256MiB、磁盘最低剩余256MiB、每设备登记预算20GiB；修改Settings时须压测。请求进入前原子预留容量，finally释放；崩溃遗留暂存仍占预算，不会自动删除。可核对SQLite与OSS后由管理员离线处置。当前锁和回执数据库为单机文件，不支持直接多副本扩容。
+manifest输出索引，reconcile核对对象数量，verify完整回读复算哈希，restore只写受管managed-restores/<task>。retention默认dry run；--execute才删除。daemon每30秒重试，失败写私有retention-alert.json并持续补偿；运维需接入现有告警和服务监控。状态文件需受控备份，恢复副本不可另做无期限备份。
 
-真实OSS、RAM权限、TLS、生产负载与Windows/Mac长期运行仍需独立验收；本地假存储测试不能替代。
+固定删除日为服务端已知的实际/批准结束较早者+30天；结束元数据在本地持久保存并独立重试，不以图片上传全部成功为条件。若断网、凭证撤销或程序关闭导致服务端尚未收到提前结束，它暂时只能依据批准结束上界；负责人需同步结束记录并必要时提前处置，不能宣称离线仍已同步。到期删除开始时间与完成时间应分开记录，服务/OSS故障、慢请求、外部备份和人工副本须独立核验。
+
+并发默认4、单请求120秒/空闲5秒、暂存预算256MiB、最低空闲256MiB、每设备预算20GiB。容量及负载、TLS/IAM、真实OSS、平台长期运行和实际删除均未在本次验收。
+
+## OSS直传管理工具
+
+不使用接收服务时，运行 `timelens-oss-grant` 签发并登记授权，`timelens-oss-admin` 同步清单、对账、完整回读、恢复和到期清理。步骤、私有台账要求、常驻/授权排空限制和launchd模板见 [离线授权操作](../docs/oss-offline-upload.md)。这套台账与旧接收器台账独立，不自动接管旧任务。

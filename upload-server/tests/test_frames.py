@@ -8,15 +8,18 @@ import pytest
 from timelens_upload.config import Settings
 from timelens_upload.app import create_app
 from fakes import FakeBucket
+TASK="11111111-1111-4111-8111-111111111111"
+END="2026-10-31T17:00:00Z"
 TOKEN="fixture-only-device-token-not-a-real-secret-123456"
 def image_bytes():
  out=io.BytesIO();Image.new("RGB",(16,16),(30,140,210)).save(out,format="WEBP",quality=85);return out.getvalue()
 def headers(data,**changes):
- h={"Authorization":"Bearer "+TOKEN,"Content-Type":"image/webp","X-TimeLens-Survey":"fixture-survey","X-TimeLens-Device":"fixture-device","X-TimeLens-Captured-At":"2026-10-01T01:02:03.123Z","X-TimeLens-Sha256":hashlib.sha256(data).hexdigest(),"X-TimeLens-Size-Bytes":str(len(data)),"X-TimeLens-Capture-Group-ID":str(uuid4()),"X-TimeLens-Group-Elapsed-Ms":"0","X-TimeLens-Expected-Displays":"1","X-TimeLens-Display-ID":"1"};h.update(changes);return h
+ h={"Authorization":"Bearer "+TOKEN,"Content-Type":"image/webp","X-TimeLens-Survey":"fixture-survey","X-TimeLens-Device":"fixture-device","X-TimeLens-Captured-At":"2026-10-01T01:02:03.123Z","X-TimeLens-Sha256":hashlib.sha256(data).hexdigest(),"X-TimeLens-Size-Bytes":str(len(data)),"X-TimeLens-Capture-Group-ID":str(uuid4()),"X-TimeLens-Group-Elapsed-Ms":"0","X-TimeLens-Expected-Displays":"1","X-TimeLens-Display-ID":"1","X-TimeLens-Task":TASK,"X-TimeLens-Archive-End":END};h.update(changes);return h
 @pytest.fixture
 def env(tmp_path):
  p=tmp_path/"tokens.json";p.write_text(json.dumps({"fixture-survey":{"fixture-device":TOKEN}}));p.chmod(0o600)
- s=Settings(tmp_path/"persistent",p,"fixture-private-bucket",min_free_bytes=0);b=FakeBucket();return s,b,TestClient(create_app(s,b))
+ e=tmp_path/"ends.json";e.write_text(json.dumps({"fixture-survey":{"fixture-device":END}}));e.chmod(0o600)
+ s=Settings(tmp_path/"persistent",p,"fixture-private-bucket",ends_file=e,clock=lambda:1792454400,min_free_bytes=0);b=FakeBucket();return s,b,TestClient(create_app(s,b))
 def send(c,data=None,h=None,sid=None):
  data=image_bytes() if data is None else data
  return c.post("/v1/frames/"+(sid or str(uuid4())),content=data,headers=h or headers(data))
@@ -28,7 +31,7 @@ def test_idempotent_retry_and_restart(env):
 def test_single_and_multiple_displays_without_duration_gate(env):
  s,b,c=env;d=image_bytes();g=str(uuid4())
  for display in (1,9):assert send(c,d,headers(d,**{"X-TimeLens-Capture-Group-ID":g,"X-TimeLens-Expected-Displays":"2","X-TimeLens-Display-ID":str(display)})).status_code==200
- assert send(c).status_code==200;assert c.get("/healthz").json()["automatic_retention"] is False;assert not list(s.spool_dir.glob("*deadline*"))
+ assert send(c).status_code==200;assert c.get("/healthz").json()["retention_worker_required"] is True;assert not list(s.spool_dir.glob("*48hour*"))
 @pytest.mark.parametrize("change",[{"X-TimeLens-Captured-At":"2026-10-02T01:02:03.123Z"},{"X-TimeLens-Display-ID":"2"},{"X-TimeLens-Capture-Group-ID":str(uuid4())}])
 def test_uuid_identity_cannot_change_even_across_dates(env,change):
  _,b,c=env;d=image_bytes();h=headers(d);sid=str(uuid4());assert send(c,d,h,sid).status_code==200;assert send(c,d,{**h,**change},sid).status_code==409;assert b.put_count==1
@@ -55,7 +58,7 @@ def test_lost_receipt_can_retry_without_second_put(env,monkeypatch):
  def failing(config):
   nonlocal calls
   calls+=1
-  if calls==2:raise OSError("simulated receipt persistence failure")
+  if calls==5:raise OSError("simulated receipt persistence failure")
   with original(config) as db:yield db
  d=image_bytes();h=headers(d);sid=str(uuid4());monkeypatch.setattr(m,"registry",failing);assert send(c,d,h,sid).status_code==503
  monkeypatch.setattr(m,"registry",original);assert send(c,d,h,sid).status_code==200;assert b.put_count==1
@@ -96,7 +99,7 @@ def test_cleanup_failure_never_leaks_capacity_or_slot(env,monkeypatch):
  from pathlib import Path
  s,b,_=env;c=TestClient(create_app(replace(s,max_inflight=1),b));d=image_bytes();h=headers(d);sid=str(uuid4());original=Path.unlink
  def fail(path,*args,**kwargs):
-  if path.parent.name=="pending":raise OSError("simulated cleanup failure")
+  if path.suffix==".webp" and "pending" in path.parts:raise OSError("simulated cleanup failure")
   return original(path,*args,**kwargs)
  monkeypatch.setattr(Path,"unlink",fail);assert send(c,d,h,sid).status_code==503
  monkeypatch.setattr(Path,"unlink",original);assert send(c,d,h,sid).status_code==200;assert b.put_count==1

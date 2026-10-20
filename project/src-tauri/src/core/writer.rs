@@ -75,7 +75,7 @@ fn event_sort_key(e: &WriteEvent) -> u8 {
         WriteEvent::NudgeLog(_) => 8,
         WriteEvent::Retention { .. } => 9,
         WriteEvent::WalCheckpoint => 10,
-        WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) => 0,
+        WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) | WriteEvent::EraseExpiredData(_) => 0,
     }
 }
 
@@ -105,6 +105,11 @@ impl WriterHandle {
 
     pub fn check_health(&self) -> Result<(), String> {
         self.metrics.last_error.lock().clone().map_or(Ok(()), Err)
+    }
+    pub fn erase_expired_data(&self)->Result<(),String>{
+        let (tx,rx)=std::sync::mpsc::channel();
+        self.tx.send_timeout(WriteEvent::EraseExpiredData(tx),std::time::Duration::from_secs(5)).map_err(|_|"清理队列不可用")?;
+        rx.recv_timeout(std::time::Duration::from_secs(120)).map_err(|_|"到期清理超时")?
     }
     pub fn erase_collected_data(&self) -> Result<(), String> {
         self.check_health()?;
@@ -178,6 +183,7 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             let _ = done.send(metrics.last_error.lock().clone().map_or(Ok(()), Err));
             continue;
         }
+        if let WriteEvent::EraseExpiredData(done) = first { let _=done.send(erase_data_inner(conn,true)); continue; }
         if let WriteEvent::EraseCollectedData(done) = first {
             let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
             let _ = done.send(health.and_then(|_| erase_data(conn)));
@@ -191,7 +197,7 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
                         e,
                         WriteEvent::Shutdown
                             | WriteEvent::Flush(_)
-                            | WriteEvent::EraseCollectedData(_)
+                            | WriteEvent::EraseCollectedData(_) | WriteEvent::EraseExpiredData(_)
                     ) {
                         batch.push(e);
                         break;
@@ -204,11 +210,13 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
         let has_shutdown = batch.iter().any(|e| matches!(e, WriteEvent::Shutdown));
         let mut flushes = Vec::new();
         let mut erasures = Vec::new();
+        let mut expirations = Vec::new();
         batch.retain(|e| match e {
             WriteEvent::Flush(done) => {
                 flushes.push(done.clone());
                 false
             }
+            WriteEvent::EraseExpiredData(done) => { expirations.push(done.clone()); false },
             WriteEvent::EraseCollectedData(done) => {
                 erasures.push(done.clone());
                 false
@@ -235,6 +243,7 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
         for done in erasures {
             let _ = done.send(health.clone().and_then(|_| erase_data(conn)));
         }
+        for done in expirations { let _=done.send(erase_data_inner(conn,true)); }
         let ms = started.elapsed().as_millis() as u64;
         metrics.total_batches.fetch_add(1, AtomicOrdering::Relaxed);
         metrics.total_events.fetch_add(n, AtomicOrdering::Relaxed);
@@ -252,7 +261,8 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
     }
 }
 
-pub(crate) fn erase_data(conn: &mut Connection) -> Result<(), String> {
+pub(crate) fn erase_data(conn: &mut Connection) -> Result<(), String> { erase_data_inner(conn,false) }
+fn erase_data_inner(conn:&mut Connection,keep_settings:bool)->Result<(),String>{
     conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA secure_delete=ON;")
         .map_err(|e| e.to_string())?;
     let result = (|| {
@@ -266,8 +276,10 @@ pub(crate) fn erase_data(conn: &mut Connection) -> Result<(), String> {
         };
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         for table in tables {
+            if keep_settings && table=="settings" {continue;}
+            let filter=if keep_settings && table=="intent_mapping" {" WHERE is_builtin=0"} else {""};
             tx.execute(
-                &format!("DELETE FROM \"{}\"", table.replace('"', "\"\"")),
+                &format!("DELETE FROM \"{}\"{}", table.replace('"', "\"\""),filter),
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -613,7 +625,7 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                     )?;
                 }
             },
-            WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) => {}
+            WriteEvent::Shutdown | WriteEvent::Flush(_) | WriteEvent::EraseCollectedData(_) | WriteEvent::EraseExpiredData(_) => {}
         }
     }
     tx.commit()?;

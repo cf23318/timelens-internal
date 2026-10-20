@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace as NS
+import io
 import oss2
 from oss2.utils import Crc64
 
@@ -24,3 +25,12 @@ class FakeBucket:
         data=Path(filename).read_bytes();self.objects[key]=(data,headers.copy());self.put_count+=1;crc=Crc64();crc.update(data)
         if self.after_put:self.after_put()
         return NS(crc=crc.crc+int(self.bad_crc))
+
+    def get_object(self,key):
+        if key not in self.objects: self.head_object(key)
+        return io.BytesIO(self.objects[key][0])
+    def delete_object(self,key):
+        self.objects.pop(key,None)
+    def list_objects(self,prefix,marker='',max_keys=1000):
+        keys=sorted(k for k in self.objects if k.startswith(prefix) and k>marker)
+        return NS(object_list=[NS(key=k) for k in keys[:max_keys]],is_truncated=len(keys)>max_keys,next_marker=keys[max_keys-1] if len(keys)>max_keys else '')

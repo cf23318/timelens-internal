@@ -37,6 +37,10 @@ pub fn snapshot_stats(conn: &Connection) -> Result<SnapshotStats, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UploadConfirmation {
+    #[serde(default="receiver_mode")]
+    pub upload_mode: String,
+    #[serde(default)]
+    pub grant_fingerprint: String,
     pub task_id: String,
     pub upload_url: String,
     pub encryption_recipient: String,
@@ -46,7 +50,11 @@ pub struct UploadConfirmation {
     pub survey_id: String,
     #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
+    pub archive_end_at: String,
 }
+
+fn receiver_mode()->String { "receiver".into() }
 
 pub fn upload_missing(config: &InternalConfig, token_present: bool) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -62,7 +70,8 @@ pub fn upload_missing(config: &InternalConfig, token_present: bool) -> Vec<&'sta
     if !config.domestic_server_confirmed {
         missing.push("domestic");
     }
-    if !token_present {
+    if super::archive::end_ms(config).is_err() { missing.push("archiveEnd"); }
+    if !token_present && config.upload_mode == "receiver" {
         missing.push("credential");
     }
     missing
@@ -81,11 +90,12 @@ pub fn validate_confirmation(
     if expected.cleanup_only {
         return Ok(());
     }
-    if expected.upload_url != config.upload_url
+    if expected.upload_mode != config.upload_mode || expected.upload_url != config.upload_url
         || expected.encryption_recipient != config.encryption_recipient
         || expected.domestic_server_confirmed != config.domestic_server_confirmed
         || expected.survey_id != config.upload_survey_id
         || expected.device_id != config.upload_device_id
+        || expected.archive_end_at != config.archive_end_at
     {
         return Err("上传配置已变化，请重新查看目的地并确认".into());
     }
@@ -132,7 +142,9 @@ mod tests {
         config.domestic_server_confirmed = true;
         config.upload_survey_id = "fixture".into();
         config.upload_device_id = "device".into();
+        config.archive_end_at="2026-10-31T17:00:00Z".into();
         let expected = UploadConfirmation {
+            upload_mode: "receiver".into(), grant_fingerprint: String::new(),
             task_id: progress.task_id.clone(),
             upload_url: config.upload_url.clone(),
             encryption_recipient: config.encryption_recipient.clone(),
@@ -140,6 +152,7 @@ mod tests {
             cleanup_only: false,
             survey_id: config.upload_survey_id.clone(),
             device_id: config.upload_device_id.clone(),
+            archive_end_at:config.archive_end_at.clone(),
         };
         assert!(validate_confirmation(&expected, &config, &progress, true).is_ok());
         assert!(validate_confirmation(&expected, &config, &progress, false).is_err());
@@ -155,7 +168,7 @@ mod tests {
         let mut changed = config.clone();
         changed.domestic_server_confirmed = false;
         assert!(validate_confirmation(&expected, &changed, &progress, true).is_err());
-        assert!(upload_missing(&InternalConfig::default(), false).len() == 5);
+        assert!(upload_missing(&InternalConfig::default(), false).len() == 6);
         assert_eq!(control.progress.lock().task_id, progress.task_id);
         assert!(!control.tracking.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -167,6 +180,7 @@ mod tests {
         let mut progress = control.progress.lock().clone();
         let config = InternalConfig::default();
         let expected = UploadConfirmation {
+            upload_mode: "receiver".into(), grant_fingerprint: String::new(),
             task_id: progress.task_id.clone(),
             upload_url: String::new(),
             encryption_recipient: String::new(),
@@ -174,6 +188,7 @@ mod tests {
             cleanup_only: true,
             survey_id: String::new(),
             device_id: String::new(),
+            archive_end_at:String::new(),
         };
         assert!(validate_confirmation(&expected, &config, &progress, false).is_err());
         progress.receipt = Some(crate::core::transfer::UploadReceipt {

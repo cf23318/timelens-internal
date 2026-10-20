@@ -7,7 +7,8 @@ from timelens_upload.config import Settings
 from fakes import FakeBucket
 with tempfile.TemporaryDirectory(prefix="timelens-contract-fixture-") as directory:
     root=Path(directory);token=root/"tokens.json";token.write_text(json.dumps({"fixture-survey":{"fixture-device":"fixture-only-token-not-real-credentials-12345"}}));token.chmod(0o600)
-    bucket=FakeBucket();app=create_app(Settings(root/"state",token,"fixture-private-bucket",min_free_bytes=0),bucket)
+    ends=root/"ends.json";ends.write_text(json.dumps({"fixture-survey":{"fixture-device":"2099-12-31T17:00:00Z"}}));ends.chmod(0o600)
+    bucket=FakeBucket();app=create_app(Settings(root/"state",token,"fixture-private-bucket",ends_file=ends,min_free_bytes=0),bucket)
     @app.get("/fixture-state")
     async def fixture_state():return {"put_count":bucket.put_count}
     sock=socket.socket();sock.bind(("127.0.0.1",0));sock.listen(128)
