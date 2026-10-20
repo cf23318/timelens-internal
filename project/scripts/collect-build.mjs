@@ -9,7 +9,9 @@ const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const platform = process.argv[2];
 if (!["windows", "macos"].includes(platform)) throw new Error("Expected windows or macos");
 const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: project, encoding: "utf8" }).trim();
-const sourceDirty = !!execFileSync("git", ["status", "--porcelain"], { cwd: project, encoding: "utf8" }).trim();
+const sourceChanges = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: project, encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
+const sourceDirty = sourceChanges.length > 0;
+const sourceDiff = execFileSync("git", ["diff", "HEAD", "--binary"], { cwd: project, maxBuffer: 32 * 1024 * 1024 });
 const repository = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: project, encoding: "utf8" }).trim();
 const sourcePaths = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: repository, encoding: "utf8" }).split("\0").filter(Boolean))].sort();
 const sourceHash = createHash("sha256");
@@ -27,6 +29,7 @@ const release = path.join(project, "src-tauri", "target", "release");
 const output = path.join(project, "src-tauri", "target", "distribution", platform);
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
+if (sourceDiff.length) await writeFile(path.join(output, "SOURCE-DIFF.patch"), sourceDiff);
 const files = [];
 async function include(source, name = path.basename(source)) {
   const destination = path.join(output, name);
@@ -64,7 +67,7 @@ if (platform === "macos") {
 }
 await writeFile(path.join(output, "INTERNAL-TEST-PACKAGE.txt"), "Internal test package. No employee data or upload grants included.\nNo Developer ID notarization or Windows signing certificate is configured; inspect BUILD-INFO.json.\nDo not treat this build as a signed production release.\n");
 await writeFile(path.join(output, "BUILD-INFO.json"), JSON.stringify({
-  version, sourceCommit, sourceDirty, sourceTreeSha256, platform, architecture: process.arch, signing,
+  version, sourceCommit, sourceDirty, sourceChanges, sourceDiffSha256: createHash("sha256").update(sourceDiff).digest("hex"), sourceTreeSha256, platform, architecture: process.arch, signing,
   runUrl: process.env.GITHUB_SERVER_URL && `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
   builtAt: new Date().toISOString(),
   acceptance: "CI tests and packaging only; desktop capture requires separate authorized machine testing.", files,
