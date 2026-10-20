@@ -143,23 +143,7 @@ impl InternalConfig {
         {
             return true;
         }
-        let title = title.to_lowercase();
-        if [
-            "密码",
-            "password",
-            "登录",
-            "login",
-            "网银",
-            "网上银行",
-            "online banking",
-            "验证码",
-            "支付验证",
-            "verification code",
-            "one-time password",
-        ]
-        .iter()
-        .any(|s| title.contains(s))
-        {
+        if super::privacy::sensitive_title(title) {
             return true;
         }
         // An unreadable browser address must never silently bypass banking-domain rules.
@@ -167,8 +151,10 @@ impl InternalConfig {
             return true;
         }
         let host = url
-            .and_then(|s| reqwest::Url::parse(s).ok())
-            .and_then(|u| u.host_str().map(str::to_owned));
+            .and_then(super::browser::url_host);
+        if browser && host.is_none() {
+            return true;
+        }
         host.is_some_and(|host| {
             self.screenshot_blocked_domains.iter().any(|d| {
                 let d = d.trim().trim_start_matches('.').to_lowercase();
@@ -814,7 +800,14 @@ mod tests {
         let c = InternalConfig::default();
         assert!(c.blocks_screenshot("WeChat", None, "", None, false));
         assert!(c.blocks_screenshot("Chrome", None, "", None, true));
+        assert!(c.blocks_screenshot("Chrome", None, "", Some("not a URL"), true));
         assert!(c.blocks_screenshot("Chrome", None, "", Some("https://my.icbc.com.cn/a"), true));
+        assert!(c.blocks_screenshot("Chrome", None, "", Some("//my.icbc.com.cn/a"), true));
+        assert!(!c.blocks_screenshot("Chrome", None, "", Some("//icbc.com.cn.example.org/a"), true));
+        for title in ["password-test.txt", "PASSWORD", "登录", "VERIFICATION CODE"] {
+            assert!(c.blocks_screenshot("notepad", None, title, None, false));
+            assert_eq!(super::super::privacy::redact_title(title), "[redacted]");
+        }
         assert!(!c.blocks_screenshot(
             "Chrome",
             None,

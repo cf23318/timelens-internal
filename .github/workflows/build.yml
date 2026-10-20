@@ -1,86 +1,106 @@
 name: Build
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  checks:
+    name: Frontend and receiver checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: project/package-lock.json
+      - run: npm ci
+        working-directory: project
+      - run: npm run build && npm run verify:no-net
+        working-directory: project
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e './upload-server[test]'
+      - run: python -m pytest -q
+        working-directory: upload-server
+
   build:
+    name: Build ${{ matrix.name }}
+    needs: checks
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             name: windows
+            bundle: nsis
           - os: macos-latest
             name: macos
-
+            bundle: dmg
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: project
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
           cache: npm
           cache-dependency-path: project/package-lock.json
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: project/src-tauri
-
-      - name: Install frontend dependencies
-        working-directory: project
-        run: npm ci
-
-      - name: Import Apple signing certificate (macOS)
-        if: matrix.os == 'macos-latest' && env.APPLE_CERTIFICATE != ''
+      - run: npm ci
+      - name: Rust unit tests (synthetic data only)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Import Apple signing certificate
+        if: matrix.name == 'macos' && github.event_name != 'pull_request' && env.APPLE_CERTIFICATE != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           security create-keychain -p "timelens_ci" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "timelens_ci" build.keychain
-          security import certificate.p12 -k build.keychain \
-            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "timelens_ci" build.keychain
-          rm certificate.p12
-
-      - name: Build Tauri app
-        working-directory: project
+          rm "$RUNNER_TEMP/certificate.p12"
+      - name: Build installer
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: npm run tauri build
-
-      - name: Upload Windows installer (NSIS)
-        if: matrix.os == 'windows-latest'
+          APPLE_SIGNING_IDENTITY: ${{ github.event_name != 'pull_request' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+        run: |
+          # Empty is treated as a signing identity by Tauri; unset for ad-hoc test builds.
+          if [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then unset APPLE_SIGNING_IDENTITY; fi
+          npm run tauri -- build --bundles ${{ matrix.bundle }}
+      - name: Record source commit and checksums
+        run: node scripts/collect-build.mjs ${{ matrix.name }}
+      - name: Upload test package
         uses: actions/upload-artifact@v4
         with:
-          name: TimeLens-windows-x64-installer
-          path: project/src-tauri/target/release/bundle/nsis/*-setup.exe
-          retention-days: 30
-
-      - name: Upload Windows portable (exe)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: TimeLens-windows-x64-portable
-          path: project/src-tauri/target/release/TimeLens.exe
-          retention-days: 30
-
-      - name: Upload macOS DMG
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: TimeLens-macos-dmg
-          path: project/src-tauri/target/release/bundle/dmg/*.dmg
+          name: TimeLens-${{ matrix.name }}
+          path: project/src-tauri/target/distribution/${{ matrix.name }}/
+          if-no-files-found: error
           retention-days: 30

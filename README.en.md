@@ -1,177 +1,34 @@
-> The local internal build now uploads individual raw screenshots and retains local images/database. See [installation](docs/internal-frame-install.md) and [receiver](upload-server/README.md). Encrypted recovery descriptions below document the earlier implementation.
-
 # TimeLens Internal
 
-This repository adapts [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5 (`f8e7107`) and retains its MIT license. See [INTERNAL_REVIEW.md](INTERNAL_REVIEW.md) for implementation and verification limits. The upstream introduction and download links below describe the original project, not this adaptation.
+An internal desktop adaptation of [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5 (f8e7107), under the [MIT license](LICENSE). Current internal version: **0.17.6**. See the [Chinese README](README.md) for full configuration and acceptance details.
 
-Collection starts manually and uses periodic screenshots, with a default cumulative target of 16 hours. Foreground-app screenshot blocking is independent of OCR and does not mask other visible windows. Original screenshot pixels are not redacted. External AI and online updates are disabled; internal upload configuration is empty by default. Runtime data and credentials are excluded from source publication. A Mac build and short local trial have been completed; Windows runtime and full two-workday acceptance remain unverified.
+- Chinese and light appearance by default; collection starts manually. Pause/resume is available, and restarting leaves collection paused.
+- Periodic WebP screenshots (12-second default attempt interval), foreground-window events, local timeline and replay. Replay works with OCR disabled; optional OCR runs locally. This is sampled screenshots, not continuous video.
+- Two workdays default to 16 accumulated hours. The foreground display is captured by default; all displays are optional. Windows input counters are not implemented.
+- Foreground privacy rules block listed apps, sensitive titles and banking domains. Unreadable browser addresses block screenshots. Background content may still appear; there is no pixel masking. New titles are redacted; old records are not rewritten automatically.
+- Upload is off until configured and explicitly confirmed. Each original WebP is sent to an internal HTTPS receiver with required metadata; the activity database stays local. There is no new age archive, automatic local deletion or 30-day expiry. Restarting disables upload again.
+- External AI and online updates are disabled. Upstream AI reports and upstream download links do not describe this internal build. Example endpoints do not prove deployment.
 
----
+## Builds and contributions
 
-<!-- markdownlint-disable MD033 MD041 MD036 MD060 -->
+Use a dedicated branch and PR. [Build](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) automatically tests and builds PRs and main for Windows and macOS. Download the matching successful run's `TimeLens-windows` or `TimeLens-macos` artifact (30-day retention), and verify `BUILD-INFO.json` and `SHA256SUMS`. Windows includes NSIS and standalone executables; macOS includes DMG. Artifacts may require GitHub sign-in. Actions stays enabled as the standard build path.
 
-<div align="center">
+Before merging desktop behavior changes, test the affected platform with authorized fixtures and upload off. Merge only after checks and the required authorization. Releases require separate approval; a `v*` tag produces a draft using the same build workflow. Unsigned/unnotarized packages are for controlled testing.
 
-<img src="docs/assets/timelines宣传/EN/timelines.png" alt="TimeLens timeline preview" width="100%">
+## Development
 
-# TimeLens
+Node.js 22+, Rust stable, and [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) are required. Windows also needs MSVC and WebView2.
 
-**Local-first AI time engine for macOS and Windows**
-
-Passive tracking, smart screenshots, OCR search, and AI reports. All data stays on your device.
-
-[中文版](README.md)
-
-[![GitHub stars](https://img.shields.io/github/stars/gitxuzhefeng/timelines?style=social)](https://github.com/gitxuzhefeng/timelines)
-[![MIT License](https://img.shields.io/github/license/gitxuzhefeng/timelines)](LICENSE)
-[![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-blue)](https://tauri.app/)
-[![macOS](https://img.shields.io/badge/platform-macOS-black)](https://github.com/gitxuzhefeng/timelines/releases/latest)
-[![Windows](https://img.shields.io/badge/platform-Windows-0078D4)](https://github.com/gitxuzhefeng/timelines/releases/latest)
-
-[Download](https://github.com/gitxuzhefeng/timelines/releases/latest) · [Website](https://timelens-pi.vercel.app/) · [GitHub Actions Builds](https://github.com/gitxuzhefeng/timelines/actions)
-
-</div>
-
----
-
-## What It Does
-
-TimeLens runs silently in the background, automatically recording how much time you spend in each app and window. Smart screenshots, OCR, and AI analysis turn fragmented desktop activity into reviewable timelines, daily reports, and weekly insights.
-
-No manual check-ins. No account. No cloud upload. Everything stays in a local SQLite database on your device.
-
----
-
-## Screenshots
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <strong>Today Lens</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/screenshot-20260427-211111.png" alt="TimeLens Today Lens English UI" width="100%">
-      <br>
-      <sub>Understand your day at a glance</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>Timeline</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/timelines.png" alt="TimeLens timeline English UI" width="100%">
-      <br>
-      <sub>Review app sessions, windows, and screenshots</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <strong>Daily Report</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/daily.png" alt="TimeLens daily report English UI" width="100%">
-      <br>
-      <sub>Turn desktop activity into daily insights</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>Weekly Report</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/weeklyreport.png" alt="TimeLens weekly report English UI" width="100%">
-      <br>
-      <sub>Review your weekly focus rhythm with heatmaps</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <strong>Work Loop</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/workloop.png" alt="TimeLens work loop English UI" width="100%">
-      <br>
-      <sub>See which apps form your focus loop or interruptions</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>Settings</strong><br><br>
-      <img src="docs/assets/timelines宣传/EN/setting.png" alt="TimeLens settings English UI" width="100%">
-      <br>
-      <sub>Configure language, themes, AI, and privacy options</sub>
-    </td>
-  </tr>
-</table>
-
----
-
-## Live Demo
-
-Below is a **Today Lens** screen recording. Use the GIF for a quick preview, or the MP4 for higher quality with playback controls.
-
-<div align="center">
-
-<img src="docs/assets/timelines宣传/EN/ezgif.com-animated-gif-maker.gif" alt="TimeLens Today Lens English UI demo" width="100%">
-
-<video src="docs/assets/timelines宣传/EN/ezgif.com-gif-to-mp4-converter.mp4" controls playsinline width="100%"></video>
-
-</div>
-
----
-
-## Features
-
-- **Passive capture**: Detects foreground window changes in the background and records app name, window title, and duration without interrupting your workflow.
-- **Smart screenshots**: Captures screenshots on window switch, with perceptual-hash deduplication and WebP compression to control disk usage.
-- **Session aggregation**: Reconstructs fragmented events into continuous work sessions, filterable by app and date.
-- **OCR full-text search**: Runs OCR on screenshots so you can search any past screen content.
-- **AI daily and weekly reports**: Turns desktop activity into summaries, metrics, and trend analysis.
-- **Work loop visualization**: Identifies main loops, supporting apps, and interruption sources when you switch contexts too often.
-- **Local-first**: Stores data in SQLite, requires no cloud service, and does not record keyboard input or clipboard content.
-- **Cross-platform and bilingual**: Supports macOS, Windows, Chinese, and English.
-
----
-
-## Download
-
-| Platform | How to download |
-|----------|-----------------|
-| macOS | Download the `.dmg` from [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest) |
-| Windows installer | Download `*-setup.exe` from [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest) |
-| Windows portable | Download `TimeLens.exe` from [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest), extract, and run directly |
-
-> If no release is available yet, download the latest build artifact from the [Actions](https://github.com/gitxuzhefeng/timelines/actions) page.
-
-### macOS First Launch Note
-
-If you see `"TimeLens.app is damaged and can't be opened"` on macOS, this is usually caused by the system quarantine attribute rather than actual file corruption. Run:
-
-```bash
-xattr -rd com.apple.quarantine "/Applications/TimeLens.app"
-```
-
----
-
-## Quick Start for Developers
-
-**Prerequisites**: Node.js · Rust toolchain · [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/)
-
-```bash
-git clone https://github.com/gitxuzhefeng/timelines.git
-cd timelines/project
-npm install
+```sh
+git clone https://github.com/cf23318/timelens-internal.git
+cd timelens-internal/project
+npm ci
 npm run tauri dev
+npm run build
+npm run verify:no-net
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-| Command | Description |
-|---------|-------------|
-| `npm run tauri dev` | Desktop app development mode |
-| `npm run tauri build` | Production build |
-| `npm test` | Rust unit tests |
+[Installation/configuration](docs/internal-frame-install.md) · [Receiver and synthetic tests](upload-server/README.md) · [Current validation](docs/validation.md)
 
----
-
-## Tech Stack
-
-- **Frontend**: [React 18](https://react.dev/) · TypeScript · [Vite 6](https://vitejs.dev/) · [Tailwind CSS 4](https://tailwindcss.com/) · Zustand · [react-i18next](https://react.i18next.com/)
-- **Backend**: [Rust](https://www.rust-lang.org/) · [Tauri 2](https://v2.tauri.app/) · SQLite · Tokio
-- **Platform**: macOS acquisition bridge · Windows Win32 acquisition bridge
-- **AI**: Bring your own API key, with local-first defaults
-
----
-
-## Star the Project
-
-If TimeLens helps you understand where your desktop time goes, a GitHub star helps more people discover this local-first productivity tool.
-
----
-
-## License
-
-[MIT](LICENSE)
+Windows 10 received a short single-screen remote-desktop test on 2026-10-20. Windows 11, physical multiple displays/mixed DPI, full two-workday collection, production uploads and organizational/privacy compliance require separate acceptance. A successful CI build is not proof of those outcomes.

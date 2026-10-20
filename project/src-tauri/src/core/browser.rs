@@ -27,10 +27,11 @@ pub fn sanitized_url(raw: &str) -> Option<String> {
     if raw.is_empty() || raw.len() > 8192 {
         return None;
     }
-    let raw = if raw.contains("://") {
+    let explicit_scheme = raw.contains("://");
+    let raw = if explicit_scheme {
         raw.to_owned()
     } else {
-        format!("https://{raw}")
+        format!("https://{}", raw.trim_start_matches("//"))
     };
     let mut url = reqwest::Url::parse(&raw).ok()?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -40,7 +41,20 @@ pub fn sanitized_url(raw: &str) -> Option<String> {
     url.set_password(None).ok()?;
     url.set_query(None);
     url.set_fragment(None);
-    Some(url.to_string())
+    // Address bars may hide the scheme. Store that uncertainty rather than
+    // claiming an HTTP page was HTTPS; domain privacy rules support both forms.
+    Some(if explicit_scheme {
+        url.to_string()
+    } else {
+        format!("//{}", url.as_str().strip_prefix("https://")?)
+    })
+}
+
+pub fn url_host(raw: &str) -> Option<String> {
+    let url = if raw.starts_with("//") { format!("https:{raw}") } else { raw.to_owned() };
+    let url = reqwest::Url::parse(&url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    url.host_str().map(str::to_owned)
 }
 
 pub fn url_for_front(front: &FrontWindowState) -> Option<String> {
@@ -272,6 +286,16 @@ fn read_native(_front: &FrontWindowState) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn hidden_scheme_is_preserved_as_unknown_and_still_supports_privacy_host_matching() {
+        let url = sanitized_url("127.0.0.1:43829/work?q=private#token").unwrap();
+        assert_eq!(url, "//127.0.0.1:43829/work");
+        assert_eq!(sanitized_url(&url).as_deref(), Some(url.as_str()));
+        assert_eq!(url_host(&url).as_deref(), Some("127.0.0.1"));
+        assert_eq!(sanitized_url("http://example.com/work").as_deref(), Some("http://example.com/work"));
+        assert!(url_host("file:///private/report").is_none());
+    }
+
+    #[test]
     fn url_only_keeps_domain_and_path() {
         assert_eq!(
             sanitized_url("https://user:secret@example.com/work/a?q=private#token"),
@@ -279,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             sanitized_url("example.com/work"),
-            Some("https://example.com/work".into())
+            Some("//example.com/work".into())
         );
         assert!(sanitized_url("file:///private/report").is_none());
         assert!(sanitized_url("chrome://settings").is_none());

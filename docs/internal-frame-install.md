@@ -4,11 +4,11 @@
 
 ## 安装
 
-macOS用已审查的依赖运行`scripts/build-internal-macos.sh`。它只构建`.app`并输出源码指纹，不安装、不启动、不录屏、不上传、不授系统权限。构建产物位于`project/src-tauri/target/release/bundle/macos/`。未签名/未公证构建仍需按本机系统提示处理，脚本不关闭系统安全设置。
+macOS用已审查的依赖运行`scripts/build-internal-macos.sh`。它只构建`.app`，不安装、不启动、不录屏、不上传、不授系统权限。构建产物位于`project/src-tauri/target/release/bundle/macos/`。未签名/未公证构建仍需按本机系统提示处理，脚本不关闭系统安全设置。
 
-Windows沿用Tauri NSIS的当前用户安装模式。此模式是Tauri默认行为；本次没有Windows真机安装验收，不将Mac编译或接口检查当作Windows已验收。不要直接执行另一份交付源码的安装器或逐机脚本。
+Windows 使用 NSIS 当前用户安装，默认简体中文。2026-10-20 已完成 Windows 10 单屏远程桌面的安装与短时试录；当前修复版结果见对应 PR。Windows 11、多屏和长期采集仍需验收。标准测试包从本仓库 Actions 的 TimeLens-windows 产物获取，核对 BUILD-INFO.json 和 SHA256SUMS；不要把上游个人版安装包当作此内部版。
 
-新启动保持暂停，权限由系统交互授予。不要覆盖上游个人版的数据目录；此版使用`~/.timelens-internal`，标识`com.timelens.internal`。本次没有安装到系统应用目录，也没有修改现有用户数据。
+新装等待手动开始，重启保持暂停，权限由系统交互授予。不要覆盖上游个人版的数据目录；此版使用`~/.timelens-internal`，标识`com.timelens.internal`。安装或更新时保留已有数据，不覆盖个人版或其他设备配置。
 
 ## 上传配置
 
@@ -31,3 +31,7 @@ token从`TIMELENS_UPLOAD_TOKEN`环境变量或当前用户`~/.timelens-internal/
 服务端模板已保留交付包指定的北京 OSS 桶 `umall-video-record` 和内网端点；非阿里云内网环境使用北京公网端点。客户端示例地址 `https://upload.timelens.internal` 仅供管理员核对，尚未验证其实际部署和连通性。两个模板位于 `upload-server/deploy/`，不会自动修改当前用户配置或启用上传。
 
 交付包只附占位的 AccessKey/token，未附可直接使用的完整凭据。若现有服务器运行对方原版服务，还需部署兼容本地新版的接收服务；本次没有执行任何线上改动。
+
+## 持续构建
+
+PR 和 main 的自动检查、双平台打包、产物身份及合并规则见根目录 [README](../README.md#长期构建与提交流程) 和 [AGENTS.md](../AGENTS.md)。Actions 长期保持启用；普通构建只保存测试产物，不自动发布 Release。

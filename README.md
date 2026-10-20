@@ -1,181 +1,61 @@
-> 本地内部版已改为逐张原始截图上传，保留本地数据库与图片。最新说明见 [内部版安装与配置](docs/internal-frame-install.md) 和 [接收服务](upload-server/README.md)。下方旧版加密回收说明属于历史实现。
-
 # TimeLens Internal · 内部采集版
 
-本仓库是基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) **v0.17.5 / f8e7107** 的改造版本，保留上游 MIT 许可证。当前改造在 PR 分支中审核，功能与验证边界见 [内部版审核说明](INTERNAL_REVIEW.md)。下方保留的上游介绍、界面和下载链接用于说明原项目，不代表本改造版本的功能或安装包。
+基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前内部版本为 **0.17.6**。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
 
-- 启动后等待手动开始，默认每 12 秒尝试截图；记录应用、窗口、网址及复制流向估计，不保存按键内容或剪贴板正文。
-- 默认按两个工作日、每天 8 小时累计，到时自动停止；可暂停或提前结束。16 小时是当前实现的默认换算。
-- 黑名单在截图前按前台应用判断，不依赖 OCR；其他可见窗口仍可能入镜，原始截图像素未打码。OCR 默认关闭。
-- 禁用外部 AI 和在线更新；内部上传地址、加密公钥默认留空。公开源码不包含真实采集数据、上传凭据或本机运行配置。
-- 已通过 Mac 构建和本地短时试录；Windows 相关模块仅完成编译检查，完整 Windows 实机、双屏及两工作日验收尚未完成。当前没有本改造版本的正式分发包。
+[English](README.en.md) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
----
+## 当前功能
 
-<!-- markdownlint-disable MD033 MD041 MD036 MD060 -->
+- 默认中文、浅色和原生窗口边框。新装等待手动开始；可暂停、继续，正常退出和重启后保持暂停。
+- 默认每 12 秒尝试截图，可配置 10–15 秒；窗口切换截图保留原分辨率，定时图默认宽 1600、质量 85，WebP 压缩和近似画面去重。它保存离散截图，不是连续录屏视频。
+- 默认采集前台窗口所在显示器，可选择全部显示器。两个工作日默认换算为 2 × 8 小时，可在任务开始前配置每天小时数，也可提前结束。暂停、退出及长时间采样中断不累计；电脑空闲会停止截图，采集任务计时仍继续。
+- 本地保存应用、脱敏窗口标题、时长及可获取的网址域名/路径；记录复制流向估计，不保存按键内容或剪贴板正文。Windows 没有实现输入计数。浏览器地址栏隐藏协议时以 `//域名/路径` 表示协议未知。
+- 时间线和时间回放直接读取本地截图，**不依赖 OCR**。OCR 默认关闭，开启时在本机识别文字。外部 AI、在线更新及旧个人版 AI/导出入口已禁用或移除。
 
-<div align="center">
+## 隐私与数据流
 
-<img src="docs/assets/timelines宣传/CH/timeline.png" alt="TimeLens 时间线预览" width="100%">
+截图黑名单按**当前前台应用、标识、标题和网址**判断，不依赖 OCR。默认包含微信、钉钉、常见密码管理器、敏感标题和列出的网银域名；浏览器网址读取失败时跳过截图。
 
-# TimeLens · 时间透视镜
+这是基于前台规则的过滤，没有对原图做像素打码。背景中可见的聊天、通知或其他敏感内容仍可能入镜，处理敏感内容时应暂停采集。标题脱敏用于新产生的记录，不会自动重写旧记录。规则覆盖和授权仍需按实际组织环境核实，软件不能代替隐私或法律审查。
 
-**本地优先的 AI 时间感知引擎，支持 macOS 与 Windows**
+- 运行数据位于 `~/.timelens-internal/`，Windows 对应 `%USERPROFILE%\.timelens-internal\`；数据库为 `data/db.sqlite`，截图为 `data/shots/`。
+- 默认不上传。需配置国内 HTTPS 接收服务根地址、调研编号、设备编号、管理员 token，并在界面确认启用本次上传。重启后上传关闭，需重新确认。
+- 上传内容为单张原始 WebP 及必要的调研/设备、时间、显示器、大小和哈希元数据；**不上传活动数据库，不再制作 age 加密压缩包**。HTTPS 传输与服务端存储保护仍保留。
+- 上传成功或失败均保留本地图片与数据库。没有采集满 48 小时的强制规则，也没有 30 天自动删除。旧数据/旧 age 回执需人工核对。
+- `https://upload.timelens.internal` 是配置示例，不能视为已上线的服务器。真实接收服务、凭据及部署由环境负责人提供；源码不含真实运行数据或密钥。
 
-不用打卡，让电脑自动告诉你时间去了哪里。
+## 长期构建与提交流程
 
-[English Version](README.en.md)
+1. 在专用分支修改并创建 PR。**PR 自动运行**前端构建、外部调用检查、接收服务假数据测试，以及 Windows/macOS Rust 测试和打包。
+2. 从该次成功运行的 **Artifacts** 下载 `TimeLens-windows` 或 `TimeLens-macos`。Windows 包含安装器和独立 exe，macOS 包含 DMG；包内附 `BUILD-INFO.json` 和 `SHA256SUMS`，用于核对版本、源码提交和文件校验值。产物保留 30 天，下载通常需要登录 GitHub。
+3. 对涉及桌面行为的改动，用测试内容实机验证启动、窗口唤回、截图、暂停、隐私过滤、无 OCR 回放及重启状态；默认不启用上传。记录未测项。
+4. 检查通过并取得合并授权后合并 PR、删除分支。main 更新会重新构建；Actions 长期保持启用，也可在页面手动运行 Build。
+5. 普通构建不会发布 Release。明确授权发布后才打 `v*` 标签；Release 工作流复用同一构建流程并生成待审核的草稿。
 
-[![GitHub stars](https://img.shields.io/github/stars/gitxuzhefeng/timelines?style=social)](https://github.com/gitxuzhefeng/timelines)
-[![MIT License](https://img.shields.io/github/license/gitxuzhefeng/timelines)](LICENSE)
-[![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-blue)](https://tauri.app/)
-[![macOS](https://img.shields.io/badge/platform-macOS-black)](https://github.com/gitxuzhefeng/timelines/releases/latest)
-[![Windows](https://img.shields.io/badge/platform-Windows-0078D4)](https://github.com/gitxuzhefeng/timelines/releases/latest)
+测试包未使用组织代码签名/公证时，只适合受控测试。更新可能需要重新核对系统权限；按系统正常提示处理，不关闭系统安全保护。
 
-[下载](https://github.com/gitxuzhefeng/timelines/releases/latest) · [产品宣传页](https://timelens-pi.vercel.app/) · [GitHub Actions 构建](https://github.com/gitxuzhefeng/timelines/actions)
+## 本地开发
 
-</div>
+需要 Node.js 22 或更新版本、Rust stable，以及 [Tauri 平台依赖](https://v2.tauri.app/start/prerequisites/)；Windows 构建还需要 MSVC C++ 工具链和 WebView2。
 
----
-
-## 它能做什么
-
-TimeLens 在后台静默运行，自动记录你在每个应用和窗口上花了多少时间，配合智能截图、OCR 和 AI 分析，把碎片化的屏幕行为聚合成可复盘的时间线、日报和周报。
-
-不需要手动打卡，不需要账号，不上传任何数据。一切都存储在本机 SQLite 数据库中。
-
----
-
-## 界面预览
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <strong>今日透视</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/today.png" alt="TimeLens 今日透视中文界面" width="100%">
-      <br>
-      <sub>一眼看到今天的时间结构和复盘入口</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>时间线</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/timeline.png" alt="TimeLens 时间线中文界面" width="100%">
-      <br>
-      <sub>自动聚合应用、窗口和截图上下文</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <strong>AI 日报</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/dayreport.png" alt="TimeLens AI 日报中文界面" width="100%">
-      <br>
-      <sub>把当天活动自动整理成工作摘要</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>周报</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/weekreport.png" alt="TimeLens 周报中文界面" width="100%">
-      <br>
-      <sub>用热力图复盘一周专注节奏</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <strong>今天看见</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/todaysee.png" alt="TimeLens 今天看见中文界面" width="100%">
-      <br>
-      <sub>从屏幕行为中找回关键上下文</sub>
-    </td>
-    <td align="center" width="50%">
-      <strong>设置</strong><br><br>
-      <img src="docs/assets/timelines宣传/CH/setting.png" alt="TimeLens 设置中文界面" width="100%">
-      <br>
-      <sub>配置语言、主题、AI 与隐私选项</sub>
-    </td>
-  </tr>
-</table>
-
----
-
-## 动态演示
-
-下方为 **今日透视** 界面录屏。GIF 便于快速浏览，MP4 画质更清晰，可点击播放控件观看。
-
-<div align="center">
-
-<img src="docs/assets/timelines宣传/CH/ezgif.com-animated-gif-maker_Chinese.gif" alt="TimeLens 今日透视中文界面演示" width="100%">
-
-<video src="docs/assets/timelines宣传/CH/ezgif.com-gif-to-mp4-converter_chinese.mp4" controls playsinline width="100%"></video>
-
-</div>
-
----
-
-## 核心特性
-
-- **被动采集**：后台检测前台窗口变化，自动记录应用名、窗口标题与时长，不打断工作流。
-- **智能截图**：窗口切换时抓取画面，感知哈希去重 + WebP 压缩，控制磁盘占用。
-- **会话聚合**：把碎片事件还原成连续工作会话，支持按应用、日期筛选与复盘。
-- **OCR 全文搜索**：对截图内容做文字识别，可搜索任意历史屏幕内容。
-- **AI 日报与周报**：基于当天或一周的会话自动生成工作摘要、指标与趋势分析。
-- **工作链路图**：识别频繁切换时的主回路、辅助应用和打断来源。
-- **本地优先**：数据存 SQLite，不依赖云端，不记录键盘内容与剪贴板。
-- **双平台与双语**：支持 macOS、Windows、中文与英文界面。
-
----
-
-## 下载
-
-| 平台 | 下载方式 |
-|------|----------|
-| macOS | 在 [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest) 下载 `.dmg` |
-| Windows 安装版 | 在 [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest) 下载 `*-setup.exe` |
-| Windows 便携版 | 在 [Releases](https://github.com/gitxuzhefeng/timelines/releases/latest) 下载 `TimeLens.exe`，解压后直接运行 |
-
-> 暂无 Release 时，可在 [Actions](https://github.com/gitxuzhefeng/timelines/actions) 页面下载最新构建产物。
-
-### macOS 首次打开提示
-
-如果 macOS 提示 `"TimeLens.app is damaged and can't be opened"`，通常是系统隔离属性导致，并不代表文件损坏。可以在终端执行：
-
-```bash
-xattr -rd com.apple.quarantine "/Applications/TimeLens.app"
-```
-
----
-
-## 快速开始（开发者）
-
-**前置条件**：Node.js · Rust 工具链 · [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)
-
-```bash
-git clone https://github.com/gitxuzhefeng/timelines.git
-cd timelines/project
-npm install
+```sh
+git clone https://github.com/cf23318/timelens-internal.git
+cd timelens-internal/project
+npm ci
 npm run tauri dev
 ```
 
-| 命令 | 说明 |
-|------|------|
-| `npm run tauri dev` | 桌面应用开发模式 |
-| `npm run tauri build` | 生产打包 |
-| `npm test` | Rust 单元测试 |
+```sh
+npm run build
+npm run verify:no-net
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+npm run tauri -- build
+```
 
----
+已有依赖的离线构建可使用 `project/scripts/build-internal-macos.sh` 或 `build-internal-windows.ps1`。接收服务假数据测试与跨语言合同测试见 [接收服务说明](upload-server/README.md)。
 
-## 技术栈
+## 验证边界
 
-- **前端**：[React 18](https://react.dev/) · TypeScript · [Vite 6](https://vitejs.dev/) · [Tailwind CSS 4](https://tailwindcss.com/) · Zustand · [react-i18next](https://react.i18next.com/)
-- **后端**：[Rust](https://www.rust-lang.org/) · [Tauri 2](https://v2.tauri.app/) · SQLite · Tokio
-- **平台**：macOS 采集桥接 · Windows Win32 采集桥接
-- **AI**：自带 API Key，默认保持本地优先
+2026-10-20 已在 Windows 10 Education 22H2（远程桌面、单屏）完成 0.17.5 安装和约 14 分钟实测：31 张截图、暂停、无 OCR 回放及重启保持暂停通过，同时发现窗口唤回、标题脱敏和界面收尾问题。0.17.6 修复后的结果见 [当前验证记录](docs/validation.md)。
 
----
-
-## Star 支持
-
-如果 TimeLens 帮你解决了“时间去哪了”的问题，欢迎给这个仓库一个 star。它会帮助更多正在寻找本地优先效率工具的人发现这个项目。
-
----
-
-## License
-
-[MIT](LICENSE)
+尚不能宣称完成 Windows 11、真实双屏/混合 DPI、长时间锁屏/睡眠、完整两工作日、员工试点、真实性能指标或真实服务器上传验收。CI、短时试录、生产部署和合规结论分别验证。

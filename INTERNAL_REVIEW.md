@@ -1,3 +1,5 @@
+> 历史审阅日志：下文包含各次当时版本的说明，不能作为当前功能或上传接口指南。当前说明见 [README](README.md) 和 [验证边界](docs/validation.md)。
+
 > 本地内部版已改为逐张原始截图上传，保留本地数据库与图片。最新说明见 [内部版安装与配置](docs/internal-frame-install.md) 和 [接收服务](upload-server/README.md)。下方旧版加密回收说明属于历史实现。
 
 # TimeLens 内部版本地审核说明
