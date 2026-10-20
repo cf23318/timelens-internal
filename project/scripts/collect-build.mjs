@@ -12,6 +12,7 @@ const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: project, 
 const sourceChanges = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: project, encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
 const sourceDirty = sourceChanges.length > 0;
 const sourceDiff = execFileSync("git", ["diff", "HEAD", "--binary"], { cwd: project, maxBuffer: 32 * 1024 * 1024 });
+console.log(JSON.stringify({ sourceDirty, sourceChanges, trackedDiffBytes: sourceDiff.length }));
 const repository = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: project, encoding: "utf8" }).trim();
 const sourcePaths = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: repository, encoding: "utf8" }).split("\0").filter(Boolean))].sort();
 const sourceHash = createHash("sha256");
