@@ -47,6 +47,7 @@ if (platform === "macos") {
   const details = spawnSync("codesign", ["-dv", "--verbose=4", app], { encoding: "utf8" });
   const info = details.stderr || "";
   const verify = spawnSync("codesign", ["--verify", "--deep", "--strict", app], { encoding: "utf8" });
+  if (verify.status !== 0) throw new Error("Mac app signature integrity validation failed; do not distribute this bundle");
   const staple = spawnSync("xcrun", ["stapler", "validate", app], { encoding: "utf8" });
   signing = { type: info.includes("Signature=adhoc") ? "ad-hoc" : details.status === 0 ? "certificate" : "unsigned",
     verified: verify.status === 0, notarizationTicketStapled: staple.status === 0,

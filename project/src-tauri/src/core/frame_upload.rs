@@ -621,7 +621,9 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "frame-contract-tests")]
+    // The receiver enforces POSIX directory ownership/flock and is deployed on Linux.
+    // Direct OSS TLS contracts remain enabled on both Windows and macOS.
+    #[cfg(all(feature = "frame-contract-tests", unix))]
     #[test]
     fn rust_to_python_receiver_to_fake_oss_roundtrip() {
         use std::{
