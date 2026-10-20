@@ -60,7 +60,8 @@ jobs:
             bundle: nsis
           - os: macos-latest
             name: macos
-            bundle: dmg
+            # Keep .app after creating DMG so version/signature checks inspect the packaged app.
+            bundle: app,dmg
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     defaults:
