@@ -1,6 +1,6 @@
 [package]
 name = "timelens"
-version = "0.17.5"
+version = "0.17.6"
 description = "TimeLens — local activity data lens (P0)"
 authors = ["TimeLens"]
 edition = "2021"
@@ -99,6 +99,7 @@ windows = { version = "0.58", features = [
   "ApplicationModel",
 ] }
 screenshots = "0.8"
+tauri-plugin-single-instance = "~2.4.5"
 
 [features]
 frame-contract-tests = []

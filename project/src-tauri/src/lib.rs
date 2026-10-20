@@ -110,7 +110,15 @@ pub struct AppStateInner {
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Register before setup acquires the data lock: a second Windows launch only
+    // restores the existing window and never starts collection or another writer.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        show_main_window(app);
+    }));
+
+    builder
         .plugin(
             tauri::plugin::Builder::<tauri::Wry, ()>::new("internal-navigation")
                 .on_navigation(|_, url| core::internal::allow_webview_navigation(url))
