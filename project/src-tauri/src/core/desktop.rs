@@ -137,6 +137,7 @@ mod tests {
         let control = InternalControl::load(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
         let progress = control.progress.lock().clone();
         let mut config = control.config.read().clone();
+        config.upload_mode = "receiver".into(); // Explicit legacy receiver fixture.
         config.upload_url = "https://internal.example/upload".into();
         config.encryption_recipient = age::x25519::Identity::generate().to_public().to_string();
         config.domestic_server_confirmed = true;
