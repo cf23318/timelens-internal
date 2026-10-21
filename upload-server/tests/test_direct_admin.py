@@ -9,6 +9,8 @@ from timelens_upload import direct_admin as mod
 
 
 def put(bucket, key, data, g, task, mime, extra=None):
+    if g.get('format') == 'timelens-oss-shared-post-v1':
+        extra = {'study-end':g['archiveEndAt'], **(extra or {})}
     bucket.objects[key] = (data, {'Content-Type':mime,'x-oss-server-side-encryption':'AES256',
         **{'x-oss-meta-timelens-'+k:v for k,v in {'user':g['userId'],'device':g['deviceId'],'task':task,
            'sha256':mod.digest(data), **(extra or {})}.items()}})

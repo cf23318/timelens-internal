@@ -101,15 +101,35 @@ fn millis(value: &str) -> Result<i64, String> {
         .map_err(|_| "授权时间无效".into())
 }
 pub fn prefix(user: &str, device: &str) -> String {
-    format!("timelens/direct/v1/users/{user}/devices/{device}/")
+    format!("{}{device}/", shared_prefix(user))
+}
+fn shared_prefix(user: &str) -> String {
+    format!("timelens/direct/v1/users/{user}/devices/")
 }
 impl Grant {
+    pub fn is_shared(&self) -> bool { self.format == "timelens-oss-shared-post-v1" }
+    fn bind_device(&mut self, device: &str) -> Result<(), String> {
+        if !self.is_shared() { return Ok(()); }
+        if (self.device_id != "*" && self.device_id != device)
+            || (self.prefix != shared_prefix(&self.user_id) && self.prefix != prefix(&self.user_id, device)) {
+            return Err("公用授权的本机绑定无效".into());
+        }
+        for fields in std::iter::once(&mut self.fields).chain(self.manifest_fields.iter_mut()) {
+            let value = fields.get_mut("x-oss-meta-timelens-device").ok_or("授权字段缺失")?;
+            if !value.is_empty() && value != device { return Err("公用授权已绑定其他设备".into()); }
+            *value = device.into();
+        }
+        self.device_id = device.into();
+        self.prefix = prefix(&self.user_id, device);
+        Ok(())
+    }
     pub fn parse(raw: &str, device: &str, now: i64) -> Result<Self, String> {
         if raw.len() > MAX_GRANT {
             return Err("授权文件超过64KB".into());
         }
-        let g: Self = serde_json::from_str(raw)
+        let mut g: Self = serde_json::from_str(raw)
             .map_err(|_| "上传授权格式无效，不能导入长期密钥或普通OSS配置")?;
+        g.bind_device(device)?;
         g.validate(device, now)?;
         Ok(g)
     }
@@ -132,7 +152,7 @@ impl Grant {
         } else {
             &self.fields
         };
-        if self.format != "timelens-oss-post-v1"
+        if (self.format != "timelens-oss-post-v1" && !self.is_shared())
             || self.device_id != device
             || uuid::Uuid::parse_str(device).is_err()
         {
@@ -233,7 +253,9 @@ impl Grant {
             json!([
                 "starts-with",
                 "$key",
-                if manifest {
+                if self.is_shared() {
+                    shared_prefix(&self.user_id)
+                } else if manifest {
                     format!("{}manifests/", self.prefix)
                 } else {
                     self.prefix.clone()
@@ -243,7 +265,9 @@ impl Grant {
         ];
         for (key, value) in fields {
             if key != "policy" && key != "x-oss-signature" {
-                conditions.push(json!({key:value}));
+                if self.is_shared() && key == "x-oss-meta-timelens-device" {
+                    conditions.push(json!(["starts-with", "$x-oss-meta-timelens-device", ""]));
+                } else { conditions.push(json!({key:value})); }
             }
         }
         for name in ["sha256", "task", "captured-at", "display"] {
@@ -288,7 +312,7 @@ pub fn load(root: &Path, cfg: &InternalConfig) -> Result<Grant, String> {
 pub fn summary(root: &Path, cfg: &InternalConfig) -> Value {
     match load(root, cfg) {
         Ok(g) => {
-            json!({"valid":true,"userId":g.user_id,"deviceId":g.device_id,"prefix":g.prefix,"endpoint":g.endpoint,"expiresAt":g.expires_at,"archiveEndAt":g.archive_end_at,"fingerprint":g.fingerprint()})
+            json!({"valid":true,"userId":g.user_id,"deviceId":g.device_id,"prefix":g.prefix,"endpoint":g.endpoint,"expiresAt":g.expires_at,"archiveEndAt":g.archive_end_at,"fingerprint":g.fingerprint(),"scope":if g.is_shared() {"shared"} else {"device"}})
         }
         Err(e) => json!({"valid":false,"error":e}),
     }
@@ -322,6 +346,11 @@ pub fn import(
     cfg.domestic_server_confirmed = true;
     cfg.validate()?;
     if let Some(b) = super::archive::load(root)? {
+        if b.upload_mode == "ossDirect" {
+            let bytes = private_read(&root.join(GRANT_FILE)).map_err(|_| "已绑定任务的原授权不可读，请管理员修复，不能切换范围")?;
+            let previous: Grant = serde_json::from_slice(&bytes).map_err(|_| "原上传授权损坏，不能切换授权范围")?;
+            if previous.format != g.format { return Err("任务已绑定，不能在设备专属与公用授权之间切换".into()); }
+        }
         if b.upload_mode != cfg.upload_mode
             || b.upload_url != cfg.upload_url
             || b.survey_id != cfg.upload_survey_id
@@ -771,6 +800,43 @@ mod tests {
             let g = grant(&device_id(&p.root).unwrap());
             (t, p, c, control, g)
         }
+        fn shared_raw() -> String {
+            let out = Command::new(python()).arg("tests/oss_direct_fixture.py").arg("--shared-grant")
+                .current_dir(server_root()).env("PYTHONPATH", server_root()).output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        }
+        #[test]
+        fn shared_import_binds_two_profiles_roundtrips_and_never_starts_upload() {
+            let raw = shared_raw();
+            let (_a, first, _, control_a, _) = fixture();
+            let (_b, second, _, control_b, _) = fixture();
+            import(&first.root, &control_a, &raw).unwrap();
+            import(&second.root, &control_b, &raw).unwrap();
+            let ga = load(&first.root, &control_a.config.read()).unwrap();
+            let gb = load(&second.root, &control_b.config.read()).unwrap();
+            assert!(ga.is_shared() && gb.is_shared());
+            assert_ne!(ga.device_id, gb.device_id);
+            assert_ne!(ga.prefix, gb.prefix);
+            assert_eq!(ga.fields["policy"], gb.fields["policy"]);
+            assert_eq!(ga.fields["x-oss-signature"], gb.fields["x-oss-signature"]);
+            assert_eq!(ga.fields["x-oss-meta-timelens-device"], ga.device_id);
+            assert_eq!(gb.manifest_fields.as_ref().unwrap()["x-oss-meta-timelens-device"], gb.device_id);
+            assert!(!control_a.frame_upload_active.load(Ordering::SeqCst));
+            assert!(!control_a.frame_upload_running.load(Ordering::SeqCst));
+            assert!(!control_b.frame_upload_active.load(Ordering::SeqCst));
+            let saved = serde_json::to_string(&ga).unwrap();
+            assert!(Grant::parse(&saved,&gb.device_id,Utc::now().timestamp_millis()).is_err());
+            assert!(Grant::parse(&saved,&ga.device_id,millis(&ga.expires_at).unwrap()).is_err());
+            for field in ["prefix", "deviceId", "format"] {
+                let mut bad: Value = serde_json::from_str(&raw).unwrap();
+                bad[field] = json!(if field == "deviceId" {gb.device_id.clone()} else {"invalid".into()});
+                assert!(Grant::parse(&bad.to_string(),&ga.device_id,Utc::now().timestamp_millis()).is_err());
+            }
+            let mut bad: Value = serde_json::from_str(&raw).unwrap();
+            bad["fields"]["x-oss-meta-timelens-device"] = json!(gb.device_id);
+            assert!(Grant::parse(&bad.to_string(),&ga.device_id,Utc::now().timestamp_millis()).is_err());
+        }
         #[test]
         fn import_scope_expiry_and_sensitive_fields_fail_closed() {
             let (_t, p, _c, control, g) = fixture();
@@ -837,6 +903,7 @@ mod tests {
                 archive_end_at: cfg.archive_end_at.clone(),
             };
             assert!(validate_confirmation(&p.root, &cfg, &progress, &expected).is_ok());
+            assert!(import(&p.root, &control, &shared_raw()).is_err());
             let mut next = g.clone();
             next.fields.insert("x-oss-signature".into(), "a".repeat(64));
             import(&p.root, &control, &serde_json::to_string(&next).unwrap()).unwrap();
@@ -849,6 +916,9 @@ mod tests {
             receiver.upload_mode = "receiver".into();
             assert!(control.save_config(receiver).is_err());
             assert_eq!(device_id(&p.root).unwrap(), g.device_id);
+            fs::remove_file(p.root.join(GRANT_FILE)).unwrap();
+            assert!(import(&p.root, &control, &serde_json::to_string(&g).unwrap()).is_err());
+            assert!(import(&p.root, &control, &shared_raw()).is_err());
         }
         struct ChildGuard(Child);
         impl Drop for ChildGuard {
@@ -858,8 +928,12 @@ mod tests {
             }
         }
         #[test]
-        fn tls_post_contract_crc_scope_retry_and_queue_accounting() {
-            let (_t, p, c, control, g) = fixture();
+        fn tls_post_contract_crc_scope_retry_and_queue_accounting() { tls_contract(false); }
+        #[test]
+        fn shared_tls_post_image_manifest_crc_retry_and_queue_accounting() { tls_contract(true); }
+        fn tls_contract(shared: bool) {
+            let (_t, p, c, control, mut g) = fixture();
+            if shared { g = Grant::parse(&shared_raw(), &g.device_id, Utc::now().timestamp_millis()).unwrap(); }
             let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
             let pem = p.root.join("fixture-cert.pem");
             let key = p.root.join("fixture-key.pem");

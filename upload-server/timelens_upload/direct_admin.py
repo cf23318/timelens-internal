@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 from oss2.utils import Crc64
 from .archive import object_keys
 from .oss_backend import assert_private_bucket, assert_private_object, delete_and_verify_absent, header_value
-from .oss_grant import utc, private_json, MAX_BYTES
+from .oss_grant import utc, iso, private_json, MAX_BYTES
 
 RETENTION_MS = 30*86400000
 GRANT_DRAIN_MS = 120000  # client requests time out at 60s; expired tasks are rescanned on every pass
@@ -116,6 +116,8 @@ class Admin:
             os.close(fd)
 
     def enroll(self, grant):
+        if grant.get('format') == 'timelens-oss-shared-post-v1':
+            return self._enroll_shared(grant)
         device = uid(grant['deviceId']); user = grant['userId']; bucket = grant['bucket']
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', user) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', bucket):
             raise ValueError('Invalid grant identity')
@@ -127,11 +129,13 @@ class Admin:
             raise ValueError('Grant exceeds maximum retention or lifetime')
         with self.lock():
             devices = read_private(self.root/'devices.json', {})
+            if user in read_private(self.root/'shared-groups.json', {}):
+                raise ValueError('Shared batch ID cannot be used for a device-scoped grant')
             entry = {'deviceId': device, 'userId': user, 'bucket': bucket, 'prefix': prefix, 'plannedEndMs': plan}
             old = devices.get(device)
             if old and any(old[k] != v for k, v in entry.items()):
                 raise ValueError('Device destination and approved end are immutable')
-            deadlines = [t['deadlineMs'] for t in self._tasks() if t['deviceId'] == device]
+            deadlines = [t['deadlineMs'] for t in self._tasks() if all(t[k] == entry[k] for k in ('deviceId','userId','bucket','prefix'))]
             if deadlines and now_ms()>=min(deadlines):
                 raise ValueError('Device has an expired task; renew under a new approved profile instead')
             if deadlines and expiry+GRANT_DRAIN_MS > min(deadlines):
@@ -140,6 +144,60 @@ class Admin:
             devices[device] = entry
             write_private(self.root/'devices.json', devices)
         return entry
+
+    def _enroll_shared(self, grant):
+        user = grant['userId']; bucket = grant['bucket']
+        if grant['deviceId'] != '*' or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', user) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', bucket):
+            raise ValueError('Invalid shared grant identity')
+        prefix = f'timelens/direct/v1/users/{user}/devices/'
+        if grant['prefix'] != prefix or grant['endpoint'] != f'https://{bucket}.oss-cn-beijing.aliyuncs.com/':
+            raise ValueError('Invalid shared destination')
+        plan = ms(grant['archiveEndAt']); expiry = ms(grant['expiresAt']); issued = ms(grant['issuedAt'])
+        if not 0 < expiry-issued <= 7*86400000 or expiry > plan+RETENTION_MS or expiry <= now_ms():
+            raise ValueError('Shared grant exceeds maximum retention or lifetime')
+        with self.lock():
+            groups = read_private(self.root/'shared-groups.json', {})
+            devices = read_private(self.root/'devices.json', {})
+            if any(d['userId'] == user and not d.get('sharedGroup') for d in devices.values()):
+                raise ValueError('Device-scoped user ID cannot be reused as a shared batch')
+            entry = {'userId':user, 'bucket':bucket, 'prefix':prefix, 'plannedEndMs':plan}
+            old = groups.get(user)
+            if old and any(old[k] != v for k,v in entry.items()):
+                raise ValueError('Shared batch destination and approved end are immutable')
+            deadlines = [t['deadlineMs'] for t in self._tasks() if t.get('sharedGroup') == user]
+            if deadlines and (now_ms() >= min(deadlines) or expiry+GRANT_DRAIN_MS > min(deadlines)):
+                raise ValueError('Shared renewal would outlive a known task deletion deadline')
+            entry['lastGrantExpiresMs'] = max(expiry, (old or {}).get('lastGrantExpiresMs',0))
+            groups[user] = entry
+            # This is the authoritative batch expiry, including devices discovered later.
+            write_private(self.root/'shared-groups.json', groups)
+        return entry
+
+    @staticmethod
+    def _device_key(device):
+        return f"shared:{device['sharedGroup']}:{device['deviceId']}" if device.get('sharedGroup') else device['deviceId']
+
+    def _discover_shared(self, bucket, devices):
+        errors = []
+        for group in read_private(self.root/'shared-groups.json', {}).values():
+            if group['bucket'] != bucket.bucket_name: continue
+            count = 0
+            for key in object_keys(bucket,group['prefix']):
+                count += 1
+                if count > 1000000: raise ValueError('Shared batch object limit exceeded')
+                try:
+                    device = uid(key.removeprefix(group['prefix']).split('/')[0])
+                except (ValueError, TypeError):
+                    errors.append({'sharedGroup':group['userId'],'error':'UnknownSharedNamespace'})
+                    continue
+                entry = {**group, 'deviceId':device, 'prefix':group['prefix']+device+'/', 'sharedGroup':group['userId']}
+                registry_key = self._device_key(entry)
+                old = devices.get(registry_key)
+                if old and any(old[k] != entry[k] for k in ('deviceId','userId','bucket','prefix','plannedEndMs','sharedGroup')):
+                    raise ValueError('Shared device registry conflict')
+                devices[registry_key] = entry
+        write_private(self.root/'devices.json',devices)
+        return errors
 
     def _tasks(self):
         return [read_private(p) for p in sorted(self.tasks.glob('*.json'))]
@@ -168,6 +226,8 @@ class Admin:
             raise ValueError('Manifest object size is invalid')
         assert_private_object(bucket, key)
         expected = {'user': device['userId'], 'device': device['deviceId'], 'task': task}
+        if device.get('sharedGroup'):
+            expected['study-end'] = iso(datetime.fromtimestamp(device['plannedEndMs']/1000,timezone.utc))
         for name, value in expected.items():
             if header_value(head, 'x-oss-meta-timelens-'+name) != value:
                 raise ValueError('Manifest identity differs')
@@ -245,7 +305,8 @@ class Admin:
 
     def _sync(self, bucket):
         assert_private_bucket(bucket)
-        devices = read_private(self.root/'devices.json', {}); updated = []; errors = []
+        devices = read_private(self.root/'devices.json', {}); updated = []
+        errors = self._discover_shared(bucket,devices)
         for device in devices.values():
             if device['bucket'] != bucket.bucket_name: continue
             found = {}; image_tasks = set(); total = 0
@@ -258,24 +319,25 @@ class Admin:
                     # Unknown suffixes still belong to a canonical task, if present.
                     candidate=key.removeprefix(device['prefix']+'tasks/').split('/')[0]
                     try: image_tasks.add(uid(candidate))
-                    except ValueError: errors.append({'deviceId':device['deviceId'],'error':'UnknownImageNamespace'})
+                    except ValueError: errors.append({'sharedGroup':device.get('sharedGroup'),'deviceId':device['deviceId'],'error':'UnknownImageNamespace'})
                     continue
                 try: image_tasks.add(uid(match[1]))
-                except ValueError: errors.append({'deviceId':device['deviceId'],'error':'UnknownTaskId'})
+                except ValueError: errors.append({'sharedGroup':device.get('sharedGroup'),'deviceId':device['deviceId'],'error':'UnknownTaskId'})
             for key in object_keys(bucket, device['prefix']+'manifests/'):
                 total += 1
                 if total > 1000000: raise ValueError('Device object limit exceeded')
                 relative = key.removeprefix(device['prefix']+'manifests/')
                 try: task = uid(relative.split('/')[0])
                 except ValueError:
-                    errors.append({'deviceId':device['deviceId'],'error':'UnknownManifestNamespace'});continue
+                    errors.append({'sharedGroup':device.get('sharedGroup'),'deviceId':device['deviceId'],'error':'UnknownManifestNamespace'});continue
                 image_tasks.add(task)
                 if re.fullmatch(r'[0-9a-f-]{36}/indexes/\d{20}-[0-9a-f-]{36}\.json',relative):
                     found[task] = max(found.get(task,''),key)
             for task in sorted(image_tasks):
                 old = read_private(self.tasks/(task+'.json'))
                 if old and any(old[k] != device[k] for k in ('deviceId','userId','bucket','prefix','plannedEndMs')):
-                    raise ValueError('Task identity conflicts with administrator registry')
+                    errors.append({'conflictingTaskId':task,'deviceId':device['deviceId'],'sharedGroup':device.get('sharedGroup'),'error':'TaskIdentityConflict'})
+                    continue
                 state = copy.deepcopy(old) if old else self._new_task(device,task)
                 # Tombstones never become live again. Cleanup repeatedly sweeps these scopes.
                 if state['deleted']: continue
@@ -329,6 +391,8 @@ class Admin:
         key = frame['objectKey']; head = bucket.head_object(key)
         expected = {'user':task['userId'],'device':task['deviceId'],'task':task['taskId'],
                     'sha256':frame['sha256'],'captured-at':str(frame['capturedAtMs']),'display':str(frame['displayId'])}
+        if task.get('sharedGroup'):
+            expected['study-end'] = iso(datetime.fromtimestamp(task['plannedEndMs']/1000,timezone.utc))
         if head.content_length != frame['sizeBytes'] or header_value(head,'Content-Type') != 'image/webp' or header_value(head,'x-oss-server-side-encryption') != 'AES256':
             raise ValueError('Frame size/MIME/encryption differs')
         for k,v in expected.items():
@@ -372,11 +436,20 @@ class Admin:
                 # A failed/new inventory must not prevent known expired scopes being swept.
                 sync = {'errors':[{'error':type(error).__name__}]}
             devices = read_private(self.root/'devices.json', {})
-            result = {'dryRun':not execute,'deleted':[],'deletedDevices':[],'blocked':[],'due':[], 'syncErrors':sync['errors']}
+            groups = read_private(self.root/'shared-groups.json', {})
+            def grant_expiry(device):
+                expiry = device['lastGrantExpiresMs']
+                if device.get('sharedGroup'):
+                    group = groups[device['sharedGroup']]
+                    if any(group[k] != device[k] for k in ('userId','bucket','plannedEndMs')):
+                        raise ValueError('Shared device and group identity differ')
+                    expiry = max(expiry,group['lastGrantExpiresMs'])
+                return expiry
+            result = {'dryRun':not execute,'deleted':[],'deletedDevices':[],'deletedGroups':[],'blocked':[],'due':[], 'syncErrors':sync['errors']}
             for task in self._tasks():
                 if task['bucket'] != bucket.bucket_name or now_ms() < task['deadlineMs']: continue
                 result['due'].append(task['taskId'])
-                expiry = devices[task['deviceId']]['lastGrantExpiresMs']
+                expiry = grant_expiry(devices[self._device_key(task)])
                 if now_ms() < expiry+GRANT_DRAIN_MS:
                     result['blocked'].append({'taskId':task['taskId'],'reason':'upload grant active or request drain pending','retryAfterMs':expiry+GRANT_DRAIN_MS})
                     continue
@@ -399,7 +472,7 @@ class Admin:
             # keys that cannot be assigned to a task. This is an exact enrolled prefix.
             if execute:
                 for device in devices.values():
-                    if device['bucket']!=bucket.bucket_name or now_ms()<max(device['plannedEndMs']+RETENTION_MS,device['lastGrantExpiresMs']+GRANT_DRAIN_MS):continue
+                    if device['bucket']!=bucket.bucket_name or now_ms()<max(device['plannedEndMs']+RETENTION_MS,grant_expiry(device)+GRANT_DRAIN_MS):continue
                     try:
                         assert_private_bucket(bucket)
                         for key in list(object_keys(bucket,device['prefix'])):delete_and_verify_absent(bucket,key)
@@ -407,7 +480,16 @@ class Admin:
                         result['deletedDevices'].append(device['deviceId'])
                     except Exception as error:
                         result['blocked'].append({'deviceId':device['deviceId'],'reason':type(error).__name__})
-                result['syncErrors']=[e for e in result['syncErrors'] if e.get('taskId') not in result['deleted'] and e.get('deviceId') not in result['deletedDevices']]
+                for group in read_private(self.root/'shared-groups.json', {}).values():
+                    if group['bucket'] != bucket.bucket_name or now_ms() < max(group['plannedEndMs']+RETENTION_MS,group['lastGrantExpiresMs']+GRANT_DRAIN_MS): continue
+                    try:
+                        assert_private_bucket(bucket)
+                        for key in list(object_keys(bucket,group['prefix'])): delete_and_verify_absent(bucket,key)
+                        if list(object_keys(bucket,group['prefix'])): raise ValueError('Shared orphan cleanup incomplete')
+                        result['deletedGroups'].append(group['userId'])
+                    except Exception as error:
+                        result['blocked'].append({'sharedGroup':group['userId'],'reason':type(error).__name__})
+                result['syncErrors']=[e for e in result['syncErrors'] if e.get('taskId') not in result['deleted'] and (e.get('sharedGroup') or e.get('deviceId') not in result['deletedDevices']) and e.get('sharedGroup') not in result['deletedGroups']]
             alert = self.root/'retention-alert.json'
             if result['blocked'] or result['syncErrors']:
                 write_private(alert,result)

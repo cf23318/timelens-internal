@@ -60,7 +60,7 @@ export interface UploadConfirmation {
 }
 export interface InternalOverview {
   fixedDeviceId: string;
-  ossGrant: {valid:boolean; userId?:string; deviceId?:string; prefix?:string; endpoint?:string; expiresAt?:string; archiveEndAt?:string; fingerprint?:string; error?:string};
+  ossGrant: {valid:boolean; scope?:"device"|"shared"; userId?:string; deviceId?:string; prefix?:string; endpoint?:string; expiresAt?:string; archiveEndAt?:string; fingerprint?:string; error?:string};
   config: InternalConfig;
   progress: TaskProgress;
   snapshots: { count: number; bytes: number; latestAtMs: number | null };

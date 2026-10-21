@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 FORMAT = "timelens-oss-post-v1"
+SHARED_FORMAT = "timelens-oss-shared-post-v1"
 MAX_BYTES = 20 * 1024 * 1024
 DYNAMIC = ("sha256", "task", "captured-at", "display")
 
@@ -28,14 +29,14 @@ def iso(value):
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def make_grant(device, user, bucket, access_id, secret, *, now=None, days=7, study_end=None, ttl_seconds=None):
+def make_grant(device, user, bucket, access_id, secret, *, now=None, days=7, study_end=None, ttl_seconds=None, shared=False):
     now = (now or datetime.now(timezone.utc))
     if now.tzinfo is None:
         raise ValueError("签发时间必须包含时区")
     now = now.astimezone(timezone.utc).replace(microsecond=0)
     if now.tzinfo is None or not 1 <= days <= 7:
         raise ValueError("授权有效期必须为1至7天")
-    device = str(UUID(device))
+    device = "*" if shared else str(UUID(device))
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", user):
         raise ValueError("用户编号须为1至64位字母、数字或 ._-，不要使用姓名或手机号")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
@@ -51,7 +52,7 @@ def make_grant(device, user, bucket, access_id, secret, *, now=None, days=7, stu
     end = min(end, planned + timedelta(days=30))
     if end <= now:
         raise ValueError("调研已到保留截止，不能签发上传授权")
-    prefix = f"timelens/direct/v1/users/{user}/devices/{device}/"
+    prefix = f"timelens/direct/v1/users/{user}/devices/" + ("" if shared else device + "/")
     date = now.strftime("%Y%m%d")
     fields = {
         "x-oss-signature-version": "OSS4-HMAC-SHA256",
@@ -63,7 +64,7 @@ def make_grant(device, user, bucket, access_id, secret, *, now=None, days=7, stu
         "success_action_status": "204",
         "Content-Type": "image/webp",
         "x-oss-meta-timelens-user": user,
-        "x-oss-meta-timelens-device": device,
+        "x-oss-meta-timelens-device": "" if shared else device,
         "x-oss-meta-timelens-study-end": iso(planned),
     }
     key = ("aliyun_v4" + secret).encode()
@@ -71,18 +72,20 @@ def make_grant(device, user, bucket, access_id, secret, *, now=None, days=7, stu
         key = hmac.new(key, part.encode(), hashlib.sha256).digest()
     def signed_fields(content_type, allowed_prefix):
         form = {**fields, "Content-Type": content_type}
-        conditions = [{"bucket": bucket}, *({k: v} for k, v in form.items()),
+        conditions = [{"bucket": bucket}, *({k: v} for k, v in form.items() if not (shared and k == "x-oss-meta-timelens-device")),
                       ["starts-with", "$key", allowed_prefix], ["content-length-range", 1, MAX_BYTES],
                       *(["starts-with", f"$x-oss-meta-timelens-{k}", ""] for k in DYNAMIC)]
+        if shared:
+            conditions.append(["starts-with", "$x-oss-meta-timelens-device", ""])
         policy = base64.b64encode(json.dumps({"expiration": iso(end), "conditions": conditions},
                                            separators=(",", ":")).encode()).decode()
         return {**form, "policy": policy, "x-oss-signature": hmac.new(key, policy.encode(), hashlib.sha256).hexdigest()}
-    return {"format": FORMAT, "deviceId": device, "userId": user,
+    return {"format": SHARED_FORMAT if shared else FORMAT, "deviceId": device, "userId": user,
             "bucket": bucket, "region": "cn-beijing",
             "endpoint": f"https://{bucket}.oss-cn-beijing.aliyuncs.com/", "prefix": prefix,
             "issuedAt": iso(now), "expiresAt": iso(end), "archiveEndAt": iso(planned),
             "fields": signed_fields("image/webp", prefix),
-            "manifestFields": signed_fields("application/json", prefix + "manifests/")}
+            "manifestFields": signed_fields("application/json", prefix if shared else prefix + "manifests/")}
 
 
 def private_json(path):
@@ -109,6 +112,7 @@ def write_grant(path, grant):
 
 def main():
     parser = argparse.ArgumentParser(description="本地签发TimeLens设备专用7天上传授权；不访问OSS")
+    parser.add_argument("--shared", action="store_true", help="签发7天公用配置；按设备ID分目录，但不提供设备间云端写入隔离")
     parser.add_argument("--device-id")
     parser.add_argument("--user-id")
     parser.add_argument("--bucket")
@@ -119,7 +123,7 @@ def main():
     parser.add_argument("--registry", default=str(Path.home()/".timelens-admin"), help="管理员私有台账目录，续签和清理共用")
     args = parser.parse_args()
     try:
-        device = args.device_id or input("员工软件显示的固定设备ID：").strip()
+        device = "*" if args.shared else args.device_id or input("员工软件显示的固定设备ID：").strip()
         user = args.user_id or input("用户编号（如employee-001）：").strip()
         bucket = args.bucket or input("北京OSS Bucket名称：").strip()
         credentials = private_json(args.credentials_file) if args.credentials_file else {
@@ -127,11 +131,11 @@ def main():
             "accessKeySecret": getpass.getpass("管理员AccessKey Secret（隐藏输入）："),
         }
         grant = make_grant(device, user, bucket, credentials["accessKeyId"], credentials["accessKeySecret"],
-                           days=args.days, study_end=args.study_end)
+                           days=args.days, study_end=args.study_end, shared=args.shared)
         from .direct_admin import Admin
         # Record expiry BEFORE exporting any usable grant; a failed export is conservative.
         Admin(args.registry).enroll(grant)
-        output = args.output or f"TimeLens-{user}-{grant['deviceId'][:8]}.timelens-upload.json"
+        output = args.output or f"TimeLens-{user}-{'shared' if args.shared else grant['deviceId'][:8]}.timelens-upload.json"
         write_grant(output, grant)
         print(f"已生成：{Path(output).resolve()}\n授权截止：{grant['expiresAt']}\n批准调研结束：{grant['archiveEndAt']}")
         print("将授权文件单独交给对应员工。不要上传到Git；本工具未访问OSS，未验证上传权限。")

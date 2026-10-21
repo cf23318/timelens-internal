@@ -113,8 +113,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "--grant":
-        print(json.dumps(grant(sys.argv[2] if len(sys.argv)>2 else DEVICE)))
+    if sys.argv[1] in ("--grant", "--shared-grant"):
+        print(json.dumps(grant(sys.argv[2] if len(sys.argv)>2 else DEVICE, shared=sys.argv[1] == "--shared-grant")))
     else:
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
