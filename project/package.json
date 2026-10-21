@@ -1,7 +1,7 @@
 {
   "name": "timelens",
   "private": true,
-  "version": "0.17.9",
+  "version": "0.17.10",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "verify:no-net": "node scripts/check-no-external-fetch.mjs",
+    "test:upload-status": "node scripts/test-upload-status.mjs",
     "verify:lens-map": "node scripts/check-lens-map-ui.mjs"
   },
   "dependencies": {

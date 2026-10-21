@@ -1,10 +1,14 @@
 # TimeLens Internal · 内部采集版
 
-基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前内部测试版本为 **0.17.9**。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
+基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前源码测试版本为 **0.17.10**，已发布安装包以 Releases 为准。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
 
 [English](README.en.md) · [下载安装包](https://github.com/cf23318/timelens-internal/releases) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
-## OSS上传界面（0.17.9）
+## 上传状态与断网重试（0.17.10）
+
+任务页和顶部状态统一显示截图的OSS回执状态；全部截图收到回执后显示“OSS已接收 · 待核验”，清单同步或重试单独显示，不再继续显示“待上传”。OSS接收仍不代表管理员已完成对账。连接失败、HTTP 408/429/5xx 保留队列并按退避时间重试；409、校验失败等需处理，不会误报成功。截图清晰度及采集规则保持现状。
+
+## OSS上传界面（0.17.9起）
 
 新数据目录默认使用OSS直传，管理员界面仅显示OSS上传。接收服务选项和配置界面已注释停用；旧任务的后端兼容和留存处理保留，已绑定旧目的地的任务不会自动切换。上传仍需单独确认。
 
@@ -62,6 +66,7 @@ npm run tauri dev
 ```sh
 npm run build
 npm run verify:no-net
+npm run test:upload-status
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri -- build
 ```
