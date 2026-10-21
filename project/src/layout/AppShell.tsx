@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useDevModeStore } from "../stores/devModeStore";
 import { useInternalStore, useInternalUpdates } from "../stores/internalStore";
-import { duration, shotTime, taskLabel, captureLabel, useDesktopText } from "../lib/desktop";
+import { duration, shotTime, taskOverviewLabel, captureLabel, useDesktopText } from "../lib/desktop";
 import { TaskControls } from "../components/TaskControls";
 import { DesktopError } from "../components/DesktopFeedback";
 import { DesktopPageBoundary } from "../components/DesktopPageBoundary";
@@ -57,7 +57,7 @@ export default function AppShell() {
       <header className="desktop-toolbar">
         <div className="min-w-0"><h1>{current?.title ?? "TimeLens"}</h1><p>{current?.sub}</p></div>
         <div className="flex items-center gap-3 shrink-0">
-          <span className={`desktop-status ${!expired && p?.status === "recording" ? "is-recording" : ""}`} role="status"><span className={`desktop-dot ${!expired && p?.status === "recording" ? "is-green" : ""}`} />{p ? data?.archive?.deleted ? text("已到期清理", "Expired and removed") : expired ? text("已到期 · 等待清理", "Expired · Cleanup pending") : taskLabel(p.status, english) : text("读取中", "Loading")}</span>
+          <span className={`desktop-status ${!expired && p?.status === "recording" ? "is-recording" : ""}`} role="status"><span className={`desktop-dot ${!expired && p?.status === "recording" ? "is-green" : ""}`} />{data ? taskOverviewLabel(data, english) : text("读取中", "Loading")}</span>
           {draft && <Link to="/settings" className="desktop-text-link text-xs">{text("设置未保存", "Unsaved settings")}</Link>}
           <TaskControls />
         </div>

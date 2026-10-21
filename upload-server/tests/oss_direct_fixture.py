@@ -58,6 +58,7 @@ def verify(fields, data, now=None):
 class Handler(BaseHTTPRequestHandler):
     objects = {}
     requests = 0
+    disconnected = set()
 
     def log_message(self, *_args):
         pass
@@ -94,6 +95,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("duplicate field")
                     fields[name] = part.get_payload(decode=True).decode()
             key = verify(fields, data)
+            if self.headers.get("X-Fixture-Fault") == "disconnect-before-store-once" and key not in self.disconnected:
+                self.disconnected.add(key)
+                self.close_connection = True
+                return
             if key in self.objects:
                 self.send_response(409); self.end_headers(); return
             self.objects[key] = data

@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import type { TaskProgress } from "../services/internal";
+export { taskLabel, taskOverviewLabel, directFramesAccepted } from "./taskStatus";
 
 export function useDesktopText() {
   const { i18n } = useTranslation();
@@ -10,14 +10,6 @@ export function duration(ms: number, english = false): string {
   const minutes = Math.floor(Math.max(0, ms) / 60000);
   const hours = Math.floor(minutes / 60);
   return english ? `${hours}h ${minutes % 60}m` : `${hours} 小时 ${minutes % 60} 分钟`;
-}
-export function taskLabel(status: TaskProgress["status"], english = false): string {
-  const labels = {
-    ready: ["待开始", "Ready"], recording: ["采集中", "Recording"], paused: ["已暂停", "Paused"],
-    completed: ["已结束 · 待上传", "Ended · Pending upload"], uploading: ["逐张上传中", "Uploading frames"],
-    uploaded: ["归档清单已对账", "Archive manifest reconciled"],
-  };
-  return labels[status]?.[english ? 1 : 0] ?? (english ? "Unknown status" : "状态未知");
 }
 export function fileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;

@@ -37,7 +37,7 @@ export function UploadConfirmDialog({ onClose, background = false }: { onClose: 
       <dl className="desktop-review-list">
         <div><dt>{text("任务编号", "Task ID")}</dt><dd className="font-mono text-xs break-all">{confirmation.taskId}</dd></div>
         <div><dt>{text("数据范围", "Contents")}</dt><dd>{text("新上传队列中的原始截图，以及调研/设备编号、时间、显示器编号、大小和校验值。活动数据库不上传。", "Original queued screenshots and survey/device IDs, timestamps, display IDs, sizes and checksums. The activity database is not uploaded.")}</dd></div>
-        <div><dt>{text("当前队列", "Current queue")}</dt><dd>{text("待传", "Pending")} {original.uploads.pending} · {text("已确认", "Verified")} {original.uploads.verified} · {text("需处理", "Needs review")} {original.uploads.blocked}</dd></div>
+        <div><dt>{text("当前队列", "Current queue")}</dt><dd>{text("待传", "Pending")} {original.uploads.pending} · {text("已确认", "Verified")} {original.uploads.verified} · {direct && <>{text("OSS已接收", "OSS accepted")} {original.uploads.ossAccepted ?? 0} · </>}{text("需处理", "Needs review")} {original.uploads.blocked}</dd></div>
         <div><dt>{text("未加入队列的旧截图", "Legacy images excluded")}</dt><dd>{original.uploads.legacy}</dd></div>
         <div><dt>{text("已保存目的地", "Saved destination")}</dt><dd className="break-all">{confirmation.uploadUrl || text("尚未配置", "Not configured")}</dd></div>
         <div><dt>{text("批准调研结束", "Approved study end")}</dt><dd>{confirmation.archiveEndAt}</dd></div>

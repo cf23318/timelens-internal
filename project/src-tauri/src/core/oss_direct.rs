@@ -21,6 +21,7 @@ use tauri::{Emitter, Manager};
 
 const GRANT_FILE: &str = "oss-upload-grant.json";
 const MAX_GRANT: usize = 65536;
+const CONNECTION_ERROR: &str = "OSS上传连接失败；待传图片保留，若已接收但回执丢失需管理员核验";
 static ID_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn private_read(path: &Path) -> Result<Vec<u8>, String> {
@@ -465,7 +466,7 @@ fn send_to(
         )
         .body(body)
         .send()
-        .map_err(|_| "OSS上传连接失败；待传图片保留，若已接收但回执丢失需管理员核验")?;
+        .map_err(|_| CONNECTION_ERROR)?;
     if response.status().as_u16() != 204 {
         return Err(format!(
             "OSS返回 HTTP {}；本地图片保留，409不能视为上传成功",
@@ -516,6 +517,20 @@ fn record(conn: &Connection, f: &Frame, r: &Accepted) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+/// A lost connection is retryable even when the message mentions a lost receipt.
+/// If OSS did persist the object, the subsequent 409 still requires review.
+fn record_failure(conn: &Connection, frame: &Frame, error: &str) -> Result<bool, String> {
+    let status = error.split("HTTP ").nth(1)
+        .and_then(|v| v.get(..3)).and_then(|v| v.parse::<u16>().ok());
+    let blocked = error.contains("校验失败") || error.contains("批准结束") || status == Some(409);
+    conn.execute(
+        "UPDATE frame_upload_outbox SET status=?2,attempts=attempts+1,next_retry_ms=?3,last_error=?4 WHERE snapshot_id=?1",
+        params![frame.id, if blocked { "blocked" } else { "pending" },
+            Utc::now().timestamp_millis()+frame_upload::retry_delay_ms(frame.attempts), error],
+    ).map_err(|e| e.to_string())?;
+    let retryable = error == CONNECTION_ERROR || status.is_some_and(|v| v == 408 || v == 429 || (500..600).contains(&v));
+    Ok(blocked || !retryable)
 }
 fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, task: String) {
     let result = (|| -> Result<(), String> {
@@ -598,21 +613,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                         })?;
                     }
                     Err(error) => {
-                        let blocked = error.contains("校验失败")
-                            || error.contains("批准结束")
-                            || error.contains("HTTP 409");
-                        conn.execute("UPDATE frame_upload_outbox SET status=?2,attempts=attempts+1,next_retry_ms=?3,last_error=?4 WHERE snapshot_id=?1",params![frame.id,if blocked{"blocked"}else{"pending"},Utc::now().timestamp_millis()+frame_upload::retry_delay_ms(frame.attempts),error]).map_err(|e|e.to_string())?;
-                        // A rejected/ambiguous response must never produce an accepted receipt.
-                        let status = error
-                            .split("HTTP ")
-                            .nth(1)
-                            .and_then(|v| v.get(..3))
-                            .and_then(|v| v.parse::<u16>().ok());
-                        let fatal = blocked
-                            || error.contains("回执")
-                            || status.is_some_and(|v| {
-                                (300..500).contains(&v) && ![408, 429].contains(&v)
-                            });
+                        let fatal = record_failure(&conn, &frame, &error)?;
                         state.0.internal.edit_progress(|p| {
                             p.last_error = Some(error.clone());
                             Ok(())
@@ -741,6 +742,34 @@ mod tests {
     fn crc64_matches_standard_and_empty_vectors() {
         assert_eq!(crc64(b"123456789"), 0x995dc9bbdf1939fa);
         assert_eq!(crc64(b""), 0);
+    }
+
+    #[test]
+    fn transient_errors_retry_but_rejections_and_ambiguous_objects_stop() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE frame_upload_outbox(snapshot_id TEXT PRIMARY KEY,status TEXT,attempts INTEGER,next_retry_ms INTEGER,last_error TEXT); INSERT INTO frame_upload_outbox VALUES('test-frame','pending',0,0,NULL);").unwrap();
+        let f = Frame { id: "test-frame".into(), task_id: "test-task".into(), path: String::new(),
+            captured_at_ms: 1, display_id: 0, sha256: String::new(), size_bytes: 12, attempts: 0 };
+        for (error, fatal, status) in [
+            (CONNECTION_ERROR, false, "pending"),
+            ("OSS返回 HTTP 408", false, "pending"),
+            ("OSS返回 HTTP 429", false, "pending"),
+            ("OSS返回 HTTP 503", false, "pending"),
+            ("OSS返回 HTTP 403", true, "pending"),
+            ("OSS返回 HTTP 302", true, "pending"),
+            ("OSS返回 HTTP 409", true, "blocked"),
+            ("OSS回执CRC校验失败，本地图片保留", true, "blocked"),
+            ("OSS回执缺少请求编号，本地图片保留", true, "pending"),
+            ("待传截图缺失", true, "pending"),
+            ("后台上传已停止", true, "pending"),
+        ] {
+            c.execute("UPDATE frame_upload_outbox SET attempts=0", []).unwrap();
+            assert_eq!(record_failure(&c, &f, error).unwrap(), fatal, "{error}");
+            let row = c.query_row("SELECT status,attempts,next_retry_ms,last_error FROM frame_upload_outbox", [], |r|
+                Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap();
+            assert_eq!((row.0.as_str(),row.1,row.3.as_str()), (status,1,error));
+            assert!(row.2 > Utc::now().timestamp_millis());
+        }
     }
 
     #[cfg(feature = "frame-contract-tests")]
@@ -1042,12 +1071,63 @@ mod tests {
             );
             assert!(next(&c, &frame.task_id).unwrap().is_none());
             assert!(file.exists());
+            // Real transport failures, durable backoff and retry after reopening the database.
+            // Neither a connection refusal nor a mid-request disconnect may acknowledge a frame.
+            frame.id = uuid::Uuid::new_v4().to_string();
+            let retry_file = p.shots_dir.join(format!("{}_retry.webp", frame.id));
+            fs::write(&retry_file, &bytes).unwrap();
+            frame.path = retry_file.to_string_lossy().into_owned();
+            c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s',?2,?3,?4,'poll')",params![frame.id,frame.path,frame.captured_at_ms,frame.size_bytes as i64]).unwrap();
+            c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,1,?3,?4)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+            let offline = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let offline_url = format!("https://{}/", offline.local_addr().unwrap());
+            drop(offline);
+            let error = send_to(&client, &offline_url, &g, &frame, &bytes).unwrap_err();
+            assert_eq!(error, CONNECTION_ERROR);
+            assert!(!record_failure(&c, &frame, &error).unwrap(), "connection failure must keep the worker running");
+            assert!(next(&c, &frame.task_id).unwrap().is_none(), "backoff must defer the next attempt");
+            assert_eq!(frame_upload::stats(&c, &frame.task_id).unwrap().oss_accepted, 1);
+            drop(c);
+            let c = frame_upload::db(&p).unwrap();
+            assert_eq!(c.query_row("SELECT attempts FROM frame_upload_outbox WHERE snapshot_id=?",[&frame.id],|r|r.get::<_,i64>(0)).unwrap(),1);
+            let wait_next = || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(7);
+                loop {
+                    if let Some(f) = next(&c, &frame.task_id).unwrap() { break f; }
+                    assert!(std::time::Instant::now() < deadline, "retry did not become eligible");
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            };
+            let retry = wait_next();
+            assert_eq!(retry.attempts, 1);
+            let error = send_to(&make_client(Some("disconnect-before-store-once")), url, &g, &retry, &bytes).unwrap_err();
+            assert!(!record_failure(&c, &retry, &error).unwrap());
+            let remote: Value = client.get(url).send().unwrap().json().unwrap();
+            assert!(remote["objects"].get(object_key(&g, &retry).unwrap()).is_none());
+            assert!(next(&c, &frame.task_id).unwrap().is_none());
+            let retry = wait_next();
+            assert_eq!(retry.attempts, 2);
+            let receipt = send_to(&client, url, &g, &retry, &frame_upload::frame_bytes(&p, &retry).unwrap()).unwrap();
+            record(&c, &retry, &receipt).unwrap();
+            assert_eq!(frame_upload::stats(&c, &frame.task_id).unwrap().pending, 0);
+            assert_eq!(frame_upload::stats(&c, &frame.task_id).unwrap().oss_accepted, 2);
+            assert!(next(&c, &frame.task_id).unwrap().is_none());
+            assert_eq!(fs::read(&retry_file).unwrap(), bytes);
+            assert!(c.query_row("SELECT last_error FROM frame_upload_outbox WHERE snapshot_id=?",[&frame.id],|r|r.get::<_,Option<String>>(0)).unwrap().is_none());
             for fault in ["crc", "disconnect", "redirect"] {
                 frame.id = uuid::Uuid::new_v4().to_string();
-                assert!(send_to(&make_client(Some(fault)), url, &g, &frame, &bytes).is_err());
-                assert!(send_to(&client, url, &g, &frame, &bytes)
-                    .unwrap_err()
-                    .contains("409"));
+                let error = send_to(&make_client(Some(fault)), url, &g, &frame, &bytes).unwrap_err();
+                let conflict = send_to(&client, url, &g, &frame, &bytes).unwrap_err();
+                assert!(conflict.contains("HTTP 409"));
+                if fault == "disconnect" {
+                    c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s',?2,?3,?4,'poll')",params![frame.id,frame.path,frame.captured_at_ms,frame.size_bytes as i64]).unwrap();
+                    c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,1,?3,?4)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+                    assert!(!record_failure(&c, &frame, &error).unwrap());
+                    assert!(record_failure(&c, &frame, &conflict).unwrap());
+                    let stats = frame_upload::stats(&c, &frame.task_id).unwrap();
+                    assert_eq!((stats.blocked, stats.oss_accepted), (1, 2));
+                    assert!(next(&c, &frame.task_id).unwrap().is_none());
+                }
                 assert!(file.exists());
             }
             frame.id = uuid::Uuid::new_v4().to_string();
@@ -1062,7 +1142,7 @@ mod tests {
                 .unwrap_err()
                 .contains("批准结束"));
             let remote: Value = client.get(url).send().unwrap().json().unwrap();
-            assert_eq!(remote["objects"].as_object().unwrap().len(), 6);
+            assert_eq!(remote["objects"].as_object().unwrap().len(), 7);
         }
     }
 }
