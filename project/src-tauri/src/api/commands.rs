@@ -154,8 +154,16 @@ pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_j
             (config, progress)
         };
         let stats = crate::core::desktop::snapshot_stats(&state.0.read_conn.lock())?;
-        let missing = crate::core::desktop::upload_missing(&config, crate::core::desktop::token_present());
+        let token_present = config.upload_mode == "receiver" && crate::core::frame_upload::read_token(&state.0.paths.root).is_ok();
+        let mut missing = crate::core::desktop::upload_missing(&config, token_present);
+        let direct = config.upload_mode == "ossDirect";
+        let grant = crate::core::oss_direct::summary(&state.0.paths.root,&config);
+        if direct && grant["valid"] != true { missing.push("ossGrant"); }
+        if !crate::core::archive::owner_matches(&state.0.paths,&progress.task_id) { missing.push("profile"); }
         Ok(serde_json::json!({
+            "fixedDeviceId": crate::core::oss_direct::device_id(&state.0.paths.root)?,
+            "ossGrant": grant,
+            "archive": crate::core::archive::load(&state.0.paths.root)?,
             "config": config, "progress": progress, "snapshots": stats,
             "captureNotice": state.0.internal.capture_notice.lock().clone(),
             "uploadMissing": missing,
@@ -163,6 +171,12 @@ pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_j
             "uploadActive": state.0.internal.frame_upload_running.load(Ordering::SeqCst),
         }))
     }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_oss_upload_grant(state: State<'_, AppState>, grant_json: String) -> Result<(), String> {
+    let state=state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||crate::core::oss_direct::import(&state.0.paths.root,&state.0.internal,&grant_json)).await.map_err(|_|"授权导入执行失败".to_string())?
 }
 
 #[tauri::command]
@@ -176,13 +190,22 @@ pub async fn finish_internal_task(
         {
             let _gate = state.0.internal.gate.read();
             let progress = state.0.internal.progress.lock().clone();
-            crate::core::desktop::validate_confirmation(
-                &confirmation, &state.0.internal.config.read(), &progress,
-                crate::core::desktop::token_present(),
-            )?;
+            let config = state.0.internal.config.read().clone();
+            if config.upload_mode == "ossDirect" {
+                crate::core::oss_direct::validate_confirmation(&state.0.paths.root,&config,&progress,&confirmation)?;
+            } else {
+                crate::core::desktop::validate_confirmation(&confirmation,&config,&progress,crate::core::desktop::token_present())?;
+            }
+            if progress.receipt.is_some() || progress.stored_bundle.is_some() || progress.bundle_path.is_some() {
+                return Err("任务含旧版加密包或回执，请先人工核对".into());
+            }
+            if state.0.internal.frame_upload_running.load(Ordering::SeqCst) && !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {
+                return Err("上一轮后台上传仍在结束，请稍后再结束并上传".into());
+            }
+            // Keep configuration stable through confirmation and binding, without
+            // holding config/progress locks together in the opposite save order.
+            crate::core::archive::bind(&state.0.paths, &config, &progress)?;
         }
-        { let p=state.0.internal.progress.lock(); if p.receipt.is_some() || p.stored_bundle.is_some() || p.bundle_path.is_some() {return Err("任务含旧版加密包或回执，请先人工核对".into());} }
-        if state.0.internal.frame_upload_running.load(Ordering::SeqCst) && !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {return Err("上一轮后台上传仍在结束，请稍后再结束并上传".into());}
         crate::core::internal::pause_collection(&app, &state, true)?;
         if state.0.internal.frame_upload_running.load(Ordering::SeqCst) {return Ok(());}
 

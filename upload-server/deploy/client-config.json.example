@@ -2,5 +2,7 @@
   "uploadUrl": "https://upload.timelens.internal",
   "uploadSurveyId": "",
   "uploadDeviceId": "",
-  "domesticServerConfirmed": false
+  "domesticServerConfirmed": false,
+  "archiveEndAt": "",
+  "targetHours": 48
 }

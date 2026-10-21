@@ -338,6 +338,7 @@ pub enum WriteEvent {
     },
     WalCheckpoint,
     Flush(std::sync::mpsc::Sender<Result<(), String>>),
+    EraseExpiredData(std::sync::mpsc::Sender<Result<(), String>>),
     EraseCollectedData(std::sync::mpsc::Sender<Result<(), String>>),
     Shutdown,
 }

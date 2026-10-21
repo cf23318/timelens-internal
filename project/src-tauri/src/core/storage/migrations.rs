@@ -378,6 +378,18 @@ CREATE TABLE frame_upload_outbox (
 CREATE INDEX frame_upload_pending ON frame_upload_outbox(task_id,status,next_retry_ms);
 "#,
     },
+    Migration {
+        version: 10,
+        description: "OSS direct accepted receipts remain distinct from receiver verification",
+        sql: r#"
+CREATE TABLE oss_direct_receipts (
+ snapshot_id TEXT PRIMARY KEY REFERENCES snapshots(id), task_id TEXT NOT NULL,
+ object_key TEXT NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+ crc64 TEXT NOT NULL, request_id TEXT NOT NULL, accepted_at_ms INTEGER NOT NULL
+);
+CREATE INDEX oss_direct_task ON oss_direct_receipts(task_id);
+"#,
+    },
 ];
 
 fn current_version(conn: &Connection) -> rusqlite::Result<i32> {
@@ -442,6 +454,22 @@ mod tests {
         );
     }
     #[test]
+    fn version_nine_upload_queue_survives_direct_receipt_migration() {
+        let mut c = Connection::open_in_memory().unwrap();
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 9) {
+            c.execute_batch(m.sql).unwrap();
+            c.execute("INSERT INTO schema_migrations(version,description,applied_at) VALUES(?1,?2,1)",rusqlite::params![m.version,m.description]).unwrap();
+        }
+        c.execute("INSERT INTO window_sessions(id,app_name,window_title,start_ms,end_ms,duration_ms,is_active) VALUES('old-session','fixture','synthetic',1,2,1,0)",[]).unwrap();
+        c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES('old-frame','old-session','fixture.webp',1,12,'poll')",[]).unwrap();
+        c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,status,receipt_json) VALUES('old-frame','old-task',1,'synthetic',12,'verified','old-receipt')",[]).unwrap();
+        run_migrations(&mut c).unwrap();
+        let (status,receipt):(String,String)=c.query_row("SELECT status,receipt_json FROM frame_upload_outbox WHERE snapshot_id='old-frame'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((status.as_str(),receipt.as_str()),("verified","old-receipt"));
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM oss_direct_receipts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(c.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+    }
+    #[test]
     fn migrations_run_twice_idempotent() {
         let mut c = Connection::open_in_memory().unwrap();
         run_migrations(&mut c).unwrap();
@@ -453,7 +481,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 9);
+        assert_eq!(v, 10);
         let tables: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='daily_analysis'",

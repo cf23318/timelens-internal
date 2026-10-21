@@ -15,7 +15,7 @@ export function taskLabel(status: TaskProgress["status"], english = false): stri
   const labels = {
     ready: ["待开始", "Ready"], recording: ["采集中", "Recording"], paused: ["已暂停", "Paused"],
     completed: ["已结束 · 待上传", "Ended · Pending upload"], uploading: ["逐张上传中", "Uploading frames"],
-    uploaded: ["队列截图已上传 · 本地保留", "Queued images uploaded · Local data retained"],
+    uploaded: ["归档清单已对账", "Archive manifest reconciled"],
   };
   return labels[status]?.[english ? 1 : 0] ?? (english ? "Unknown status" : "状态未知");
 }
@@ -41,7 +41,10 @@ export function captureLabel(code: string, english = false): string {
 }
 export function missingLabel(code: string, english = false): string {
   const labels: Record<string, [string, string]> = {
+    profile: ["全新且归属明确的调研数据目录", "Clean, task-owned study profile"],
+    archiveEnd: ["批准调研结束时间（含时区）", "Approved study end with timezone"],
     survey: ["调研编号", "Survey ID"], device: ["设备编号", "Device ID"],
+    ossGrant: ["有效的本机OSS上传授权", "Valid OSS upload grant for this device"],
     server: ["上传地址", "Upload endpoint"], key: ["加密公钥", "Encryption public key"],
     domestic: ["国内服务器确认", "Domestic server confirmation"], credential: ["管理员上传凭证", "Administrator upload credential"],
   };

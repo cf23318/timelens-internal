@@ -35,6 +35,7 @@ export default function AppShell() {
   ];
   const current = nav.find(n => location.pathname.startsWith(n.to));
   const p = data?.progress;
+  const expired=Boolean(data?.archive && (data.archive.deleted || Date.now()>=data.archive.deadlineMs));
   const percentage = p ? Math.min(100, Math.max(0, p.elapsedMs / Math.max(1, p.targetMs) * 100)) : 0;
   return <div className="tl-app desktop-app">
     <aside className="desktop-sidebar" aria-label={t("nav.mainNav")}>
@@ -56,7 +57,7 @@ export default function AppShell() {
       <header className="desktop-toolbar">
         <div className="min-w-0"><h1>{current?.title ?? "TimeLens"}</h1><p>{current?.sub}</p></div>
         <div className="flex items-center gap-3 shrink-0">
-          <span className={`desktop-status ${p?.status === "recording" ? "is-recording" : ""}`} role="status"><span className={`desktop-dot ${p?.status === "recording" ? "is-green" : ""}`} />{p ? taskLabel(p.status, english) : text("读取中", "Loading")}</span>
+          <span className={`desktop-status ${!expired && p?.status === "recording" ? "is-recording" : ""}`} role="status"><span className={`desktop-dot ${!expired && p?.status === "recording" ? "is-green" : ""}`} />{p ? data?.archive?.deleted ? text("已到期清理", "Expired and removed") : expired ? text("已到期 · 等待清理", "Expired · Cleanup pending") : taskLabel(p.status, english) : text("读取中", "Loading")}</span>
           {draft && <Link to="/settings" className="desktop-text-link text-xs">{text("设置未保存", "Unsaved settings")}</Link>}
           <TaskControls />
         </div>
@@ -64,8 +65,8 @@ export default function AppShell() {
       {datedPage && <div className="desktop-page-tools"><label htmlFor="workspace-date">{text("查看日期", "Date")}</label><input id="workspace-date" type="date" value={date} onChange={e => setDate(e.target.value)} className="desktop-input"/><button className="desktop-button" disabled={refreshing} onClick={() => { setRefreshing(true); void Promise.all([useAppStore.getState().refreshSessions(), refresh()]).finally(() => setRefreshing(false)); }}>{refreshing ? text("刷新中…", "Refreshing…") : text("刷新", "Refresh")}</button></div>}
       {(error || loadError || appError) && <div className="desktop-global-notice"><DesktopError error={error || loadError || appError || ""} onRetry={() => { clearError(); void refresh(); }} onDismiss={() => { clearError(); useInternalStore.setState({ error: "", loadError: "" }); }}/></div>}
       {message && !(error || loadError || appError) && <div className="desktop-global-success" role="status"><span>✓ {message}</span><button className="desktop-icon-button" aria-label={text("关闭提示", "Dismiss notice")} onClick={() => useInternalStore.setState({ message: "" })}>×</button></div>}
-      <main className="desktop-main"><DesktopPageBoundary key={location.pathname} resetKey={location.search}><Outlet /></DesktopPageBoundary></main>
-      <footer className="desktop-statusbar"><span>{data ? `${data.snapshots.count} ${text("张截图", "frames")} · ${text("最近入库截图", "Latest stored frame")} ${shotTime(data.snapshots.latestAtMs,english)}` : text("正在读取本地数据…", "Loading local data…")}</span><span className="truncate" title={p?.status === "recording" ? captureLabel(data?.captureNotice.code ?? "", english) : undefined}>{p?.status === "recording" ? `${text("最近尝试", "Last attempt")}: ${captureLabel(data?.captureNotice.code ?? "",english)}` : p?.status === "uploaded" ? text("服务器已确认接收，本地清理完成", "Server receipt confirmed; local cleanup complete") : text("当前未采集屏幕", "Screen collection is inactive")}</span></footer>
+      <main className="desktop-main"><DesktopPageBoundary key={location.pathname} resetKey={location.search}>{expired && !["/task","/settings","/about"].some(path=>location.pathname.startsWith(path)) ? <div className="desktop-card"><h2>{text("原始记录已到删除截止", "Original records have expired")}</h2><p>{text("已停止展示原始记录。本机清理状态见采集任务；云端清理由接收服务独立执行。", "Original records are no longer displayed. See the task for local cleanup; receiver cleanup runs separately.")}</p><Link to="/task">{text("查看清理状态", "View cleanup status")}</Link></div> : <Outlet />}</DesktopPageBoundary></main>
+      <footer className="desktop-statusbar"><span>{data ? `${data.snapshots.count} ${text("张截图", "frames")} · ${text("最近入库截图", "Latest stored frame")} ${shotTime(data.snapshots.latestAtMs,english)}` : text("正在读取本地数据…", "Loading local data…")}</span><span className="truncate" title={!expired && p?.status === "recording" ? captureLabel(data?.captureNotice.code ?? "", english) : undefined}>{expired ? text("原始记录已到删除截止", "Original records have expired") : p?.status === "recording" ? `${text("最近尝试", "Last attempt")}: ${captureLabel(data?.captureNotice.code ?? "",english)}` : p?.status === "uploaded" ? text("云端清单已对账，按期保留和删除", "Remote manifest reconciled; retention deadline applies") : text("当前未采集屏幕", "Screen collection is inactive")}</span></footer>
     </div>
   </div>;
 }

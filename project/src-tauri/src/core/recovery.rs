@@ -205,6 +205,7 @@ pub fn recover(paths: &DataPaths, writer: &WriterHandle, task_id: &str) -> Resul
             sync_dir(parent)?;
         }
         let f = Frame {
+            task_id:j.upload.task_id.clone(),
             id: j.row.id.clone(),
             path: j.row.file_path.clone(),
             captured_at_ms: j.row.captured_at_ms,

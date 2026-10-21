@@ -1,1 +1,1 @@
-"""Adapted raw-frame ingestion; no 48-hour accounting or automatic retention deletion."""
+"""Internal raw-frame archives; no server capture-duration accounting."""

@@ -1,4 +1,4 @@
-//! Internal two-workday collection policy. No network or operating-system capture in this module.
+//! Internal accumulated-hour collection policy. No network or operating-system capture in this module.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -15,14 +15,19 @@ pub struct InternalConfig {
     pub capture_interval_secs: u64,
     pub poll_width: u32,
     pub poll_quality: f32,
-    pub workday_hours: u32,
+    pub target_hours: u32,
+    /// Read-only compatibility with old config files; new tasks use target_hours.
+    #[serde(rename = "workdayHours", skip_serializing)]
+    pub legacy_workday_hours: Option<u32>,
     /// Native APIs capture the display containing the foreground window by default.
     pub all_displays: bool,
     pub screenshot_blocked_apps: Vec<String>,
     pub screenshot_blocked_domains: Vec<String>,
+    pub upload_mode: String,
     pub upload_url: String,
     pub upload_survey_id: String,
     pub upload_device_id: String,
+    pub archive_end_at: String,
     pub encryption_recipient: String,
     pub domestic_server_confirmed: bool,
 }
@@ -33,7 +38,8 @@ impl Default for InternalConfig {
             capture_interval_secs: 12,
             poll_width: 1600,
             poll_quality: 85.0,
-            workday_hours: 8,
+            target_hours: 48,
+            legacy_workday_hours: None,
             all_displays: false,
             screenshot_blocked_apps: [
                 "1password",
@@ -72,9 +78,11 @@ impl Default for InternalConfig {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            upload_mode: "receiver".into(),
             upload_url: String::new(),
             upload_survey_id: String::new(),
             upload_device_id: String::new(),
+            archive_end_at: String::new(),
             encryption_recipient: String::new(),
             domestic_server_confirmed: false,
         }
@@ -83,6 +91,7 @@ impl Default for InternalConfig {
 
 impl InternalConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if !["receiver", "ossDirect"].contains(&self.upload_mode.as_str()) { return Err("上传模式无效".into()); }
         if !(10..=15).contains(&self.capture_interval_secs) {
             return Err("截图间隔必须为 10–15 秒".into());
         }
@@ -92,8 +101,11 @@ impl InternalConfig {
         {
             return Err("定时截图宽度须为 1600–7680，质量须为 85–100".into());
         }
-        if !(1..=24).contains(&self.workday_hours) {
-            return Err("每天录制时长须为 1–24 小时".into());
+        if !(1..=48).contains(&self.target_hours) {
+            return Err("累计采集目标须为 1–48 小时".into());
+        }
+        if self.legacy_workday_hours.is_some_and(|v| !(1..=24).contains(&v)) {
+            return Err("旧版每天录制时长无效".into());
         }
         if self
             .screenshot_blocked_apps
@@ -115,6 +127,7 @@ impl InternalConfig {
                 return Err("上传地址必须使用 HTTPS，且不能包含账号、查询参数或片段".into());
             }
         }
+        if !self.archive_end_at.is_empty() { super::archive::end_ms(self)?; }
         if !self.encryption_recipient.is_empty()
             && self
                 .encryption_recipient
@@ -181,6 +194,8 @@ pub struct TaskProgress {
     pub task_id: String,
     pub elapsed_ms: u64,
     pub target_ms: u64,
+    #[serde(default)]
+    pub ended_at_ms: Option<i64>,
     pub status: TaskStatus,
     pub last_error: Option<String>,
     pub bundle_path: Option<String>,
@@ -192,6 +207,19 @@ pub struct TaskProgress {
     pub integrity_error: Option<String>,
     #[serde(default)]
     pub needs_flush: bool,
+}
+
+// Even a zero-duration task may already have ended or enrolled in retention.
+fn target_can_change(p: &TaskProgress, archive_bound: bool) -> bool {
+    !archive_bound
+        && p.status == TaskStatus::Ready
+        && p.elapsed_ms == 0
+        && p.ended_at_ms.is_none()
+        && !p.needs_flush
+        && p.integrity_error.is_none()
+        && p.receipt.is_none()
+        && p.stored_bundle.is_none()
+        && p.bundle_path.is_none()
 }
 
 pub struct InternalControl {
@@ -220,27 +248,20 @@ impl Drop for NativeJob<'_> {
 
 pub fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
-    use std::io::Write;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| e.to_string())?;
-    fs::rename(tmp, path).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let tmp = path.with_extension(format!("json.{}.tmp",uuid::Uuid::new_v4()));
+    let result=(||->Result<(),String>{
+        let mut opts=fs::OpenOptions::new();opts.write(true).create_new(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600).custom_flags(libc::O_NOFOLLOW); }
+        let mut file=opts.open(&tmp).map_err(|e|e.to_string())?;
+        use std::io::Write;
+        file.write_all(&bytes).and_then(|_|file.sync_all()).map_err(|e|e.to_string())?;
+        drop(file);
+        fs::rename(&tmp,path).map_err(|e|e.to_string())?;
+        #[cfg(unix)] if let Some(parent)=path.parent(){fs::File::open(parent).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;}
+        Ok(())
+    })();
+    if result.is_err(){let _=fs::remove_file(&tmp);}
+    result
 }
 
 pub fn external_ai_client() -> Result<reqwest::blocking::Client, String> {
@@ -278,10 +299,13 @@ pub fn allow_webview_navigation(url: &reqwest::Url) -> bool {
             && url.port() == Some(1420))
 }
 
-pub fn pause_collection(
+pub fn pause_collection(app:&tauri::AppHandle,state:&crate::AppState,complete:bool)->Result<(),String>{ pause_collection_inner(app,state,complete,false) }
+pub fn pause_for_expiry(app:&tauri::AppHandle,state:&crate::AppState)->Result<(),String>{ pause_collection_inner(app,state,false,true) }
+fn pause_collection_inner(
     app: &tauri::AppHandle,
     state: &crate::AppState,
     complete: bool,
+    expiry: bool,
 ) -> Result<(), String> {
     use tauri::Emitter;
     let _transition = state.0.internal.transition.lock();
@@ -306,14 +330,14 @@ pub fn pause_collection(
         .map_err(|_| "会话线程不可用")?;
     rx.recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| "等待会话关闭超时")?;
-    if let Err(e) = state.0.writer.flush() {
+    if !expiry { if let Err(e) = state.0.writer.flush() {
         let _ = state.0.internal.edit_progress(|p| {
             p.integrity_error = Some(e.clone());
             p.last_error = Some(e.clone());
             Ok(())
         });
         return Err(e);
-    }
+    } }
     state.0.internal.edit_progress(|p| {
         p.needs_flush = false;
         Ok(())
@@ -397,7 +421,7 @@ impl InternalControl {
     }
     pub fn load(root: &Path, tracking: Arc<AtomicBool>) -> Result<Arc<Self>, String> {
         let cfg_path = root.join("internal-config.json");
-        let config: InternalConfig = if cfg_path.exists() {
+        let mut config: InternalConfig = if cfg_path.exists() {
             serde_json::from_slice(&fs::read(&cfg_path).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("内部版配置读取失败：{e}"))?
         } else {
@@ -412,7 +436,8 @@ impl InternalControl {
             TaskProgress {
                 task_id: uuid::Uuid::new_v4().to_string(),
                 elapsed_ms: 0,
-                target_ms: 2 * config.workday_hours as u64 * 3_600_000,
+                ended_at_ms: None,
+                target_ms: config.target_hours as u64 * 3_600_000,
                 status: TaskStatus::Ready,
                 last_error: None,
                 bundle_path: None,
@@ -431,8 +456,21 @@ impl InternalControl {
         }
         // Before any recorded time, configuration is the single durable source of the target.
         // Saving configuration must not require a transaction across two independent JSON files.
-        if progress.elapsed_ms == 0 {
-            progress.target_ms = 2 * config.workday_hours as u64 * 3_600_000;
+        let archive = super::archive::load(root)?;
+        if archive.as_ref().is_some_and(|b| b.task_id != progress.task_id) {
+            return Err("归档与本机任务身份不匹配".into());
+        }
+        if let Some(target) = archive.as_ref().and_then(|b| b.target_ms) {
+            if progress.elapsed_ms > target { return Err("任务累计时长超过已绑定目标".into()); }
+            // Binding seals the current in-memory target, including a config
+            // saved before any progress-file write. Older bindings use progress.
+            progress.target_ms = target;
+        }
+        if target_can_change(&progress, archive.is_some()) {
+            progress.target_ms = config.target_hours as u64 * 3_600_000;
+        } else if progress.target_ms % 3_600_000 == 0 {
+            // The durable target of an existing task wins over the new default.
+            config.target_hours = (progress.target_ms / 3_600_000) as u32;
         }
         // Relaunch never silently resumes collection or assumes an interrupted upload succeeded.
         if progress.status == TaskStatus::Recording || progress.needs_flush {
@@ -471,6 +509,7 @@ impl InternalControl {
     pub fn save_config(&self, config: InternalConfig) -> Result<(), String> {
         config.validate()?;
         let _guard = self.gate.write();
+        if let Some(b)=super::archive::load(&self.root)? { if b.upload_mode!=config.upload_mode || b.upload_url!=config.upload_url || b.survey_id!=config.upload_survey_id || b.device_id!=config.upload_device_id || b.planned_end_ms!=super::archive::end_ms(&config)? { return Err("归档已绑定，不能修改目的地或结束时间".into()); } }
         if self.frame_upload_running.load(Ordering::SeqCst) {
             return Err("请先停止后台上传，再修改设置".into());
         }
@@ -478,8 +517,9 @@ impl InternalControl {
         if matches!(p.status, TaskStatus::Recording | TaskStatus::Uploading) {
             return Err("请先暂停，上传期间不能修改配置".into());
         }
-        if p.elapsed_ms > 0 && config.workday_hours != self.config.read().workday_hours {
-            return Err("任务开始后不能修改目标时长".into());
+        let may_change_target = target_can_change(&p, super::archive::load(&self.root)?.is_some());
+        if !may_change_target && config.target_hours != self.config.read().target_hours {
+            return Err("任务开始、结束或绑定归档后不能修改目标时长".into());
         }
         if p.stored_bundle
             .as_ref()
@@ -488,8 +528,8 @@ impl InternalControl {
             return Err("已有待回收数据包，修改加密公钥前需要人工审核回收状态".into());
         }
         write_json_atomic(&self.root.join("internal-config.json"), &config)?;
-        if p.elapsed_ms == 0 {
-            p.target_ms = 2 * config.workday_hours as u64 * 3_600_000;
+        if may_change_target {
+            p.target_ms = config.target_hours as u64 * 3_600_000;
         }
         *self.config.write() = config;
         Ok(())
@@ -510,6 +550,7 @@ impl InternalControl {
         {
             return Err("任务已结束，不能继续采集".into());
         }
+        super::archive::ensure_live(&self.root,&p.task_id,chrono::Utc::now().timestamp_millis())?;
         let mut next = p.clone();
         next.status = TaskStatus::Recording;
         next.last_error = None;
@@ -532,6 +573,7 @@ impl InternalControl {
             p.status,
             TaskStatus::Ready | TaskStatus::Recording | TaskStatus::Paused
         ) {
+            if complete && p.ended_at_ms.is_none() { p.ended_at_ms=Some(chrono::Utc::now().timestamp_millis()); }
             p.status = if complete {
                 TaskStatus::Completed
             } else {
@@ -605,6 +647,10 @@ impl InternalControl {
 
     /// Called with monotonic elapsed time. Long sleep/suspend gaps do not count as work.
     pub fn advance(&self, delta_ms: u64) -> Result<bool, String> {
+        // Nonterminal ticks must not wait on a slow capture. At completion,
+        // stamp the end only after the current capture has committed.
+        let terminal={let p=self.progress.lock();p.elapsed_ms.saturating_add(delta_ms)>=p.target_ms};
+        let _gate=if terminal { match self.gate.try_write(){Some(g)=>Some(g),None=>return Ok(false)} } else {None};
         let mut p = self.progress.lock();
         if !self.tracking.load(Ordering::SeqCst) || delta_ms > 5_000 {
             return Ok(false);
@@ -612,6 +658,7 @@ impl InternalControl {
         p.elapsed_ms = p.elapsed_ms.saturating_add(delta_ms).min(p.target_ms);
         let ended = p.elapsed_ms >= p.target_ms;
         if ended {
+            if p.ended_at_ms.is_none() { p.ended_at_ms=Some(chrono::Utc::now().timestamp_millis()); }
             p.status = TaskStatus::Completed;
             self.tracking.store(false, Ordering::SeqCst);
             self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -641,6 +688,19 @@ impl InternalControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Block the final rename rather than depending on a temporary filename.
+    // Preserve the previous durable state so recovery assertions remain meaningful.
+    fn block_write_target(path: &Path) -> impl FnOnce() {
+        let path = path.to_owned();
+        let previous = fs::read(&path).ok();
+        if previous.is_some() { fs::remove_file(&path).unwrap(); }
+        fs::create_dir(&path).unwrap();
+        move || {
+            fs::remove_dir(&path).unwrap();
+            if let Some(bytes) = previous { fs::write(&path, bytes).unwrap(); }
+        }
+    }
     #[test]
     fn configuration_writes_cannot_race_bundle_or_cleanup() {
         let d = tempfile::tempdir().unwrap();
@@ -689,23 +749,123 @@ mod tests {
     }
 
     #[test]
+    fn target_config_accepts_legacy_keys_but_new_tasks_default_to_48_hours() {
+        let legacy: InternalConfig = serde_json::from_str(r#"{"workdayHours":8}"#).unwrap();
+        assert_eq!(legacy.target_hours, 48);
+        assert!(legacy.validate().is_ok());
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(encoded["targetHours"], 48);
+        assert!(encoded.get("workdayHours").is_none());
+        assert!(serde_json::from_str::<InternalConfig>(r#"{"unknownTarget":48}"#).is_err());
+        for hours in [0, 1, 47, 48, 49] {
+            let mut c = InternalConfig::default();
+            c.target_hours = hours;
+            assert_eq!(c.validate().is_ok(), (1..=48).contains(&hours));
+        }
+    }
+
+    #[test]
+    fn unstarted_legacy_task_uses_48_hours_without_changing_its_identity() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("internal-config.json"), r#"{"workdayHours":8}"#).unwrap();
+        let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(c.progress.lock().target_ms, 48 * 3_600_000);
+        let task = c.progress.lock().task_id.clone();
+        c.edit_progress(|p| {p.target_ms = 16 * 3_600_000; Ok(())}).unwrap();
+        drop(c);
+        let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(restored.progress.lock().task_id, task);
+        assert_eq!(restored.progress.lock().target_ms, 48 * 3_600_000);
+        assert!(!restored.tracking.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn started_ended_and_pending_legacy_tasks_keep_their_durable_target() {
+        for (status, elapsed, ended, needs_flush) in [
+            (TaskStatus::Paused, 1000, None, false),
+            (TaskStatus::Paused, 0, None, false),
+            (TaskStatus::Completed, 0, Some(1), false),
+            (TaskStatus::Completed, 0, None, false),
+            (TaskStatus::Paused, 0, None, true),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+            c.edit_progress(|p| {
+                p.target_ms = 16 * 3_600_000;
+                p.status = status; p.elapsed_ms = elapsed;
+                p.ended_at_ms = ended; p.needs_flush = needs_flush; Ok(())
+            }).unwrap();
+            drop(c);
+            let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+            assert_eq!(restored.progress.lock().target_ms, 16 * 3_600_000);
+            assert_eq!(restored.config.read().target_hours, 16);
+            assert_eq!(restored.progress.lock().ended_at_ms, ended);
+            let mut cfg = restored.config.read().clone();
+            cfg.target_hours = 48;
+            assert!(restored.save_config(cfg).is_err());
+            assert_eq!(restored.progress.lock().target_ms, 16 * 3_600_000);
+        }
+    }
+
+    #[test]
+    fn clean_pause_before_first_tick_still_freezes_the_started_target() {
+        let d = tempfile::tempdir().unwrap();
+        let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        c.start().unwrap();
+        c.pause(false).unwrap();
+        c.edit_progress(|p| {p.needs_flush = false; Ok(())}).unwrap();
+        assert_eq!(c.progress.lock().elapsed_ms, 0);
+        let mut cfg = c.config.read().clone();
+        cfg.target_hours = 47;
+        assert!(c.save_config(cfg).is_err());
+        let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(restored.progress.lock().target_ms, 48 * 3_600_000);
+    }
+
+    #[test]
+    fn forty_eight_hour_boundary_stops_once_and_does_not_count_sleep_or_pause() {
+        let d = tempfile::tempdir().unwrap();
+        let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        c.start().unwrap();
+        c.edit_progress(|p| {p.elapsed_ms = p.target_ms - 1000; Ok(())}).unwrap();
+        assert!(!c.advance(60_000).unwrap());
+        assert_eq!(c.progress.lock().elapsed_ms, 48 * 3_600_000 - 1000);
+        assert!(!c.advance(999).unwrap());
+        assert!(c.progress.lock().ended_at_ms.is_none());
+        assert!(c.advance(1).unwrap());
+        let ended = c.progress.lock().ended_at_ms;
+        assert!(ended.is_some());
+        assert_eq!(c.progress.lock().status, TaskStatus::Completed);
+        assert!(!c.tracking.load(Ordering::SeqCst));
+        assert!(!c.advance(1000).unwrap());
+        assert_eq!(c.progress.lock().ended_at_ms, ended);
+        c.edit_progress(|p| {p.needs_flush = false; Ok(())}).unwrap();
+        let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(restored.progress.lock().target_ms, 48 * 3_600_000);
+        assert_eq!(restored.progress.lock().ended_at_ms, ended);
+        assert!(restored.start().is_err());
+        assert!(!restored.advance(1000).unwrap());
+    }
+
+    #[test]
     fn config_target_has_one_durable_source_before_recording() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
         let mut config = InternalConfig::default();
-        config.workday_hours = 6;
+        config.target_hours = 12;
         // Configuration saving remains atomic even when the unrelated progress file is unwritable.
-        fs::create_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        let restore_target = block_write_target(&d.path().join("internal-task.json"));
         c.save_config(config.clone()).unwrap();
         assert_eq!(c.progress.lock().target_ms, 12 * 3_600_000);
-        fs::remove_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        restore_target();
         let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(restored.progress.lock().target_ms, 12 * 3_600_000);
-        fs::create_dir(d.path().join("internal-config.json.tmp")).unwrap();
-        config.workday_hours = 7;
+        let restore_target = block_write_target(&d.path().join("internal-config.json"));
+        config.target_hours = 14;
         assert!(restored.save_config(config).is_err());
-        assert_eq!(restored.config.read().workday_hours, 6);
+        assert_eq!(restored.config.read().target_hours, 12);
         assert_eq!(restored.progress.lock().target_ms, 12 * 3_600_000);
+        restore_target();
     }
     #[test]
     fn clean_pause_can_resume_after_restart_but_unclean_task_stays_blocked() {
@@ -729,7 +889,7 @@ mod tests {
     fn start_and_recovery_state_save_failures_remain_retryable() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
-        fs::create_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        let restore_target = block_write_target(&d.path().join("internal-task.json"));
         assert!(c.start().is_err());
         assert_eq!(c.progress.lock().status, TaskStatus::Ready);
         assert!(!c.tracking.load(Ordering::SeqCst));
@@ -741,7 +901,7 @@ mod tests {
             })
             .is_err());
         assert_eq!(c.progress.lock().status, TaskStatus::Completed);
-        fs::remove_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        restore_target();
         c.edit_progress(|p| {
             p.status = TaskStatus::Uploading;
             Ok(())
@@ -755,11 +915,11 @@ mod tests {
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
         c.start().unwrap();
         c.progress.lock().target_ms = 1000;
-        fs::create_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        let restore_target = block_write_target(&d.path().join("internal-task.json"));
         assert!(c.advance(1000).is_err());
         assert_eq!(c.progress.lock().status, TaskStatus::Completed);
         assert!(!c.tracking.load(Ordering::SeqCst));
-        fs::remove_dir(d.path().join("internal-task.json.tmp")).unwrap();
+        restore_target();
         assert!(c.start().is_err());
     }
     #[test]

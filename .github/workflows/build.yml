@@ -39,6 +39,14 @@ jobs:
       - run: python -m pip install -e './upload-server[test]'
       - run: python -m pytest -q
         working-directory: upload-server
+      - name: Package administrator tools (explicit source allowlist)
+        run: python tools/package-oss-admin.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TimeLens-admin-tools
+          path: project/src-tauri/target/distribution/admin/
+          if-no-files-found: error
+          retention-days: 30
 
   build:
     name: Build ${{ matrix.name }}
@@ -52,7 +60,8 @@ jobs:
             bundle: nsis
           - os: macos-latest
             name: macos
-            bundle: dmg
+            # Keep .app after creating DMG so version/signature checks inspect the packaged app.
+            bundle: app,dmg
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     defaults:
@@ -73,8 +82,14 @@ jobs:
         with:
           workspaces: project/src-tauri
       - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '../upload-server[test]'
       - name: Rust unit tests (synthetic data only)
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+        env:
+          TIMELENS_TEST_PYTHON: python
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features frame-contract-tests --lib
       - name: Import Apple signing certificate
         if: matrix.name == 'macos' && github.event_name != 'pull_request' && env.APPLE_CERTIFICATE != ''
         env:

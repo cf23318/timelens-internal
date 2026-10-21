@@ -6351,10 +6351,11 @@ dependencies = [
 
 [[package]]
 name = "timelens"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "age",
  "arboard",
+ "base64 0.22.1",
  "battery",
  "block2",
  "chrono",

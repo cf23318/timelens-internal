@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.timelens.direct-admin</string>
+  <key>ProgramArguments</key><array>
+    <string>/ABSOLUTE/PATH/TO/venv/bin/timelens-oss-admin</string>
+    <string>watch</string><string>--execute</string>
+    <string>--registry</string><string>/PRIVATE/PATH/TO/admin-registry</string>
+    <string>--bucket</string><string>YOUR_PRIVATE_BUCKET</string>
+    <string>--credentials-file</string><string>/PRIVATE/PATH/TO/credentials.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/PRIVATE/PATH/TO/admin-registry/daemon.log</string>
+  <key>StandardErrorPath</key><string>/PRIVATE/PATH/TO/admin-registry/daemon-error.log</string>
+</dict></plist>
