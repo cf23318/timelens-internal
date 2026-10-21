@@ -1,10 +1,12 @@
 # TimeLens Internal · 内部采集版
 
-基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前内部版本为 **0.17.7**。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
+基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前内部测试版本为 **0.17.9**。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
 
-[English](README.en.md) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
+[English](README.en.md) · [下载安装包](https://github.com/cf23318/timelens-internal/releases) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
-## 本地公用授权改造（0.17.8，尚未发布）
+## OSS上传界面（0.17.9）
+
+新数据目录默认使用OSS直传，管理员界面仅显示OSS上传。接收服务选项和配置界面已注释停用；旧任务的后端兼容和留存处理保留，已绑定旧目的地的任务不会自动切换。上传仍需单独确认。
 
 新增本机签发网页（仅监听 `127.0.0.1:8877`）和7天公用上传配置。同批次共用一份 JSON，客户端按固定设备 ID 分目录；公用配置不提供设备之间的云端写入隔离。旧单设备授权继续支持。客户端和管理员工具均需更新；生成或导入配置不会启动上传。使用方式见 [离线上传授权说明](docs/oss-offline-upload.md)。
 
@@ -35,6 +37,8 @@
 - `https://upload.timelens.internal` 是配置示例，不能视为已上线的服务器。真实接收服务、凭据及部署由环境负责人提供；源码不含真实运行数据或密钥。
 
 ## 长期构建与提交流程
+
+已发布的版本从 [GitHub Releases](https://github.com/cf23318/timelens-internal/releases) 下载，可直接选择 Mac DMG 或 Windows x64 安装器；发布页附源码提交、校验文件及签名状态。安装包不含上传授权，授权文件由管理员单独发放。
 
 1. 在专用分支修改并创建 PR。**PR 自动运行**前端构建、外部调用检查、接收服务假数据测试，以及 Windows/macOS Rust 测试和打包。
 2. 从该次成功运行的 **Artifacts** 下载 `TimeLens-windows` 或 `TimeLens-macos`。Windows 包含安装器和独立 exe，macOS 包含 DMG；包内附 `BUILD-INFO.json` 和 `SHA256SUMS`，用于核对版本、源码提交和文件校验值。产物保留 30 天，下载通常需要登录 GitHub。

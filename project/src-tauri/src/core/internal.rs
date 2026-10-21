@@ -425,7 +425,8 @@ impl InternalControl {
             serde_json::from_slice(&fs::read(&cfg_path).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("内部版配置读取失败：{e}"))?
         } else {
-            InternalConfig::default()
+            // Fresh profiles use OSS. Keep deserialization defaults for legacy receiver tasks.
+            InternalConfig { upload_mode: "ossDirect".into(), ..InternalConfig::default() }
         };
         config.validate()?;
         let progress_path = root.join("internal-task.json");
@@ -746,6 +747,26 @@ mod tests {
             .unwrap()
             .unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn fresh_profiles_use_oss_while_legacy_receiver_configs_keep_their_mode() {
+        let fresh = tempfile::tempdir().unwrap();
+        let control = InternalControl::load(fresh.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(control.config.read().upload_mode, "ossDirect");
+        assert_eq!(control.progress.lock().target_ms, 48 * 3_600_000);
+        assert_eq!(control.progress.lock().status, TaskStatus::Ready);
+        assert!(!control.tracking.load(Ordering::SeqCst));
+        assert!(!control.frame_upload_active.load(Ordering::SeqCst));
+        assert!(!control.frame_upload_running.load(Ordering::SeqCst));
+        drop(control);
+        for saved in [r#"{"workdayHours":8}"#, r#"{"uploadMode":"receiver"}"#] {
+            let legacy = tempfile::tempdir().unwrap();
+            fs::write(legacy.path().join("internal-config.json"), saved).unwrap();
+            let control = InternalControl::load(legacy.path(), Arc::new(AtomicBool::new(false))).unwrap();
+            assert_eq!(control.config.read().upload_mode, "receiver");
+            assert!(!control.frame_upload_active.load(Ordering::SeqCst));
+        }
     }
 
     #[test]
