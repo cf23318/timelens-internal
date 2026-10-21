@@ -17,7 +17,7 @@ export function OssUploadSettings({ locked }: { locked: boolean }) {
   return <>
     <section className="desktop-card">
       <h3>{text("本机固定设备 ID", "Fixed device ID")}</h3>
-      <p className="desktop-muted mt-2">{text("将此 ID 交给管理员，在 Mac 上生成仅属于此 ID 的7天上传授权。此 ID 保存在本机数据目录，重启和续签不会改变；更换或删除数据目录会生成新 ID。", "Send this ID to your administrator for a device-scoped seven-day grant. It survives restarts and renewal; replacing the profile creates a new ID.")}</p>
+      <p className="desktop-muted mt-2">{text("支持设备专属授权或同批次公用授权。公用配置导入后按本机固定 ID 分目录保存；此 ID 在重启和续签后不变，更换数据目录会生成新 ID。", "Device-scoped or shared batch grants are supported. Shared grants use this fixed ID for a separate folder; replacing the profile creates a new ID.")}</p>
       <input aria-label={text("固定设备ID", "Fixed device ID")} className="desktop-input font-mono mt-4" readOnly value={data.fixedDeviceId ?? ""} onFocus={e => e.target.select()}/>
       <p className="desktop-caption mt-2">{text("用户编号由管理员分配并写入授权；设备 ID 不会自动识别员工姓名。", "The administrator assigns the user ID. Device IDs do not identify employee names.")}</p>
     </section>
@@ -29,13 +29,15 @@ export function OssUploadSettings({ locked }: { locked: boolean }) {
       <button className="desktop-button mt-3" type="button" disabled={locked || busy || Boolean(draft) || !content.trim()} onClick={()=>void importText(content)}>{text("导入粘贴的授权", "Import pasted grant")}</button>
       {draft && <p className="desktop-caption mt-2">{text("请先保存或放弃未保存设置，再导入授权。", "Save or discard settings before importing.")}</p>}
       {grant?.valid ? <dl className="desktop-review-list mt-4">
-        <div><dt>{text("用户编号", "User ID")}</dt><dd>{grant.userId}</dd></div>
+        <div><dt>{text("授权范围", "Grant scope")}</dt><dd>{grant.scope === "shared" ? text("公用批次 · 按设备分目录", "Shared batch · device folders") : text("设备专属", "Device-scoped")}</dd></div>
+        <div><dt>{grant.scope === "shared" ? text("批次编号", "Batch ID") : text("用户编号", "User ID")}</dt><dd>{grant.userId}</dd></div>
         <div><dt>{text("授权截止", "Grant expires")}</dt><dd>{new Date(grant.expiresAt!).toLocaleString()}</dd></div>
         <div><dt>{text("OSS 地址", "OSS destination")}</dt><dd className="break-all">{grant.endpoint}</dd></div>
-        <div><dt>{text("专属上传目录", "Upload prefix")}</dt><dd className="font-mono text-xs break-all">{grant.prefix}</dd></div>
+        <div><dt>{text("本机上传目录", "Device upload prefix")}</dt><dd className="font-mono text-xs break-all">{grant.prefix}</dd></div>
         <div><dt>{text("批准调研结束", "Approved study end")}</dt><dd>{new Date(grant.archiveEndAt!).toLocaleString()}</dd></div>
       </dl> : <p className="desktop-caption mt-4" role="status">{grant?.error || text("尚未导入有效授权", "No valid grant imported")}</p>}
     </section>
+    {grant?.valid && grant.scope === "shared" && <div className="desktop-alert desktop-alert-warning">{text("此配置可供同批次所有人使用。设备目录用于分组，不代表员工身份认证；持有配置的人也能向同批次其他设备目录写入，但不能读取、删除或覆盖对象。", "This batch grant is shared. Device folders group uploads without authenticating people or isolating writes. Holders cannot read, delete or overwrite objects.")}</div>}
     <div className="desktop-alert desktop-alert-info">{text("授权从签发时起最多7天，到期仅停止上传；续签须保留原用户、设备、Bucket和批准调研结束时间。图片直接发送到OSS，长期密钥仅留在管理员Mac。上传默认关闭，需另行确认。", "Grants last at most seven days from issuance. Expiry stops upload; renewal keeps the same user, device, bucket and approved end. Images go directly to OSS. Upload is off until explicitly confirmed.")}</div>
     <div className="desktop-alert desktop-alert-warning">{text("“OSS已接收”表示上传回执和CRC校验通过。新版授权还会同步任务清单；管理员需运行对账、原图回读及到期清理工具，保持管理机器在线。本机按原任务截止清理，旧接收服务不负责直传清理。", "OSS accepted means response and CRC checks passed. New grants also send task inventories. Administrators must run reconciliation, original readback and retention on an online management machine. Local retention still applies.")}</div>
   </>;

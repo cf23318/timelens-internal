@@ -4,6 +4,10 @@
 
 [English](README.en.md) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
+## 本地公用授权改造（0.17.8，尚未发布）
+
+新增本机签发网页（仅监听 `127.0.0.1:8877`）和7天公用上传配置。同批次共用一份 JSON，客户端按固定设备 ID 分目录；公用配置不提供设备之间的云端写入隔离。旧单设备授权继续支持。客户端和管理员工具均需更新；生成或导入配置不会启动上传。使用方式见 [离线上传授权说明](docs/oss-offline-upload.md)。
+
 ## 当前功能
 
 - 默认中文、浅色和原生窗口边框。新装等待手动开始；可暂停、继续，正常退出和重启后保持暂停。
