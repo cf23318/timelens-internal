@@ -39,8 +39,8 @@ export function OssUploadSettings({ locked }: { locked: boolean }) {
         <div><dt>{text("授权范围", "Grant scope")}</dt><dd>{grant.scope === "shared" ? text("公用批次 · 按设备分目录", "Shared batch · device folders") : text("设备专属", "Device-scoped")}</dd></div>
         <div><dt>{grant.scope === "shared" ? text("批次编号", "Batch ID") : text("用户编号", "User ID")}</dt><dd>{grant.userId}</dd></div>
         <div><dt>{text("授权截止", "Grant expires")}</dt><dd>{new Date(grant.expiresAt!).toLocaleString()}</dd></div>
-        <div><dt>{text("OSS 地址", "OSS destination")}</dt><dd className="break-all">{grant.endpoint}</dd></div>
-        <div><dt>{text("本机授权目录", "Device grant prefix")}</dt><dd className="font-mono text-xs break-all">{grant.prefix}</dd></div>
+        <div><dt>{text("上传目的地", "Upload destination")}</dt><dd>{text("由上传授权自动指定，不展示存储地址", "Assigned by the upload grant; storage address is not displayed")}</dd></div>
+        <div><dt>{text("上传权限", "Upload permission")}</dt><dd>{text("仅允许新增上传，不提供云端读取或下载授权", "New uploads only; no cloud read or download authorization")}</dd></div>
         <div><dt>{text("批准调研结束", "Approved study end")}</dt><dd>{new Date(grant.archiveEndAt!).toLocaleString()}</dd></div>
       </dl> : <p className="desktop-caption mt-4" role="status">{grant?.error || text("尚未导入有效授权", "No valid grant imported")}</p>}
     </section>

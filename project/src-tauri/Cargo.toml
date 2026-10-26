@@ -1,6 +1,6 @@
 [package]
 name = "timelens"
-version = "0.17.11"
+version = "0.17.12"
 description = "TimeLens — local activity data lens (P0)"
 authors = ["TimeLens"]
 edition = "2021"
@@ -38,7 +38,7 @@ regex = "1"
 libc = "0.2"
 crossbeam-channel = "0.5"
 webp = { version = "0.3", default-features = false, features = ["img"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "system-proxy"] }
 sha2 = "0.10"
 base64 = "0.22"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

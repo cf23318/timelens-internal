@@ -9,6 +9,10 @@ struct StrictActivation {format:String,issuer_url:String,activation_code:String,
 #[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 struct StrictRegistration {format:String,issuer_url:String,batch_id:String,scope:String,bucket:String,study_window_days:u32}
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct StrictDiscovery {format:String,issuer_url:String}
 
 pub fn validate(raw: &[u8], now_ms: i64) -> Result<String, String> {
     if raw.len() > 65536 {return Err("预置配置超过64KB".into());}
@@ -16,6 +20,12 @@ pub fn validate(raw: &[u8], now_ms: i64) -> Result<String, String> {
     // earlier values which must never be copied into a compiled credential.
     let v:Value=serde_json::from_slice(raw).map_err(|_|"预置配置不是有效JSON")?;
     let obj=v.as_object().ok_or("预置配置须为对象")?;
+    if obj.get("format").and_then(Value::as_str)==Some("timelens-cloudflare-discovery-v1") {
+        let discovery:StrictDiscovery=serde_json::from_slice(raw).map_err(|_|"配置接口预置字段无效，禁止内置OSS目的地或凭据")?;
+        let u=url::Url::parse(&discovery.issuer_url).map_err(|_|"预置签发地址无效")?;
+        if u.scheme()!="https" || u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() || u.path()!="/" || u.query().is_some() || u.fragment().is_some() {return Err("预置签发地址须为HTTPS根地址".into());}
+        return String::from_utf8(raw.to_vec()).map_err(|_|"预置配置编码失败".into());
+    }
     let registration=obj.get("format").and_then(Value::as_str)==Some("timelens-cloudflare-registration-v1");
     let keys:&[&str]=if registration {&["format","issuerUrl","batchId","scope","bucket","studyWindowDays"]} else {&["format","issuerUrl","activationCode","batchId","scope","bucket","archiveEndAt"]};
     if registration {let _:StrictRegistration=serde_json::from_slice(raw).map_err(|_|"公开注册配置字段无效，禁止凭据或重复字段")?;}
@@ -53,6 +63,18 @@ pub fn load(path:Option<&Path>, release:bool, allow_generic:bool, now:i64)->Resu
 mod tests {
     use super::*;
     fn raw()->Value {serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":"https://issuer.example.com/","activationCode":"a".repeat(64),"batchId":"pilot","scope":"device","bucket":"test-bucket","archiveEndAt":"2099-01-01T00:00:00Z"})}
+    #[test] fn discovery_embeds_only_the_configuration_origin() {
+        let v=serde_json::json!({"format":"timelens-cloudflare-discovery-v1","issuerUrl":"https://issuer.example.com/"});
+        assert_eq!(validate(v.to_string().as_bytes(),1).unwrap(),v.to_string());
+        for key in ["bucket","endpoint","prefix","activationCode","accessKeySecret"] {
+            let mut bad=v.clone();bad[key]="must-not-be-embedded".into();
+            let error=validate(bad.to_string().as_bytes(),1).unwrap_err();assert!(!error.contains("must-not-be-embedded"));
+        }
+        for value in ["http://issuer.example.com/","https://user:password@issuer.example.com/","https://issuer.example.com/?token=secret","https://issuer.example.com/path"] {
+            let mut bad=v.clone();bad["issuerUrl"]=value.into();assert!(validate(bad.to_string().as_bytes(),1).is_err());
+        }
+        assert!(validate(br#"{"format":"timelens-cloudflare-discovery-v1","issuerUrl":"https://wrong.example/","issuerUrl":"https://issuer.example/"}"#,1).is_err());
+    }
     #[test] fn strict_profile_rejects_secrets_invalid_scope_and_expired_batch() {
         let v=raw();assert!(validate(&serde_json::to_vec(&v).unwrap(),1).is_ok());
         for (key,value) in [("issuerUrl","http://example.com/"),("issuerUrl","https://u:p@example.com/"),("issuerUrl","https://example.com/?token=x"),("scope","any"),("activationCode","bad"),("archiveEndAt","2020-01-01T00:00:00Z")] {let mut bad=v.clone();bad[key]=value.into();assert!(validate(&serde_json::to_vec(&bad).unwrap(),1792979363000).is_err());}

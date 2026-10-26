@@ -25,9 +25,32 @@ struct Activation { format: String, issuer_url: String, activation_code: String,
 #[derive(Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 struct Registration {format:String,issuer_url:String,batch_id:String,scope:String,bucket:String,study_window_days:u32}
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct Discovery {format:String,issuer_url:String}
+
+// Only the configuration origin is compiled into new employee packages. The
+// destination is resolved over verified HTTPS, before taking the collection gate.
+fn discover(raw:&str,client:&reqwest::blocking::Client)->Result<String,String> {
+    let d:Discovery=serde_json::from_str(raw).map_err(|_|"配置接口预置无效")?;
+    if d.format!="timelens-cloudflare-discovery-v1" {return Err("配置接口预置无效".into());}
+    let base=url(&d.issuer_url)?;
+    let response=client.get(base.join("v1/config").unwrap()).send().map_err(|e|connection_error(&e))?;
+    let raw=read_response(response)?;
+    let config:Registration=serde_json::from_str(&raw).map_err(|_|"云端配置响应无效，请联系管理员")?;
+    if url(&config.issuer_url)?!=base {return Err("云端配置改变了签发服务，已拒绝".into());}
+    // Validation below also applies to cached and legacy registration settings.
+    validate_registration(&config)?;
+    Ok(raw)
+}
+fn validate_registration(a:&Registration)->Result<(),String> {
+    let bucket=&a.bucket;
+    if a.format!="timelens-cloudflare-registration-v1" || a.scope!="device" || !(1..=30).contains(&a.study_window_days) || !super::frame_upload::valid_id(&a.batch_id) || bucket.len()<3 || bucket.len()>63 || !bucket.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-') || !bucket.as_bytes()[0].is_ascii_alphanumeric() || !bucket.as_bytes()[bucket.len()-1].is_ascii_alphanumeric() {return Err("公开注册批次无效".into());}
+    Ok(())
+}
 fn registration_enrollment(root:&Path,raw:&str)->Result<Enrollment,String> {
     let a:Registration=serde_json::from_str(raw).map_err(|_|"公开注册配置无效")?;
-    if a.format!="timelens-cloudflare-registration-v1" || a.scope!="device" || !(1..=30).contains(&a.study_window_days) || !super::frame_upload::valid_id(&a.batch_id) {return Err("公开注册批次无效".into());}
+    validate_registration(&a)?;
     // Fixed once, before any network request; retries/restarts never extend it.
     let end=Utc::now().timestamp()*1000+i64::from(a.study_window_days)*DAY;
     let end=DateTime::<Utc>::from_timestamp_millis(end).ok_or("设备调研期限无效")?.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
@@ -72,15 +95,31 @@ fn request(client:&reqwest::blocking::Client,e:&Enrollment,force:bool,name:&str)
     } else if let Some(code)=&e.activation_code {
         client.post(base.join("v1/activate").unwrap()).json(&serde_json::json!({"activationCode":code,"deviceId":e.device_id,"deviceSecret":e.device_secret}))
     } else {client.post(base.join("v1/renew").unwrap()).bearer_auth(&e.device_secret).json(&serde_json::json!({"deviceId":e.device_id,"force":force}))};
-    let mut response=r.send().map_err(|_|"云端续期连接失败；已有授权及待传图片保留")?;
+    let response=r.send().map_err(|e|connection_error(&e))?;
+    let raw=read_response(response)?;
+    let v:serde_json::Value=serde_json::from_str(&raw).map_err(|_|"云端授权响应无效")?;
+    serde_json::to_string(v.get("grant").ok_or("云端授权缺失")?).map_err(|_|"云端授权无效".into())
+}
+fn connection_error(error:&reqwest::Error)->String {
+    // Never display Debug/Display for network errors: they may contain URLs,
+    // proxy credentials or request details. Keep reasons local and bounded.
+    if error.is_timeout() {"云端授权连接超时；请检查网络和系统代理，软件会自动重试"}
+    else {"云端授权连接失败；请检查网络、系统代理或证书，软件会自动重试"}.into()
+}
+fn read_response(mut response:reqwest::blocking::Response)->Result<String,String> {
     if !response.status().is_success() {return Err(format!("云端授权返回 HTTP {}；请检查激活或设备状态",response.status().as_u16()));}
     let mut bytes=Vec::new(); response.by_ref().take(65537).read_to_end(&mut bytes).map_err(|_|"云端授权响应读取失败")?;
     if bytes.len()>65536 {return Err("云端授权响应过大".into());}
-    let v:serde_json::Value=serde_json::from_slice(&bytes).map_err(|_|"云端授权响应无效")?;
-    serde_json::to_string(v.get("grant").ok_or("云端授权缺失")?).map_err(|_|"云端授权无效".into())
+    String::from_utf8(bytes).map_err(|_|"云端授权响应无效".into())
+}
+fn client_builder()->reqwest::blocking::ClientBuilder {
+    // reqwest's system-proxy feature reads Windows/macOS manual proxy settings.
+    // Build a fresh client for each renewal so changed settings take effect.
+    // OSS image and manifest clients deliberately keep their own no_proxy().
+    reqwest::blocking::Client::builder().https_only(true).redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(25))
 }
 fn client()->Result<reqwest::blocking::Client,String> {
-    reqwest::blocking::Client::builder().https_only(true).no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(25)).build().map_err(|_|"无法建立云端签发连接".into())
+    client_builder().build().map_err(|_|"无法建立云端签发连接".into())
 }
 fn refresh_locked(root:&Path,control:&InternalControl,force:bool)->Result<(),String> {
     refresh_with_client(root,control,force,&client()?)
@@ -127,8 +166,7 @@ fn validate_binding(root:&Path,cfg:&InternalConfig,p:&TaskProgress,b:&super::arc
     if owner!=p.task_id || b.task_id!=p.task_id || b.upload_mode!=cfg.upload_mode || b.upload_url!=cfg.upload_url || b.survey_id!=cfg.upload_survey_id || b.device_id!=cfg.upload_device_id || b.planned_end_ms!=super::archive::end_ms(cfg)? {return Err("预置激活不能改写原任务归属或目的地".into());}
     super::archive::ensure_live(root,&p.task_id,Utc::now().timestamp_millis())
 }
-/// Network-free provisioning. The same function is used by startup, the task
-/// clock and ALL native start entrypoints; no pasted JSON is required.
+/// Existing enrollment is checked without network I/O, including offline resume.
 fn preset_already_prepared(root:&Path,control:&InternalControl)->Result<bool,String> {
     if !root.join(FILE).exists() {return Ok(false);}
     let e=enrollment(root)?;let _gate=control.gate.read();let cfg=control.config.read().clone();let p=control.progress.lock().clone();
@@ -142,6 +180,7 @@ fn preset_already_prepared(root:&Path,control:&InternalControl)->Result<bool,Str
     Ok(e.preset_managed||has_grant)
 }
 pub fn prepare_preset(root:&Path,control:&InternalControl,raw:&str)->Result<(),String> {
+    if control.config.read().participant_name.trim().is_empty() {return Err("请先填写姓名".into());}
     // A renewal may hold cloud_refresh through a network timeout. Already
     // provisioned starts validate immutable state without waiting for that I/O.
     let _single=loop {
@@ -150,6 +189,10 @@ pub fn prepare_preset(root:&Path,control:&InternalControl,raw:&str)->Result<(),S
         std::thread::sleep(Duration::from_millis(10));
     };
     let existing=root.join(FILE).exists();
+    let resolved;
+    let raw=if !existing && serde_json::from_str::<serde_json::Value>(raw).ok().is_some_and(|v|v["format"]=="timelens-cloudflare-discovery-v1") {
+        resolved=discover(raw,&client()?)?;resolved.as_str()
+    } else {raw};
     let mut e=if existing {enrollment(root)?} else if serde_json::from_str::<serde_json::Value>(raw).ok().is_some_and(|v|v["format"]=="timelens-cloudflare-registration-v1") {registration_enrollment(root,raw)?} else {
         let a:Activation=serde_json::from_str(raw).map_err(|_|"安装包预置配置无效，请联系管理员")?;
         if a.format!="timelens-cloudflare-activation-v1" || !is_secret(&a.activation_code) || !super::frame_upload::valid_id(&a.batch_id) || !["device","shared"].contains(&a.scope.as_str()) {return Err("安装包预置批次无效，请联系管理员".into());}
@@ -185,7 +228,7 @@ pub fn refresh(root:&Path,control:&InternalControl,force:bool)->Result<(),String
 }
 pub enum Recovery { Unchanged,Updated,RetryLater }
 fn retryable_renewal(error:&str)->bool {
-    error.contains("连接失败") || error.contains("读取失败") || error.split("HTTP ").nth(1).and_then(|v|v.get(..3)).and_then(|v|v.parse::<u16>().ok()).is_some_and(|v|v==408||v==429||(500..600).contains(&v))
+    error.contains("连接失败") || error.contains("超时") || error.contains("读取失败") || error.split("HTTP ").nth(1).and_then(|v|v.get(..3)).and_then(|v|v.parse::<u16>().ok()).is_some_and(|v|v==408||v==429||(500..600).contains(&v))
 }
 pub fn pending_refresh(root:&Path)->bool {enrollment(root).is_ok_and(|e|e.force_refresh)}
 pub fn refresh_after_rejection(root:&Path,control:&InternalControl,grant:&Grant,error:&str)->Recovery {
@@ -246,16 +289,21 @@ pub fn auto_ready(cfg:&InternalConfig,p:&TaskProgress)->bool {
 pub fn spawn(app:tauri::AppHandle) {
     std::thread::spawn(move|| {
         let mut next_refresh=0i64;let mut failures=0u32;
+        let mut next_prepare=0i64;let mut prepare_failures=0u32;
         loop {
             let Some(state)=app.try_state::<crate::AppState>() else {break;};
             if !state.0.running.load(Ordering::SeqCst) || state.0.exiting.load(Ordering::SeqCst) {break;}
             let cfg=state.0.internal.config.read().clone();
             if cfg.upload_mode=="ossDirect" {
                 if super::preset::employee_mode() && !cfg.participant_name.trim().is_empty() {
+                    if Utc::now().timestamp_millis()<next_prepare {std::thread::sleep(Duration::from_secs(5));continue;}
                     if let Err(error)=super::preset::prepare(&state.0.paths.root,&state.0.internal) {
-                        state.0.internal.cloud_status.lock().last_error=Some(error);
+                        {let mut s=state.0.internal.cloud_status.lock();s.last_error=Some(error);s.last_checked_ms=Utc::now().timestamp_millis();}
+                        prepare_failures=prepare_failures.saturating_add(1);
+                        next_prepare=Utc::now().timestamp_millis()+super::frame_upload::retry_delay_ms(prepare_failures);
                         std::thread::sleep(Duration::from_secs(5));continue;
                     }
+                    prepare_failures=0;next_prepare=0;
                 }
                 if state.0.paths.root.join(FILE).exists() && Utc::now().timestamp_millis()>=next_refresh {
                     let r=refresh(&state.0.paths.root,&state.0.internal,false);
@@ -284,6 +332,43 @@ mod tests {
         assert!(r.status.success());String::from_utf8(r.stdout).unwrap()
     }
     fn preset_raw(batch:&str)->String {serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":"https://issuer.example.com/","activationCode":"a".repeat(64),"batchId":batch,"scope":"device","bucket":"test-bucket","archiveEndAt":"2099-01-01T00:00:00.000Z"}).to_string()}
+    #[test] fn configuration_discovery_validates_origin_and_never_sends_credentials() {
+        use std::{io::Write,net::TcpListener};
+        use rustls::{pki_types::PrivatePkcs8KeyDer,ServerConfig,ServerConnection,StreamOwned};
+        let _=rustls::crypto::ring::default_provider().install_default();
+        for case in ["valid","foreign","extra","bucket","duplicate"] {
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
+            let cert=rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+            let tls=Arc::new(ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()],PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap());
+            let base=format!("https://{addr}/");
+            let raw=serde_json::json!({"format":"timelens-cloudflare-discovery-v1","issuerUrl":base}).to_string();
+            let mut config=serde_json::json!({"format":"timelens-cloudflare-registration-v1","issuerUrl":base,"batchId":"test-batch","scope":"device","bucket":"test-bucket","studyWindowDays":7});
+            match case {"foreign"=>config["issuerUrl"]="https://wrong.example/".into(),"extra"=>config["accessKeySecret"]="must-not-display".into(),"bucket"=>config["bucket"]="bad.bucket".into(),_=>{}}
+            let body=if case=="duplicate" {format!("{{\"bucket\":\"bad-bucket\",{}",&config.to_string()[1..])} else {config.to_string()};
+            let server=std::thread::spawn(move||{
+                let (tcp,_)=listener.accept().unwrap();tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut stream=StreamOwned::new(ServerConnection::new(tls).unwrap(),tcp);let mut bytes=Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {let mut b=[0];stream.read_exact(&mut b).unwrap();bytes.push(b[0]);assert!(bytes.len()<8192);}
+                let header=String::from_utf8(bytes).unwrap().to_ascii_lowercase();assert!(header.starts_with("get /v1/config "));assert!(!header.contains("authorization")&&!header.contains("devicesecret"));
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();stream.flush().unwrap();
+            });
+            let client=client_builder().no_proxy().timeout(Duration::from_secs(5)).add_root_certificate(reqwest::Certificate::from_der(cert.cert.der()).unwrap()).build().unwrap();
+            let result=discover(&raw,&client);assert_eq!(result.is_ok(),case=="valid","{case}");
+            if let Err(error)=result {assert!(!error.contains("must-not-display")&&!error.contains("wrong.example"));}
+            server.join().unwrap();
+        }
+    }
+    #[test] fn automatic_proxy_timeout_preserves_forced_renewal_and_safe_error() {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{let (_tcp,_)=listener.accept().unwrap();std::thread::sleep(Duration::from_millis(200));});
+        let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();c.save_participant_name("cf").unwrap();
+        let e=Enrollment{issuer_url:format!("https://{addr}/"),device_id:oss_direct::device_id(t.path()).unwrap(),device_secret:"c".repeat(64),activation_code:None,expected:Expected{batch_id:"test-batch".into(),scope:"device".into(),bucket:"test-bucket".into(),archive_end_at:"2099-01-01T00:00:00.000Z".into()},force_refresh:true,preset_managed:true,registration_pending:false};
+        super::super::internal::write_json_atomic(&t.path().join(FILE),&e).unwrap();
+        let client=client_builder().no_proxy().timeout(Duration::from_millis(30)).build().unwrap();
+        let error=refresh_with_client(t.path(),&c,true,&client).unwrap_err();assert!(error.contains("超时")&&retryable_renewal(&error));assert!(!error.contains(&e.device_secret)&&!error.contains("127.0.0.1"));
+        assert!(pending_refresh(t.path()));let reopened=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();assert!(pending_refresh(t.path()));assert!(summary(t.path(),&reopened).configured);
+        server.join().unwrap();
+    }
     #[test] fn public_registration_prepares_once_without_a_shared_activation_secret() {
         let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();c.save_participant_name("cf").unwrap();
         let mut raw=serde_json::json!({"format":"timelens-cloudflare-registration-v1","issuerUrl":"https://issuer.example.com/","batchId":"employees","scope":"device","bucket":"test-bucket","studyWindowDays":7});
@@ -313,7 +398,7 @@ mod tests {
     #[test] fn prepared_start_does_not_wait_for_in_flight_network_renewal() {
         let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();c.save_participant_name("测试员工").unwrap();prepare_preset(t.path(),&c,&preset_raw("pilot")).unwrap();
         let network=c.cloud_refresh.lock();let copy=c.clone();let root=t.path().to_owned();let(tx,rx)=std::sync::mpsc::channel();
-        let thread=std::thread::spawn(move||{tx.send(prepare_preset(&root,&copy,&preset_raw("pilot"))).unwrap();});
+        let thread=std::thread::spawn(move||{tx.send(prepare_preset(&root,&copy,&serde_json::json!({"format":"timelens-cloudflare-discovery-v1","issuerUrl":"https://unreachable.example/"}).to_string())).unwrap();});
         assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());drop(network);thread.join().unwrap();
     }
     #[test] fn worker_grants_renew_expired_grants_without_changing_scope_or_capture() {
@@ -343,19 +428,30 @@ mod tests {
             assert!(!t.path().join(FILE).exists()); // Reject before credentials or cloud registration.
         }
     }
-    #[test] fn tls_activation_retries_then_renews_with_the_same_private_device_credential() {tls_bootstrap_round_trip(false);}
-    #[test] fn tls_registration_retries_then_renews_without_an_activation_code() {tls_bootstrap_round_trip(true);}
-    fn tls_bootstrap_round_trip(public:bool) {
+    #[test] fn tls_activation_retries_then_renews_with_the_same_private_device_credential() {tls_bootstrap_round_trip(false,false);}
+    #[test] fn tls_registration_retries_then_renews_without_an_activation_code() {tls_bootstrap_round_trip(true,false);}
+    #[test] fn tls_registration_and_renewal_use_automatic_https_proxy() {
+        // Environment proxy settings are process-global. Isolate this case from
+        // parallel tests; use the production builder rather than an explicit proxy.
+        if std::env::var_os("TIMELENS_PROXY_TEST_CHILD").is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","core::cloud_auth::tests::tls_registration_and_renewal_use_automatic_https_proxy","--nocapture"])
+                .env("TIMELENS_PROXY_TEST_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        tls_bootstrap_round_trip(true,true);
+    }
+    fn tls_bootstrap_round_trip(public:bool,via_proxy:bool) {
         use std::{io::Write,net::TcpListener};
         use rustls::{pki_types::PrivatePkcs8KeyDer,ServerConfig,ServerConnection,StreamOwned};
         let _=rustls::crypto::ring::default_provider().install_default();
-        let cert=rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert=rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(),"issuer.example.com".into()]).unwrap();
         let tls=Arc::new(ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()],PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap());
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
         let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();super::super::internal::fill_test_participant_name(&c);
         let device=oss_direct::device_id(t.path()).unwrap();let raw=grant(&device,"device",0,Utc::now().timestamp_millis()+7*DAY);
         let g:Grant=serde_json::from_str(&raw).unwrap();
-        let e=Enrollment{issuer_url:format!("https://{addr}/"),device_id:device,device_secret:"c".repeat(64),activation_code:Some("d".repeat(64)),expected:Expected{batch_id:g.user_id,scope:"device".into(),bucket:g.bucket,archive_end_at:g.archive_end_at},force_refresh:false,preset_managed:false,registration_pending:false};
+        let e=Enrollment{issuer_url:if via_proxy {"https://issuer.example.com/".into()} else {format!("https://{addr}/")},device_id:device,device_secret:"c".repeat(64),activation_code:Some("d".repeat(64)),expected:Expected{batch_id:g.user_id,scope:"device".into(),bucket:g.bucket,archive_end_at:g.archive_end_at},force_refresh:false,preset_managed:false,registration_pending:false};
         let preset=if public {serde_json::json!({"format":"timelens-cloudflare-registration-v1","issuerUrl":e.issuer_url,"batchId":e.expected.batch_id,"scope":e.expected.scope,"bucket":e.expected.bucket,"studyWindowDays":7})} else {serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":e.issuer_url,"activationCode":e.activation_code,"batchId":e.expected.batch_id,"scope":e.expected.scope,"bucket":e.expected.bucket,"archiveEndAt":e.expected.archive_end_at})};
         let paths=super::super::storage::DataPaths{root:t.path().to_owned(),data_dir:t.path().join("data"),db_path:t.path().join("data/db.sqlite"),shots_dir:t.path().join("data/shots"),exports_dir:t.path().join("exports")};paths.ensure_dirs().unwrap();
         let mut conn=rusqlite::Connection::open(&paths.db_path).unwrap();super::super::storage::migrations::run_migrations(&mut conn).unwrap();
@@ -380,7 +476,29 @@ mod tests {
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",b.len()).unwrap();stream.flush().unwrap();
             }
         });
-        let client=reqwest::blocking::Client::builder().https_only(true).no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).add_root_certificate(reqwest::Certificate::from_der(cert.cert.der()).unwrap()).build().unwrap();
+        let proxy=if via_proxy {
+            let proxy=TcpListener::bind("127.0.0.1:0").unwrap();let proxy_addr=proxy.local_addr().unwrap();proxy.set_nonblocking(true).unwrap();
+            for key in ["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy"] {std::env::set_var(key,format!("http://{proxy_addr}"));}
+            for key in ["NO_PROXY","no_proxy"] {std::env::set_var(key,"127.0.0.1,localhost");}
+            Some(std::thread::spawn(move|| {
+                for _ in 0..5 {
+                    let deadline=std::time::Instant::now()+Duration::from_secs(20);
+                    let (mut browser,_)=loop {match proxy.accept() {Ok(v)=>break v,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{assert!(std::time::Instant::now()<deadline,"HTTPS proxy was not used");std::thread::sleep(Duration::from_millis(10));},Err(e)=>panic!("{e}")}};
+                    // Accepted sockets may inherit O_NONBLOCK on macOS.
+                    browser.set_nonblocking(false).unwrap();
+                    browser.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut header=Vec::new();while !header.ends_with(b"\r\n\r\n") {let mut b=[0];browser.read_exact(&mut b).unwrap();header.push(b[0]);assert!(header.len()<8192);}
+                    let header=String::from_utf8(header).unwrap();assert!(header.starts_with("CONNECT issuer.example.com:443 HTTP/1.1"));assert!(!header.contains("deviceSecret"));
+                    let mut upstream=std::net::TcpStream::connect(addr).unwrap();upstream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    browser.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").unwrap();
+                    let mut input=browser.try_clone().unwrap();let mut output=upstream.try_clone().unwrap();
+                    let forward=std::thread::spawn(move||{let _=std::io::copy(&mut input,&mut output);});
+                    let _=std::io::copy(&mut upstream,&mut browser);let _=browser.shutdown(std::net::Shutdown::Both);let _=upstream.shutdown(std::net::Shutdown::Both);forward.join().unwrap();
+                }
+            }))
+        } else {None};
+        let builder=client_builder().timeout(Duration::from_secs(5)).add_root_certificate(reqwest::Certificate::from_der(cert.cert.der()).unwrap());
+        let client=if via_proxy {builder} else {builder.no_proxy()}.build().unwrap();
         let closed=TcpListener::bind("127.0.0.1:0").unwrap();let closed_addr=closed.local_addr().unwrap();drop(closed);
         let mut offline=enrollment(t.path()).unwrap();offline.issuer_url=format!("https://{closed_addr}/");super::super::internal::write_json_atomic(&t.path().join(FILE),&offline).unwrap();
         assert!(refresh_with_client(t.path(),&c,true,&client).unwrap_err().contains("连接失败"));
@@ -396,6 +514,7 @@ mod tests {
         refresh_with_client(t.path(),&c,false,&client).unwrap(); // Ignores >24h local validity after OSS403.
         assert!(!pending_refresh(t.path()));assert_ne!(old.fingerprint(),oss_direct::load(t.path(),&c.config.read()).unwrap().fingerprint());
         server.join().unwrap();
+        if let Some(proxy)=proxy {proxy.join().unwrap();}
         assert!(oss_direct::load(t.path(),&c.config.read()).is_ok());assert!(!c.tracking.load(Ordering::SeqCst));
         #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(std::fs::metadata(t.path().join(FILE)).unwrap().permissions().mode()&0o077,0);}
         assert!(!serde_json::to_string(&summary(t.path(),&c)).unwrap().contains(&enrollment(t.path()).unwrap().device_secret));
