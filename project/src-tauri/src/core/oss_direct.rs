@@ -19,12 +19,13 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 
-const GRANT_FILE: &str = "oss-upload-grant.json";
+pub(super) const GRANT_FILE: &str = "oss-upload-grant.json";
 const MAX_GRANT: usize = 65536;
 const CONNECTION_ERROR: &str = "OSS上传连接失败；待传图片保留，若已接收但回执丢失需管理员核验";
+const AUTH_RETRY: &str = "云端续期暂不可用；待传图片保留，联网后自动重试";
 static ID_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-fn private_read(path: &Path) -> Result<Vec<u8>, String> {
+pub(super) fn private_read(path: &Path) -> Result<Vec<u8>, String> {
     let m = fs::symlink_metadata(path).map_err(|_| "尚未导入上传授权")?;
     if !m.is_file() || m.file_type().is_symlink() || m.len() > MAX_GRANT as u64 {
         return Err("授权文件类型或大小无效".into());
@@ -405,6 +406,7 @@ pub struct Accepted {
     pub request_id: String,
 }
 pub(super) fn object_key(g: &Grant, f: &Frame) -> Result<String, String> {
+    super::internal::validate_participant_name(&f.participant_name)?;
     uuid::Uuid::parse_str(&f.task_id).map_err(|_| "任务ID无效")?;
     uuid::Uuid::parse_str(&f.id).map_err(|_| "截图ID无效")?;
     let date = Utc
@@ -412,10 +414,8 @@ pub(super) fn object_key(g: &Grant, f: &Frame) -> Result<String, String> {
         .single()
         .ok_or("截图时间无效")?
         .format("%Y/%m/%d");
-    Ok(format!(
-        "{}tasks/{}/{}/{}.webp",
-        g.prefix, f.task_id, date, f.id
-    ))
+    let name = if f.participant_name.is_empty() { String::new() } else { format!("{}/", f.participant_name) };
+    Ok(format!("{}tasks/{}/{name}{}/{}.webp", g.prefix, f.task_id, date, f.id))
 }
 fn multipart(g: &Grant, f: &Frame, bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
     if bytes.is_empty()
@@ -506,7 +506,7 @@ pub fn send(
     send_to(client, &g.endpoint, g, f, bytes)
 }
 fn next(conn: &Connection, task: &str) -> Result<Option<Frame>, String> {
-    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts,q.task_id FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id LEFT JOIN oss_direct_receipts d ON d.snapshot_id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 AND d.snapshot_id IS NULL ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?,task_id:r.get(7)?})).optional().map_err(|e|e.to_string())
+    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts,q.task_id,q.participant_name FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id LEFT JOIN oss_direct_receipts d ON d.snapshot_id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 AND d.snapshot_id IS NULL ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{participant_name:r.get(8)?,id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?,task_id:r.get(7)?})).optional().map_err(|e|e.to_string())
 }
 fn record(conn: &Connection, f: &Frame, r: &Accepted) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -523,16 +523,17 @@ fn record(conn: &Connection, f: &Frame, r: &Accepted) -> Result<(), String> {
 fn record_failure(conn: &Connection, frame: &Frame, error: &str) -> Result<bool, String> {
     let status = error.split("HTTP ").nth(1)
         .and_then(|v| v.get(..3)).and_then(|v| v.parse::<u16>().ok());
-    let blocked = error.contains("校验失败") || error.contains("批准结束") || status == Some(409);
+    let retryable = error == CONNECTION_ERROR || error==AUTH_RETRY || status.is_some_and(|v| v == 408 || v == 429 || (500..600).contains(&v));
+    let blocked = error.contains("校验失败") || error.contains("批准结束") || !retryable;
     conn.execute(
         "UPDATE frame_upload_outbox SET status=?2,attempts=attempts+1,next_retry_ms=?3,last_error=?4 WHERE snapshot_id=?1",
         params![frame.id, if blocked { "blocked" } else { "pending" },
             Utc::now().timestamp_millis()+frame_upload::retry_delay_ms(frame.attempts), error],
     ).map_err(|e| e.to_string())?;
-    let retryable = error == CONNECTION_ERROR || status.is_some_and(|v| v == 408 || v == 429 || (500..600).contains(&v));
     Ok(blocked || !retryable)
 }
 fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, task: String) {
+    let mut attempted_grant=None;
     let result = (|| -> Result<(), String> {
         let client = reqwest::blocking::Client::builder()
             .https_only(true)
@@ -545,6 +546,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
         let conn = frame_upload::db(&state.0.paths)?;
         let mut manifest_tick = std::time::Instant::now() - Duration::from_secs(61);
         let mut manifest_attempts: u32 = 0;
+        let mut refreshed_after_rejection=false;
         while state.0.internal.frame_upload_active.load(Ordering::SeqCst) {
             super::archive::ensure_live(&state.0.paths.root, &task, Utc::now().timestamp_millis())?;
             let progress = state.0.internal.progress.lock().clone();
@@ -553,7 +555,12 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
             if progress.integrity_error.is_some() {
                 return Err("数据完整性待审核，已停止上传".into());
             }
+            if super::cloud_auth::pending_refresh(&state.0.paths.root) {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let grant = load(&state.0.paths.root, &cfg)?; // Expiry stops this run without mutating pending rows.
+            attempted_grant=Some(grant.fingerprint());
             if manifest_tick.elapsed() >= Duration::from_secs(60) {
                 if let Err(error) = super::oss_manifest::publish(
                     &client,
@@ -562,6 +569,14 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                     &state.0.paths.root,
                     &progress,
                 ) {
+                    if error.contains("HTTP 403") && load(&state.0.paths.root,&cfg).is_ok_and(|g|g.fingerprint()!=grant.fingerprint()) {continue;}
+                    if !refreshed_after_rejection {
+                        match super::cloud_auth::refresh_after_rejection(&state.0.paths.root,&state.0.internal,&grant,&error) {
+                            super::cloud_auth::Recovery::Updated=>{refreshed_after_rejection=true;continue;},
+                            super::cloud_auth::Recovery::RetryLater=>{state.0.internal.edit_progress(|p|{p.last_error=Some(AUTH_RETRY.into());Ok(())})?;continue;},
+                            super::cloud_auth::Recovery::Unchanged=>{}
+                        }
+                    }
                     state.0.internal.edit_progress(|p| {
                         p.last_error = Some(error.clone());
                         Ok(())
@@ -584,7 +599,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                 state.0.internal.edit_progress(|p| {
                     if p.last_error
                         .as_ref()
-                        .is_some_and(|e| e.starts_with("清单") && super::oss_manifest::retryable(e))
+                        .is_some_and(|e| e==AUTH_RETRY || e.starts_with("清单") && super::oss_manifest::retryable(e))
                     {
                         p.last_error = None;
                     }
@@ -613,6 +628,15 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                         })?;
                     }
                     Err(error) => {
+                        if !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {break;}
+                        if error.contains("HTTP 403") && load(&state.0.paths.root,&cfg).is_ok_and(|g|g.fingerprint()!=grant.fingerprint()) {continue;}
+                        if !refreshed_after_rejection {
+                            match super::cloud_auth::refresh_after_rejection(&state.0.paths.root,&state.0.internal,&grant,&error) {
+                                super::cloud_auth::Recovery::Updated=>{refreshed_after_rejection=true;continue;},
+                                super::cloud_auth::Recovery::RetryLater=>{record_failure(&conn,&frame,AUTH_RETRY)?;state.0.internal.edit_progress(|p|{p.last_error=Some(AUTH_RETRY.into());Ok(())})?;continue;},
+                                super::cloud_auth::Recovery::Unchanged=>{}
+                            }
+                        }
                         let fatal = record_failure(&conn, &frame, &error)?;
                         state.0.internal.edit_progress(|p| {
                             p.last_error = Some(error.clone());
@@ -643,6 +667,9 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                         }
                         return Err(error);
                     }
+                    if let Some(b)=super::archive::load(&state.0.paths.root)?.filter(|_|grant.manifest_fields.is_some()) {
+                        super::archive::accept_end(&state.0.paths.root,&task,b.effective_end_ms,b.deadline_ms)?;
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -655,6 +682,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
         Ok(())
     })();
     if let Err(error) = result {
+        *state.0.internal.auto_failed_grant.lock()=attempted_grant;
         let _ = state.0.internal.edit_progress(|p| {
             p.last_error = Some(error);
             Ok(())
@@ -683,11 +711,24 @@ pub fn begin(
     app: &tauri::AppHandle,
     expected: &super::desktop::UploadConfirmation,
 ) -> Result<(), String> {
+    begin_inner(app,Some(expected),true)
+}
+/// Automatic runs retain blocked rows and their persisted retry deadlines.
+pub fn begin_auto(app:&tauri::AppHandle)->Result<(),String> { begin_inner(app,None,false) }
+fn begin_inner(app:&tauri::AppHandle,expected:Option<&super::desktop::UploadConfirmation>,reset:bool)->Result<(),String> {
     let state = app.state::<crate::AppState>().inner().clone();
     let _gate = state.0.internal.gate.read();
     let cfg = state.0.internal.config.read().clone();
     let p = state.0.internal.progress.lock().clone();
-    validate_confirmation(&state.0.paths.root, &cfg, &p, expected)?;
+    if let Some(expected)=expected {validate_confirmation(&state.0.paths.root,&cfg,&p,expected)?;}
+    else {
+        if !super::cloud_auth::auto_ready(&cfg,&p) || load(&state.0.paths.root,&cfg).is_err() {return Ok(());}
+        if state.0.internal.auto_failed_grant.lock().as_ref()==Some(&load(&state.0.paths.root,&cfg)?.fingerprint()) {return Ok(());}
+        let conn=frame_upload::db(&state.0.paths)?;
+        let stats=frame_upload::stats(&conn,&p.task_id)?;
+        let needs_end=p.ended_at_ms.is_some() && load(&state.0.paths.root,&cfg)?.manifest_fields.is_some() && !super::archive::load(&state.0.paths.root)?.is_some_and(|b|b.end_synced);
+        if p.status!=TaskStatus::Recording && stats.pending==0 && !needs_end {return Ok(());}
+    }
     if p.receipt.is_some()
         || p.stored_bundle.is_some()
         || p.bundle_path.is_some()
@@ -697,9 +738,10 @@ pub fn begin(
         return Err("数据保存、完整性检查或旧回执需先核对".into());
     }
     super::archive::bind(&state.0.paths, &cfg, &p)?;
+    if reset {*state.0.internal.auto_failed_grant.lock()=None;}
     frame_upload::start_run(&state.0.internal)?;
-    let reset=frame_upload::db(&state.0.paths).and_then(|c|c.execute("UPDATE frame_upload_outbox SET status='pending',next_retry_ms=0,last_error=NULL WHERE task_id=? AND status!='verified' AND snapshot_id NOT IN (SELECT snapshot_id FROM oss_direct_receipts)",[&p.task_id]).map(|_|()).map_err(|e|e.to_string()));
-    if let Err(e) = reset {
+    let reset_result=if reset {frame_upload::db(&state.0.paths).and_then(|c|reset_failed(&c,&p.task_id))}else{Ok(())};
+    if let Err(e) = reset_result {
         frame_upload::finish_run(&state.0.internal);
         return Err(e);
     }
@@ -708,10 +750,27 @@ pub fn begin(
     std::thread::spawn(move || worker(handle, state, cfg, p.task_id));
     Ok(())
 }
+fn reset_failed(c:&Connection,task:&str)->Result<(),String> {
+    c.execute("UPDATE frame_upload_outbox SET status='pending',next_retry_ms=0,last_error=NULL WHERE task_id=? AND status!='verified' AND snapshot_id NOT IN (SELECT snapshot_id FROM oss_direct_receipts)",[task]).map(|_|()).map_err(|e|e.to_string())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_keys_keep_the_task_and_grant_prefix_and_legacy_keys_stable() {
+        let raw = serde_json::json!({"format":"timelens-oss-post-v1","deviceId":"d","userId":"u","bucket":"b","region":"cn-beijing","endpoint":"https://b.oss-cn-beijing.aliyuncs.com/","prefix":"scope/","issuedAt":"","expiresAt":"","archiveEndAt":"","fields":{}});
+        let g: Grant = serde_json::from_value(raw).unwrap();
+        let mut f = Frame {participant_name:String::new(),task_id:uuid::Uuid::new_v4().to_string(),id:uuid::Uuid::new_v4().to_string(),path:String::new(),captured_at_ms:1,display_id:1,sha256:String::new(),size_bytes:12,attempts:0};
+        let old=object_key(&g,&f).unwrap();
+        assert_eq!(old,format!("scope/tasks/{}/1970/01/01/{}.webp",f.task_id,f.id));
+        f.participant_name="张三".into();
+        assert_eq!(object_key(&g,&f).unwrap(),old.replace("/1970/","/张三/1970/"));
+        f.participant_name="../other".into();
+        assert!(object_key(&g,&f).is_err());
+    }
+
     #[test]
     fn fixed_id_survives_restart_and_corruption_never_regenerates() {
         let t = tempfile::tempdir().unwrap();
@@ -748,20 +807,22 @@ mod tests {
     fn transient_errors_retry_but_rejections_and_ambiguous_objects_stop() {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE frame_upload_outbox(snapshot_id TEXT PRIMARY KEY,status TEXT,attempts INTEGER,next_retry_ms INTEGER,last_error TEXT); INSERT INTO frame_upload_outbox VALUES('test-frame','pending',0,0,NULL);").unwrap();
-        let f = Frame { id: "test-frame".into(), task_id: "test-task".into(), path: String::new(),
+        let f = Frame {
+            participant_name: String::new(), id: "test-frame".into(), task_id: "test-task".into(), path: String::new(),
             captured_at_ms: 1, display_id: 0, sha256: String::new(), size_bytes: 12, attempts: 0 };
         for (error, fatal, status) in [
             (CONNECTION_ERROR, false, "pending"),
+            (AUTH_RETRY, false, "pending"),
             ("OSS返回 HTTP 408", false, "pending"),
             ("OSS返回 HTTP 429", false, "pending"),
             ("OSS返回 HTTP 503", false, "pending"),
-            ("OSS返回 HTTP 403", true, "pending"),
-            ("OSS返回 HTTP 302", true, "pending"),
+            ("OSS返回 HTTP 403", true, "blocked"),
+            ("OSS返回 HTTP 302", true, "blocked"),
             ("OSS返回 HTTP 409", true, "blocked"),
             ("OSS回执CRC校验失败，本地图片保留", true, "blocked"),
-            ("OSS回执缺少请求编号，本地图片保留", true, "pending"),
-            ("待传截图缺失", true, "pending"),
-            ("后台上传已停止", true, "pending"),
+            ("OSS回执缺少请求编号，本地图片保留", true, "blocked"),
+            ("待传截图缺失", true, "blocked"),
+            ("后台上传已停止", true, "blocked"),
         ] {
             c.execute("UPDATE frame_upload_outbox SET attempts=0", []).unwrap();
             assert_eq!(record_failure(&c, &f, error).unwrap(), fatal, "{error}");
@@ -826,6 +887,9 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
+            let mut cfg = control.config.read().clone();
+            cfg.participant_name = "测试用户".into();
+            control.save_config(cfg).unwrap();
             let g = grant(&device_id(&p.root).unwrap());
             (t, p, c, control, g)
         }
@@ -920,6 +984,7 @@ mod tests {
             let progress = control.progress.lock().clone();
             super::super::super::archive::bind(&p, &cfg, &progress).unwrap();
             let expected = super::super::super::desktop::UploadConfirmation {
+                participant_name: cfg.participant_name.clone(),
                 upload_mode: "ossDirect".into(),
                 grant_fingerprint: g.fingerprint(),
                 task_id: task,
@@ -1043,6 +1108,7 @@ mod tests {
             .encode(85.)
             .to_vec();
             let mut frame = Frame {
+            participant_name: "测试 用户".into(),
                 task_id: control.progress.lock().task_id.clone(),
                 id: uuid::Uuid::new_v4().to_string(),
                 path: String::new(),
@@ -1062,7 +1128,7 @@ mod tests {
             fs::write(&file, &bytes).unwrap();
             frame.path = file.to_string_lossy().into_owned();
             c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s',?2,?3,?4,'poll')",params![frame.id,frame.path,frame.captured_at_ms,frame.size_bytes as i64]).unwrap();
-            c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,1,?3,?4)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+            c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,participant_name) VALUES(?1,?2,1,?3,?4,?5)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64,frame.participant_name]).unwrap();
             record(&c, &frame, &receipt).unwrap();
             let stats = frame_upload::stats(&c, &frame.task_id).unwrap();
             assert_eq!(
@@ -1078,7 +1144,7 @@ mod tests {
             fs::write(&retry_file, &bytes).unwrap();
             frame.path = retry_file.to_string_lossy().into_owned();
             c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s',?2,?3,?4,'poll')",params![frame.id,frame.path,frame.captured_at_ms,frame.size_bytes as i64]).unwrap();
-            c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,1,?3,?4)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+            c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,participant_name) VALUES(?1,?2,1,?3,?4,?5)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64,frame.participant_name]).unwrap();
             let offline = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let offline_url = format!("https://{}/", offline.local_addr().unwrap());
             drop(offline);
@@ -1121,7 +1187,7 @@ mod tests {
                 assert!(conflict.contains("HTTP 409"));
                 if fault == "disconnect" {
                     c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES(?1,'s',?2,?3,?4,'poll')",params![frame.id,frame.path,frame.captured_at_ms,frame.size_bytes as i64]).unwrap();
-                    c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,1,?3,?4)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64]).unwrap();
+                    c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,participant_name) VALUES(?1,?2,1,?3,?4,?5)",params![frame.id,frame.task_id,frame.sha256,frame.size_bytes as i64,frame.participant_name]).unwrap();
                     assert!(!record_failure(&c, &frame, &error).unwrap());
                     assert!(record_failure(&c, &frame, &conflict).unwrap());
                     let stats = frame_upload::stats(&c, &frame.task_id).unwrap();

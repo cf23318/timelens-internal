@@ -25,3 +25,5 @@ pub mod time_range;
 
 pub mod oss_direct;
 pub mod oss_manifest;
+pub mod cloud_auth;
+pub mod preset;

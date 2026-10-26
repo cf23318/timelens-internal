@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "timelens-oss-issuer",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-10-26",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {"enabled": false},
+  "send_metrics": false,
+  "dependencies_instrumentation": {"enabled": false},
+  "durable_objects": {"bindings": [{"name": "ISSUER", "class_name": "Issuer"}]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["Issuer"]}]
+}

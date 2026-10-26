@@ -81,6 +81,9 @@ fn timelens_uri_response<R: tauri::Runtime>(
     }
 }
 
+/// Safe binary inspection entrypoint used by packaging; never starts Tauri.
+pub fn internal_build_info()->serde_json::Value {core::preset::build_info()}
+
 pub struct AppStateInner {
     pub _data_lock: std::fs::File,
     pub exiting: AtomicBool,
@@ -297,6 +300,7 @@ pub fn run() {
             app.manage(state);
             core::internal::spawn_task_clock(handle.clone());
             core::archive::spawn(handle.clone());
+            core::cloud_auth::spawn(handle.clone());
             #[cfg(desktop)]
             {
                 let language = core::settings::get_language(&handle.state::<AppState>().0.read_conn.lock());
@@ -427,11 +431,15 @@ pub fn run() {
             api::get_internal_progress,
             api::get_internal_overview,
             api::import_oss_upload_grant,
+            api::activate_cloud_issuer,
+            api::set_automatic_upload,
+            api::end_collection_task,
             api::finish_internal_task,
             api::retry_internal_upload,
             api::start_frame_upload,
             api::stop_frame_upload,
             api::start_tracking,
+            api::start_employee_task,
             api::stop_tracking,
             api::is_tracking,
             api::restart_tracking,

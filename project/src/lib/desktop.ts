@@ -33,6 +33,7 @@ export function captureLabel(code: string, english = false): string {
 }
 export function missingLabel(code: string, english = false): string {
   const labels: Record<string, [string, string]> = {
+    participantName: ["姓名（必填）", "Name (required)"],
     profile: ["全新且归属明确的调研数据目录", "Clean, task-owned study profile"],
     archiveEnd: ["批准调研结束时间（含时区）", "Approved study end with timezone"],
     survey: ["调研编号", "Survey ID"], device: ["设备编号", "Device ID"],
@@ -42,7 +43,9 @@ export function missingLabel(code: string, english = false): string {
   };
   return labels[code]?.[english ? 1 : 0] ?? code;
 }
-export function friendlyError(error: string, english = false): string {
+export function friendlyError(error: string, english = false, employee = false): string {
+  if (/姓名/.test(error)) return english ? employee ? "Enter a valid name on the collection task page." : "Enter a valid name in Settings → Administrator before collection or upload." : error;
+  if (employee && /上传准备|尚未配置|凭证|激活|预置|服务器|配置/.test(error)) return english ? "Automatic setup is unavailable. The app keeps checking; contact the administrator if it persists. No upload settings are required." : "自动配置暂时不可用，软件会继续检查；持续异常请联系管理员，无需自行修改上传设置。";
   if (/权限|permission|accessibility|screen capture/i.test(error)) return english ? "Permission check failed. Review system permissions and retry." : "权限未满足，请在“任务与权限”中检查后重试。";
   if (/变化|stale/i.test(error)) return english ? "The task or configuration changed. Review it again before confirming." : "任务或配置已变化，请刷新并重新确认。";
   if (/网络|network|timeout|timed out|connection|dns/i.test(error)) return english ? "Connection failed. Check the server and network, then retry. Local data is retained." : "连接失败，请检查服务器和网络后重试。本地数据会保留。";

@@ -13,12 +13,13 @@ target = out/f'TimeLens-admin-tools-{version}.zip'
 files = sorted((root/'upload-server/timelens_upload').glob('*.py'))
 files += [root/p for p in ('upload-server/pyproject.toml','upload-server/README.md',
           'upload-server/deploy/timelens-direct-admin.plist.example','tools/create-oss-upload-grant.command',
-          'docs/oss-offline-upload.md')]
+          'docs/oss-offline-upload.md','docs/cloudflare-issuer.md')]
 with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as archive:
     for file in files:archive.write(file,file.relative_to(root))
 sha=hashlib.sha256(target.read_bytes()).hexdigest()
 (out/'SHA256SUMS').write_text(f'{sha}  {target.name}\n')
 (out/'BUILD-INFO.json').write_text(json.dumps({'version':version,'sourceCommit':subprocess.check_output(
     ['git','rev-parse','HEAD'],cwd=root,text=True).strip(),'files':[{'name':target.name,'sha256':sha}],
+    'sourceDirty':bool(subprocess.check_output(['git','status','--porcelain'],cwd=root,text=True).strip()),
     'note':'Python source-only administrator tools; install dependencies per docs. No credentials or upload grants.'},indent=2)+'\n')
 print(f'Administrator tools packaged: {target.name}')

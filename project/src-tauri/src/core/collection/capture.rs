@@ -330,7 +330,7 @@ pub fn spawn_capture_thread(
                 let task = control.progress.lock().task_id.clone();
                 let saved = (|| -> Result<(), String> {
                     let draft =
-                        crate::core::frame_upload::UploadDraft::new(&task, &display, &bytes)?;
+                        crate::core::frame_upload::UploadDraft::new(&task, &display, &bytes, &cfg.participant_name)?;
                     crate::core::recovery::stage(&paths, &row, &draft, &bytes)?;
                     writer.send_snapshot_confirmed(row, draft)?;
                     crate::core::recovery::committed(&paths, &id)?;

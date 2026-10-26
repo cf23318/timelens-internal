@@ -1,0 +1,14 @@
+{
+  "name": "timelens-cloudflare-issuer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dev": "wrangler dev --local",
+    "check": "wrangler deploy --dry-run",
+    "test:runtime": "node test/runtime-runner.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.152.0"
+  }
+}

@@ -11,6 +11,7 @@ timelens-oss-grant-web = "timelens_upload.grant_web:main"
 timelens-oss-grant = "timelens_upload.oss_grant:main"
 timelens-archive = "timelens_upload.cli:main"
 timelens-oss-admin = "timelens_upload.direct_admin:main"
+timelens-cloud-issuer = "timelens_upload.cloud_issuer_cli:main"
 
 [project.optional-dependencies]
 test = ["httpx>=0.27,<1", "pytest>=8,<10"]

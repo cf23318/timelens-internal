@@ -117,10 +117,11 @@ pub(super) fn post_to(
     Ok(())
 }
 fn inventory(conn: &Connection, g: &Grant, p: &TaskProgress) -> Result<Vec<Value>, String> {
-    let mut stmt=conn.prepare("SELECT q.snapshot_id,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes FROM frame_upload_outbox q LEFT JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=? ORDER BY q.rowid").map_err(|e|e.to_string())?;
+    let mut stmt=conn.prepare("SELECT q.snapshot_id,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.participant_name FROM frame_upload_outbox q LEFT JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=? ORDER BY q.rowid").map_err(|e|e.to_string())?;
     let rows = stmt
         .query_map([&p.task_id], |r| {
             Ok(Frame {
+                participant_name: r.get(5)?,
                 id: r.get(0)?,
                 captured_at_ms: r.get(1)?,
                 display_id: r.get(2)?,
@@ -254,7 +255,7 @@ mod tests {
     #[test]
     fn inventory_includes_pending_blocked_and_receipt_lost_frames() {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE snapshots(id TEXT,captured_at_ms INTEGER);CREATE TABLE frame_upload_outbox(snapshot_id TEXT,task_id TEXT,display_id INTEGER,sha256 TEXT,size_bytes INTEGER,status TEXT);").unwrap();
+        c.execute_batch("CREATE TABLE snapshots(id TEXT,captured_at_ms INTEGER);CREATE TABLE frame_upload_outbox(snapshot_id TEXT,task_id TEXT,display_id INTEGER,sha256 TEXT,size_bytes INTEGER,status TEXT,participant_name TEXT NOT NULL DEFAULT '');").unwrap();
         // The inventory intentionally reads the entire outbox, never the acceptance receipts.
         let task = uuid::Uuid::new_v4().to_string();
         for status in ["pending", "blocked", "verified"] {
@@ -262,14 +263,19 @@ mod tests {
             c.execute("INSERT INTO snapshots VALUES(?1,1700000000000)", [&id])
                 .unwrap();
             c.execute(
-                "INSERT INTO frame_upload_outbox VALUES(?1,?2,1,?3,3,?4)",
+                "INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,status) VALUES(?1,?2,1,?3,3,?4)",
                 rusqlite::params![id, task, "a".repeat(64), status],
             )
             .unwrap();
         }
         let g:Grant=serde_json::from_value(json!({"format":"timelens-oss-post-v1","deviceId":uuid::Uuid::new_v4().to_string(),"userId":"test","bucket":"test-bucket","region":"cn-beijing","endpoint":"https://test-bucket.oss-cn-beijing.aliyuncs.com/","prefix":"test/","issuedAt":"","expiresAt":"","archiveEndAt":"","fields":{},"manifestFields":{}})).unwrap();
         let p:TaskProgress=serde_json::from_value(json!({"taskId":task,"elapsedMs":0,"targetMs":172800000,"status":"ready","lastError":null,"bundlePath":null})).unwrap();
-        assert_eq!(inventory(&c, &g, &p).unwrap().len(), 3);
+        c.execute("UPDATE frame_upload_outbox SET participant_name=CASE status WHEN 'blocked' THEN '张三' WHEN 'verified' THEN 'John Smith' ELSE '' END", []).unwrap();
+        let mixed = inventory(&c, &g, &p).unwrap();
+        assert_eq!(mixed.len(), 3);
+        assert!(mixed.iter().any(|f| f["objectKey"].as_str().unwrap().contains("/张三/")));
+        assert!(mixed.iter().any(|f| f["objectKey"].as_str().unwrap().contains("/John Smith/")));
+        assert!(mixed.iter().any(|f| f["objectKey"].as_str().unwrap().contains(&format!("/{task}/2023/"))));
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("data")).unwrap();
         let mut posted = Vec::new();
@@ -311,7 +317,7 @@ mod tests {
             c.execute("INSERT INTO snapshots VALUES(?1,1700000000001)", [&id])
                 .unwrap();
             c.execute(
-                "INSERT INTO frame_upload_outbox VALUES(?1,?2,1,?3,3,'pending')",
+                "INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,status) VALUES(?1,?2,1,?3,3,'pending')",
                 rusqlite::params![id, task, "b".repeat(64)],
             )
             .unwrap();
@@ -322,7 +328,7 @@ mod tests {
         c.execute("INSERT INTO snapshots VALUES(?1,1700000000002)", [id])
             .unwrap();
         c.execute(
-            "INSERT INTO frame_upload_outbox VALUES(?1,?2,1,?3,3,'pending')",
+            "INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,status) VALUES(?1,?2,1,?3,3,'pending')",
             rusqlite::params![id, task, "c".repeat(64)],
         )
         .unwrap();
