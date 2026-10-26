@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+.dev.vars*
+.env*
+*.activation.json
+*.private.json

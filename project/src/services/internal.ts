@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface InternalConfig {
+  autoUploadEnabled: boolean;
+  participantName: string;
   captureIntervalSecs: number;
   pollWidth: number;
   pollQuality: number;
@@ -47,6 +49,7 @@ export function remainingTime(p: TaskProgress): string {
 }
 
 export interface UploadConfirmation {
+  participantName: string;
   uploadMode: "receiver" | "ossDirect";
   grantFingerprint: string;
   taskId: string;
@@ -59,6 +62,8 @@ export interface UploadConfirmation {
   archiveEndAt: string;
 }
 export interface InternalOverview {
+  onboarding?: {employeeMode:boolean;activationPending:boolean;configured:boolean};
+  cloudIssuer: {configured:boolean;issuerUrl:string;lastCheckedMs:number;lastError:string|null};
   fixedDeviceId: string;
   ossGrant: {valid:boolean; scope?:"device"|"shared"; userId?:string; deviceId?:string; prefix?:string; endpoint?:string; expiresAt?:string; archiveEndAt?:string; fingerprint?:string; error?:string};
   config: InternalConfig;
@@ -76,3 +81,8 @@ export const startFrameUpload=(confirmation:UploadConfirmation)=>invoke<void>("s
 export const stopFrameUpload=()=>invoke<void>("stop_frame_upload");
 
 export const importOssUploadGrant=(grantJson:string)=>invoke<void>("import_oss_upload_grant",{grantJson});
+export const activateCloudIssuer=(activationJson:string)=>invoke<void>("activate_cloud_issuer",{activationJson});
+export const setAutomaticUpload=(enabled:boolean)=>invoke<void>("set_automatic_upload",{enabled});
+export const endCollectionTask=()=>invoke<void>("end_collection_task");
+export const retryOssQueue=(data:InternalOverview)=>startFrameUpload({participantName:data.config.participantName,uploadMode:data.config.uploadMode,grantFingerprint:data.ossGrant.fingerprint??"",taskId:data.progress.taskId,uploadUrl:data.config.uploadUrl,encryptionRecipient:data.config.encryptionRecipient,domesticServerConfirmed:data.config.domesticServerConfirmed,cleanupOnly:false,surveyId:data.config.uploadSurveyId,deviceId:data.config.uploadDeviceId,archiveEndAt:data.config.archiveEndAt});
+export const startEmployeeTask=(participantName:string)=>invoke<void>("start_employee_task",{participantName});

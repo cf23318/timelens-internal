@@ -205,6 +205,7 @@ pub fn recover(paths: &DataPaths, writer: &WriterHandle, task_id: &str) -> Resul
             sync_dir(parent)?;
         }
         let f = Frame {
+            participant_name: j.upload.participant_name.clone(),
             task_id:j.upload.task_id.clone(),
             id: j.row.id.clone(),
             path: j.row.file_path.clone(),
@@ -323,7 +324,7 @@ mod tests {
             format: "webp".into(),
             perceptual_hash: None,
         };
-        let draft = UploadDraft::new(&task, "display-1", &bytes).unwrap();
+        let draft = UploadDraft::new(&task, "display-1", &bytes, "测试 人员").unwrap();
         (temp, paths, w, row, draft, bytes)
     }
     #[test]
@@ -335,6 +336,7 @@ mod tests {
         assert_eq!(recover(&p, &w, &draft.task_id).unwrap(), 1);
         assert_eq!(recover(&p, &w, &draft.task_id).unwrap(), 0);
         let c = rusqlite::Connection::open(&p.db_path).unwrap();
+        assert_eq!(c.query_row("SELECT participant_name FROM frame_upload_outbox WHERE snapshot_id=?",[&row.id],|r|r.get::<_,String>(0)).unwrap(),draft.participant_name);
         assert_eq!(
             super::super::frame_upload::stats(&c, &draft.task_id)
                 .unwrap()
@@ -407,6 +409,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
+        crate::core::internal::fill_test_participant_name(&c);
         c.start().unwrap();
         draft.task_id = c.progress.lock().task_id.clone();
         stage(&p, &row, &draft, &bytes).unwrap();

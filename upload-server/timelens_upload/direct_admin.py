@@ -97,6 +97,26 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def valid_participant_name(name):
+    return (isinstance(name, str) and name == name.strip() and 0 < len(name) <= 64
+            and len(name.encode('utf-8')) <= 256 and name not in ('.', '..')
+            and not any(c in '/\\' or ord(c) < 32 or 0x7f <= ord(c) <= 0x9f
+                        or 0x200b <= ord(c) <= 0x200f or 0x202a <= ord(c) <= 0x202e
+                        or 0x2060 <= ord(c) <= 0x206f or ord(c) == 0xfeff for c in name))
+
+
+def frame_key_matches(key, prefix, task, day, snapshot):
+    """Accept legacy keys and one literal name segment within the same task scope."""
+    root = f'{prefix}tasks/{task}/'
+    tail = f'{day}/{snapshot}.webp'
+    if key == root + tail:
+        return True
+    if not isinstance(key, str) or not key.startswith(root) or not key.endswith('/' + tail):
+        return False
+    name = key[len(root):-len('/' + tail)]
+    return valid_participant_name(name)
+
+
 class Admin:
     def __init__(self, root):
         self.root = private_dir(root)
@@ -141,6 +161,7 @@ class Admin:
             if deadlines and expiry+GRANT_DRAIN_MS > min(deadlines):
                 raise ValueError('Renewal would outlive an existing task deletion deadline')
             entry['lastGrantExpiresMs'] = max(expiry, (old or {}).get('lastGrantExpiresMs', 0))
+            if (old or {}).get('cloudManaged'): entry['cloudManaged']=True
             devices[device] = entry
             write_private(self.root/'devices.json', devices)
         return entry
@@ -168,6 +189,7 @@ class Admin:
             if deadlines and (now_ms() >= min(deadlines) or expiry+GRANT_DRAIN_MS > min(deadlines)):
                 raise ValueError('Shared renewal would outlive a known task deletion deadline')
             entry['lastGrantExpiresMs'] = max(expiry, (old or {}).get('lastGrantExpiresMs',0))
+            if (old or {}).get('cloudManaged'): entry['cloudManaged']=True
             groups[user] = entry
             # This is the authoritative batch expiry, including devices discovered later.
             write_private(self.root/'shared-groups.json', groups)
@@ -195,6 +217,7 @@ class Admin:
                 old = devices.get(registry_key)
                 if old and any(old[k] != entry[k] for k in ('deviceId','userId','bucket','prefix','plannedEndMs','sharedGroup')):
                     raise ValueError('Shared device registry conflict')
+                if (old or {}).get('cloudActivated'): entry['cloudActivated']=True
                 devices[registry_key] = entry
         write_private(self.root/'devices.json',devices)
         return errors
@@ -293,7 +316,7 @@ class Admin:
                 if not re.fullmatch(r'[0-9a-f]{64}', frame['sha256']) or sid in frames:
                     raise ValueError('Duplicate frame or invalid hash')
                 day = datetime.fromtimestamp(capture/1000, timezone.utc).strftime('%Y/%m/%d')
-                if frame['objectKey'] != f"{device['prefix']}tasks/{task}/{day}/{sid}.webp":
+                if not frame_key_matches(frame['objectKey'], device['prefix'], task, day, sid):
                     raise ValueError('Frame escaped task scope')
                 frames[sid] = frame
         if len(frames) != count or sum(f['sizeBytes'] for f in frames.values()) != index['sizeBytes']:
@@ -301,7 +324,10 @@ class Admin:
         return index, frames, end
 
     def sync(self, bucket):
-        with self.lock(): return self._sync(bucket)
+        with self.lock():
+            from .cloud_ledger import synchronize
+            synchronize(self,bucket.bucket_name)
+            return self._sync(bucket)
 
     def _sync(self, bucket):
         assert_private_bucket(bucket)
@@ -314,7 +340,7 @@ class Admin:
             for key in object_keys(bucket, device['prefix']+'tasks/'):
                 total += 1
                 if total > 1000000: raise ValueError('Device object limit exceeded')
-                match = re.fullmatch(re.escape(device['prefix']+'tasks/')+r'([0-9a-f-]{36})/\d{4}/\d{2}/\d{2}/[0-9a-f-]{36}\.webp',key)
+                match = re.fullmatch(re.escape(device['prefix']+'tasks/')+r'([0-9a-f-]{36})/(?:[^/]+/)?\d{4}/\d{2}/\d{2}/[0-9a-f-]{36}\.webp',key)
                 if not match:
                     # Unknown suffixes still belong to a canonical task, if present.
                     candidate=key.removeprefix(device['prefix']+'tasks/').split('/')[0]
@@ -431,10 +457,15 @@ class Admin:
 
     def retention(self, bucket, execute=False):
         with self.lock():
+            from .cloud_ledger import synchronize
+            synchronize(self,bucket.bucket_name)
             try: sync = self._sync(bucket)
             except Exception as error:
                 # A failed/new inventory must not prevent known expired scopes being swept.
                 sync = {'errors':[{'error':type(error).__name__}]}
+            # _sync may discover an earlier-ended task in this very pass.
+            # Publish its deadline and re-read max expiry before deleting anything.
+            synchronize(self,bucket.bucket_name)
             devices = read_private(self.root/'devices.json', {})
             groups = read_private(self.root/'shared-groups.json', {})
             def grant_expiry(device):

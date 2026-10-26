@@ -54,6 +54,15 @@ pub async fn start_tracking(app: AppHandle, state: State<'_, AppState>) -> Resul
     .await
     .map_err(|e| e.to_string())?
 }
+#[tauri::command]
+pub async fn start_employee_task(app:AppHandle,state:State<'_,AppState>,participant_name:String)->Result<(),String> {
+    let s=state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        if !crate::core::preset::employee_mode() {return Err("此通用诊断包未预置员工配置，请联系管理员获取员工安装包".into());}
+        s.0.internal.save_participant_name(&participant_name)?;
+        crate::core::internal::start_collection(&app,&s)
+    }).await.map_err(|_|"开始任务失败".to_string())?
+}
 
 #[tauri::command]
 pub async fn stop_tracking(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
@@ -163,6 +172,8 @@ pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_j
         Ok(serde_json::json!({
             "fixedDeviceId": crate::core::oss_direct::device_id(&state.0.paths.root)?,
             "ossGrant": grant,
+            "cloudIssuer": crate::core::cloud_auth::summary(&state.0.paths.root,&state.0.internal),
+            "onboarding": crate::core::preset::summary(&state.0.paths.root,&state.0.internal),
             "archive": crate::core::archive::load(&state.0.paths.root)?,
             "config": config, "progress": progress, "snapshots": stats,
             "captureNotice": state.0.internal.capture_notice.lock().clone(),
@@ -175,6 +186,7 @@ pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_j
 
 #[tauri::command]
 pub async fn import_oss_upload_grant(state: State<'_, AppState>, grant_json: String) -> Result<(), String> {
+    if crate::core::preset::employee_mode() {return Err("员工包自动配置，无需手动导入授权".into());}
     let state=state.inner().clone();
     tauri::async_runtime::spawn_blocking(move||crate::core::oss_direct::import(&state.0.paths.root,&state.0.internal,&grant_json)).await.map_err(|_|"授权导入执行失败".to_string())?
 }
@@ -230,8 +242,29 @@ pub async fn start_frame_upload(app:AppHandle, confirmation:crate::core::desktop
 pub async fn stop_frame_upload(state:State<'_,AppState>)->Result<(),String> {
     let state=state.inner().clone();
     tauri::async_runtime::spawn_blocking(move||{
-        crate::core::frame_upload::stop(&state.0.internal);
-    }).await.map_err(|e|e.to_string())
+        crate::core::cloud_auth::set_auto(&state.0.internal,false)
+    }).await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command]
+pub async fn activate_cloud_issuer(state:State<'_,AppState>,activation_json:String)->Result<(),String> {
+    if crate::core::preset::employee_mode() {return Err("员工包自动激活，无需手动配置".into());}
+    let s=state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||crate::core::cloud_auth::activate(&s.0.paths.root,&s.0.internal,&activation_json)).await.map_err(|_|"云端激活执行失败".to_string())?
+}
+#[tauri::command]
+pub async fn set_automatic_upload(state:State<'_,AppState>,enabled:bool)->Result<(),String> {
+    let c=state.0.internal.clone();
+    tauri::async_runtime::spawn_blocking(move||crate::core::cloud_auth::set_auto(&c,enabled)).await.map_err(|_|"上传设置保存失败".to_string())?
+}
+#[tauri::command]
+pub async fn end_collection_task(app:AppHandle,state:State<'_,AppState>)->Result<(),String> {
+    let s=state.inner().clone();
+    // Ending collection must remain available when the network/grant is expired.
+    tauri::async_runtime::spawn_blocking(move||{
+        crate::core::internal::pause_collection(&app,&s,true)?;
+        crate::core::frame_upload::on_task_finished(&app)
+    }).await.map_err(|_|"结束采集失败".to_string())?
 }
 
 #[tauri::command]

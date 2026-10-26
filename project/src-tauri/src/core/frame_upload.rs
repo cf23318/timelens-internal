@@ -16,13 +16,16 @@ pub const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UploadDraft {
+    #[serde(default)]
+    pub participant_name: String,
     pub task_id: String,
     pub display_id: u32,
     pub sha256: String,
     pub size_bytes: u64,
 }
 impl UploadDraft {
-    pub fn new(task_id: &str, display: &str, bytes: &[u8]) -> Result<Self, String> {
+    pub fn new(task_id: &str, display: &str, bytes: &[u8], participant_name: &str) -> Result<Self, String> {
+        super::internal::validate_participant_name(participant_name)?;
         uuid::Uuid::parse_str(task_id).map_err(|_| "任务编号无效")?;
         let display_id = display
             .strip_prefix("display-")
@@ -32,6 +35,7 @@ impl UploadDraft {
             return Err("截图大小超出上传限制".into());
         }
         Ok(Self {
+            participant_name: participant_name.into(),
             task_id: task_id.into(),
             display_id,
             sha256: format!("{:x}", Sha256::digest(bytes)),
@@ -45,6 +49,8 @@ pub fn insert_draft(
     row: &SnapshotRow,
     draft: &UploadDraft,
 ) -> rusqlite::Result<()> {
+    super::internal::validate_participant_name(&draft.participant_name)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
     // INSERT OR IGNORE for recovery must never hide a different snapshot or queue identity.
     let stored: String = conn.query_row("SELECT session_id || char(10) || file_path || char(10) || captured_at_ms || char(10) || file_size_bytes FROM snapshots WHERE id=?", [&row.id], |r|r.get(0))?;
     if stored
@@ -56,8 +62,8 @@ pub fn insert_draft(
     {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    conn.execute("INSERT OR IGNORE INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES(?1,?2,?3,?4,?5)",params![row.id,draft.task_id,draft.display_id,draft.sha256,draft.size_bytes as i64])?;
-    let matches: bool = conn.query_row("SELECT task_id=?2 AND display_id=?3 AND sha256=?4 AND size_bytes=?5 FROM frame_upload_outbox WHERE snapshot_id=?1", params![row.id,draft.task_id,draft.display_id,draft.sha256,draft.size_bytes as i64],|r|r.get(0))?;
+    conn.execute("INSERT OR IGNORE INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes,participant_name) VALUES(?1,?2,?3,?4,?5,?6)",params![row.id,draft.task_id,draft.display_id,draft.sha256,draft.size_bytes as i64,draft.participant_name])?;
+    let matches: bool = conn.query_row("SELECT task_id=?2 AND display_id=?3 AND sha256=?4 AND size_bytes=?5 AND participant_name=?6 FROM frame_upload_outbox WHERE snapshot_id=?1", params![row.id,draft.task_id,draft.display_id,draft.sha256,draft.size_bytes as i64,draft.participant_name],|r|r.get(0))?;
     if !matches {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -75,6 +81,7 @@ pub struct FrameReceipt {
 }
 #[derive(Debug, Clone)]
 pub struct Frame {
+    pub participant_name: String,
     pub task_id: String,
     pub id: String,
     pub path: String,
@@ -294,7 +301,7 @@ pub fn retry_delay_ms(attempts: u32) -> i64 {
 }
 fn next(conn: &Connection, task: &str) -> Result<Option<Frame>, String> {
     use rusqlite::OptionalExtension;
-    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts,q.task_id FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{task_id:r.get(7)?,id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?})).optional().map_err(|e|e.to_string())
+    conn.query_row("SELECT s.id,s.file_path,s.captured_at_ms,q.display_id,q.sha256,q.size_bytes,q.attempts,q.task_id,q.participant_name FROM frame_upload_outbox q JOIN snapshots s ON s.id=q.snapshot_id WHERE q.task_id=?1 AND q.status='pending' AND q.next_retry_ms<=?2 ORDER BY s.captured_at_ms LIMIT 1",params![task,Utc::now().timestamp_millis()],|r|Ok(Frame{participant_name:r.get(8)?,task_id:r.get(7)?,id:r.get(0)?,path:r.get(1)?,captured_at_ms:r.get(2)?,display_id:r.get(3)?,sha256:r.get(4)?,size_bytes:r.get::<_,i64>(5)? as u64,attempts:r.get(6)?})).optional().map_err(|e|e.to_string())
 }
 pub(super) fn bind(conn: &Connection, frame: &Frame, cfg: &InternalConfig) -> Result<(), String> {
     conn.execute("UPDATE frame_upload_outbox SET destination=?2,survey_id=?3,device_id=?4 WHERE snapshot_id=?1 AND destination IS NULL",params![frame.id,cfg.upload_url,cfg.upload_survey_id,cfg.upload_device_id]).map_err(|e|e.to_string())?;
@@ -550,13 +557,56 @@ pub fn begin(
     std::thread::spawn(move || worker(handle, state, cfg, p.task_id));
     Ok(())
 }
-pub fn on_task_finished(_app: &tauri::AppHandle) -> Result<(), String> {
+pub fn on_task_finished(app: &tauri::AppHandle) -> Result<(), String> {
+    let state=app.state::<crate::AppState>().inner().clone();
+    bind_local_retention(&state.0.paths,&state.0.internal)
+}
+/// Ending an already configured task seals LOCAL retention even when its OSS
+/// grant has expired or there are no screenshots. No network/credentials used.
+pub(super) fn bind_local_retention(paths:&DataPaths,control:&super::internal::InternalControl)->Result<(),String> {
+    let _gate=control.gate.read();let cfg=control.config.read().clone();let p=control.progress.lock().clone();
+    if cfg.upload_mode=="ossDirect" && super::desktop::upload_missing(&cfg,true).is_empty() && p.receipt.is_none() && p.stored_bundle.is_none() && p.bundle_path.is_none() {
+        super::archive::bind(paths,&cfg,&p)?;
+        super::archive::shorten(&paths.root,&p)?;
+    }
     Ok(())
-} // Only an explicitly authorized worker may drain the queue.
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_retention_binds_empty_finished_task_without_any_valid_grant() {
+        use std::sync::{Arc,atomic::AtomicBool};
+        let t=tempfile::tempdir().unwrap();let paths=DataPaths{root:t.path().to_owned(),data_dir:t.path().join("data"),db_path:t.path().join("data/db.sqlite"),shots_dir:t.path().join("data/shots"),exports_dir:t.path().join("exports")};paths.ensure_dirs().unwrap();
+        let mut conn=Connection::open(&paths.db_path).unwrap();super::super::storage::migrations::run_migrations(&mut conn).unwrap();
+        let control=super::super::internal::InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();
+        let mut cfg=control.config.read().clone();cfg.participant_name="测试员工".into();cfg.upload_url="https://test-bucket.oss-cn-beijing.aliyuncs.com/".into();cfg.upload_survey_id="pilot".into();cfg.upload_device_id=uuid::Uuid::new_v4().to_string();cfg.domestic_server_confirmed=true;cfg.archive_end_at=(Utc::now()+chrono::Duration::days(7)).to_rfc3339();control.save_config(cfg).unwrap();
+        let task=control.progress.lock().task_id.clone();super::super::archive::initialize_owner(&paths,&conn,&task).unwrap();
+        control.pause(true).unwrap();bind_local_retention(&paths,&control).unwrap();
+        let b=super::super::archive::load(t.path()).unwrap().unwrap();assert_eq!(b.task_id,task);assert!(!b.end_synced);assert_eq!(b.deadline_ms,b.effective_end_ms+super::super::archive::RETENTION_MS);
+    }
+
+    #[test]
+    fn old_drafts_load_empty_and_recovery_cannot_change_frozen_name() {
+        let old = serde_json::json!({"task_id":"task","display_id":1,"sha256":"hash","size_bytes":12});
+        assert_eq!(serde_json::from_value::<UploadDraft>(old).unwrap().participant_name, "");
+        let mut c = Connection::open_in_memory().unwrap();
+        super::super::storage::migrations::run_migrations(&mut c).unwrap();
+        c.execute("INSERT INTO window_sessions(id,app_name,window_title,start_ms,end_ms,duration_ms,is_active) VALUES('s','fixture','synthetic',1,2,1,0)",[]).unwrap();
+        let row = SnapshotRow { id:"shot".into(),session_id:"s".into(),file_path:"synthetic.webp".into(),captured_at_ms:1,file_size_bytes:12,trigger_type:"poll".into(),resolution:None,format:"webp".into(),perceptual_hash:None };
+        c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES('shot','s','synthetic.webp',1,12,'poll')",[]).unwrap();
+        let mut draft = UploadDraft::new(&uuid::Uuid::new_v4().to_string(), "display-1", &[0;12], "张三").unwrap();
+        insert_draft(&c,&row,&draft).unwrap();
+        insert_draft(&c,&row,&draft).unwrap();
+        draft.participant_name="李四".into();
+        assert!(insert_draft(&c,&row,&draft).is_err());
+        draft.participant_name="../invalid".into();
+        assert!(insert_draft(&c,&row,&draft).is_err());
+        assert_eq!(c.query_row("SELECT participant_name FROM frame_upload_outbox",[],|r|r.get::<_,String>(0)).unwrap(),"张三");
+    }
+
     #[test]
     fn stop_does_not_release_worker_lease_until_request_returns() {
         use std::sync::{atomic::AtomicBool, Arc};
@@ -667,6 +717,7 @@ mod tests {
         cfg.upload_device_id = "fixture-device".into();
         cfg.archive_end_at="2099-12-31T17:00:00Z".into();
         let frame = Frame {
+            participant_name: String::new(),
             task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: uuid::Uuid::new_v4().to_string(),
             path: String::new(),
@@ -752,6 +803,7 @@ mod tests {
         c.upload_survey_id = "survey".into();
         c.upload_device_id = "device".into();
         let f = Frame {
+            participant_name: String::new(),
             task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: uuid::Uuid::new_v4().to_string(),
             path: String::new(),
@@ -804,8 +856,9 @@ mod tests {
         let bytes = enc.encode(85.0).to_vec();
         fs::write(&path, &bytes).unwrap();
         let draft =
-            UploadDraft::new(&uuid::Uuid::new_v4().to_string(), "display-1", &bytes).unwrap();
+            UploadDraft::new(&uuid::Uuid::new_v4().to_string(), "display-1", &bytes, "").unwrap();
         let f = Frame {
+            participant_name: String::new(),
             task_id:"11111111-1111-4111-8111-111111111111".into(),
             id: id.clone(),
             path: path.to_string_lossy().into(),

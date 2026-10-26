@@ -390,6 +390,11 @@ CREATE TABLE oss_direct_receipts (
 CREATE INDEX oss_direct_task ON oss_direct_receipts(task_id);
 "#,
     },
+    Migration {
+        version: 11,
+        description: "Freeze participant name with each new frame; legacy keys stay unchanged",
+        sql: "ALTER TABLE frame_upload_outbox ADD COLUMN participant_name TEXT NOT NULL DEFAULT '';",
+    },
 ];
 
 fn current_version(conn: &Connection) -> rusqlite::Result<i32> {
@@ -432,6 +437,21 @@ pub fn run_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn name_migration_keeps_legacy_queue_and_oss_keys() {
+        let mut c = Connection::open_in_memory().unwrap();
+        run_migrations(&mut c).unwrap();
+        c.execute_batch("ALTER TABLE frame_upload_outbox DROP COLUMN participant_name; DELETE FROM schema_migrations WHERE version=11;").unwrap();
+        c.execute("INSERT INTO window_sessions(id,app_name,window_title,start_ms,end_ms,duration_ms,is_active) VALUES('s','fixture','synthetic',1,2,1,0)",[]).unwrap();
+        c.execute("INSERT INTO snapshots(id,session_id,file_path,captured_at_ms,file_size_bytes,trigger_type) VALUES('shot','s','old.webp',1,12,'poll')",[]).unwrap();
+        c.execute("INSERT INTO frame_upload_outbox(snapshot_id,task_id,display_id,sha256,size_bytes) VALUES('shot','task',1,'hash',12)",[]).unwrap();
+        c.execute("INSERT INTO oss_direct_receipts VALUES('shot','task','old/tasks/task/1970/01/01/shot.webp','hash',12,'crc','request',1)",[]).unwrap();
+        run_migrations(&mut c).unwrap();
+        assert_eq!(c.query_row("SELECT participant_name FROM frame_upload_outbox",[],|r|r.get::<_,String>(0)).unwrap(),"");
+        assert_eq!(c.query_row("SELECT object_key FROM oss_direct_receipts",[],|r|r.get::<_,String>(0)).unwrap(),"old/tasks/task/1970/01/01/shot.webp");
+        assert_eq!(c.query_row("PRAGMA quick_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+    }
 
     #[test]
     fn version_eight_images_are_preserved_and_never_auto_enrolled() {
@@ -481,7 +501,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 10);
+        assert_eq!(v, 11);
         let tables: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='daily_analysis'",

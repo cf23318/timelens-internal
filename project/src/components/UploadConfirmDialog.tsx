@@ -17,6 +17,7 @@ export function UploadConfirmDialog({ onClose, background = false }: { onClose: 
   const direct = original.config.uploadMode === "ossDirect";
   const legacy = Boolean(original.progress.receipt || original.progress.storedBundle || original.progress.bundlePath);
   const confirmation: internal.UploadConfirmation = {
+    participantName: original.config.participantName ?? "",
     uploadMode: original.config.uploadMode ?? "receiver", grantFingerprint: direct ? original.ossGrant?.fingerprint ?? "" : "",
     taskId: original.progress.taskId, uploadUrl: original.config.uploadUrl,
     encryptionRecipient: original.config.encryptionRecipient, domesticServerConfirmed: original.config.domesticServerConfirmed,
@@ -35,8 +36,9 @@ export function UploadConfirmDialog({ onClose, background = false }: { onClose: 
     <div className="desktop-dialog-body">
       <p>{background ? text("确认后开始逐张上传队列中的截图，并继续上传本次运行新保存的截图。不会自动开始采集；重启后需要重新确认上传。", "Uploads queued and newly saved frames during this run. Collection does not start automatically; restart requires upload confirmation again.") : text("确认后结束采集，将队列中的原始 WebP 逐张通过 HTTPS 上传。不制作加密包；结束后的任务不能继续采集。", "Ends collection and uploads queued original WebP images over HTTPS, without an encrypted package. An ended task cannot resume collection.")}</p>
       <dl className="desktop-review-list">
+        {direct && <div><dt>{text("当前姓名", "Current name")}</dt><dd>{confirmation.participantName || text("未填写", "Not entered")}<small className="desktop-caption block">{text("已保存截图沿用原姓名目录，旧记录可能没有姓名。", "Saved frames keep their original name folders; legacy records may be unnamed.")}</small></dd></div>}
         <div><dt>{text("任务编号", "Task ID")}</dt><dd className="font-mono text-xs break-all">{confirmation.taskId}</dd></div>
-        <div><dt>{text("数据范围", "Contents")}</dt><dd>{text("新上传队列中的原始截图，以及调研/设备编号、时间、显示器编号、大小和校验值。活动数据库不上传。", "Original queued screenshots and survey/device IDs, timestamps, display IDs, sizes and checksums. The activity database is not uploaded.")}</dd></div>
+        <div><dt>{text("数据范围", "Contents")}</dt><dd>{text("新上传队列中的原始截图、姓名目录，以及调研/设备编号、时间、显示器编号、大小和校验值。活动数据库不上传。", "Original queued screenshots, name folders and survey/device IDs, timestamps, display IDs, sizes and checksums. The activity database is not uploaded.")}</dd></div>
         <div><dt>{text("当前队列", "Current queue")}</dt><dd>{text("待传", "Pending")} {original.uploads.pending} · {text("已确认", "Verified")} {original.uploads.verified} · {direct && <>{text("OSS已接收", "OSS accepted")} {original.uploads.ossAccepted ?? 0} · </>}{text("需处理", "Needs review")} {original.uploads.blocked}</dd></div>
         <div><dt>{text("未加入队列的旧截图", "Legacy images excluded")}</dt><dd>{original.uploads.legacy}</dd></div>
         <div><dt>{text("已保存目的地", "Saved destination")}</dt><dd className="break-all">{confirmation.uploadUrl || text("尚未配置", "Not configured")}</dd></div>

@@ -73,3 +73,7 @@ manifest输出索引，reconcile核对对象数量，verify完整回读复算哈
 ## OSS直传管理工具
 
 不使用接收服务时，运行 `timelens-oss-grant` 签发并登记授权，`timelens-oss-admin` 同步清单、对账、完整回读、恢复和到期清理。步骤、私有台账要求、常驻/授权排空限制和launchd模板见 [离线授权操作](../docs/oss-offline-upload.md)。这套台账与旧接收器台账独立，不自动接管旧任务。
+
+## Cloudflare签发（本地开发，未部署）
+
+新增 `timelens-cloud-issuer` 管理员命令和云签发台账同步。客户端使用设备独立凭据自动续期；管理员须升级并在私有台账配置 `cloud-issuer.json`，云同步失败时禁止删除。完整部署、激活和留存说明见 [Cloudflare签发服务](../docs/cloudflare-issuer.md)。此改动尚未发布安装包或部署到真实Cloudflare，不代表真实OSS已验收。

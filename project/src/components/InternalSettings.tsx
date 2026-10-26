@@ -7,19 +7,20 @@ import { useDesktopText, duration, missingLabel } from "../lib/desktop";
 import * as internal from "../services/internal";
 import * as api from "../services/tauri";
 import { OssUploadSettings } from "./OssUploadSettings";
-import { UploadConfirmDialog } from "./UploadConfirmDialog";
+
 
 const themes: [UiTheme, string][] = [["white", "标准浅色 / Light"], ["tech", "标准深色 / Dark"], ["claude", "Claude"], ["cursor", "Cursor"], ["catppuccin", "Catppuccin"], ["rosepine", "Rosé Pine"], ["gruvbox-light", "Gruvbox Light"], ["raycast", "Raycast"], ["spotify", "Spotify"], ["linear", "Linear"], ["dracula", "Dracula"], ["nord", "Nord"], ["tokyo-night", "Tokyo Night"], ["gruvbox-dark", "Gruvbox Dark"], ["one-dark", "One Dark"], ["sakura", "Sakura"], ["cotton-candy", "Cotton Candy"], ["peach-milk", "Peach Milk"]];
 export function InternalSettings() {
   const { text, english } = useDesktopText();
   const [params, setParams] = useSearchParams();
-  const tabs = [["capture", text("采集", "Capture")], ["privacy", text("隐私", "Privacy")], ["appearance", text("外观与语言", "Appearance & language")], ["admin", text("管理员配置", "Administrator")]];
-  const tab = tabs.some(([key]) => key === params.get("tab")) ? params.get("tab")! : "capture";
   const { data, draft, busy, edit, discard, act, refresh } = useInternalStore();
+  const employee=Boolean(data?.onboarding?.employeeMode);
+  const tabs = [["capture", text("采集", "Capture")], ["privacy", text("隐私", "Privacy")], ["appearance", text("外观与语言", "Appearance & language")], ...(!employee ? [["admin", text("管理员配置", "Administrator")]] : [])];
+  const tab = tabs.some(([key]) => key === params.get("tab")) ? params.get("tab")! : "capture";
   const { theme, setTheme } = useThemeStore();
   const [ocrEnabled, setOcrEnabled] = useState<boolean | null>(null);
   const form = useRef<HTMLFormElement>(null);
-  const [uploadDialog,setUploadDialog]=useState(false);
+
   useEffect(() => {
     let cancelled = false;
     void api.getOcrSettings().then(ocr => { if (!cancelled) setOcrEnabled(ocr.enabled); }).catch(error => { if (!cancelled) useInternalStore.setState({ error: String(error) }); });
@@ -39,7 +40,7 @@ export function InternalSettings() {
   const lines = (list: string[]) => list.map(s => s.trim()).filter(Boolean);
   const save = async () => {
     if (!draft || locked) return;
-    const next = { ...draft, screenshotBlockedApps: lines(draft.screenshotBlockedApps), screenshotBlockedDomains: lines(draft.screenshotBlockedDomains) };
+    const next = { ...draft, participantName: (draft.participantName ?? "").trim(), screenshotBlockedApps: lines(draft.screenshotBlockedApps), screenshotBlockedDomains: lines(draft.screenshotBlockedDomains) };
     const ok = await act(() => internal.saveInternalConfig(next), text("设置已保存", "Settings saved"));
     if (ok) useInternalStore.setState({ draft: null });
   };
@@ -51,7 +52,7 @@ export function InternalSettings() {
     <div className="desktop-settings-tabs" role="tablist" aria-label={text("设置分类", "Settings categories")}>{tabs.map(([key,label]) => <button key={key} id={`tab-${key}`} role="tab" aria-selected={tab===key} aria-controls="settings-panel" className={tab===key ? "is-active" : ""} tabIndex={tab===key ? 0 : -1} onKeyDown={e => { const index=tabs.findIndex(([value]) => value===key); const next=e.key === "ArrowRight" ? (index+1)%tabs.length : e.key === "ArrowLeft" ? (index+tabs.length-1)%tabs.length : e.key === "Home" ? 0 : e.key === "End" ? tabs.length-1 : -1; if (next>=0) { e.preventDefault(); setParams({tab:tabs[next][0]}); window.requestAnimationFrame(() => document.getElementById(`tab-${tabs[next][0]}`)?.focus()); } }} onClick={() => setParams({ tab: key })}>{label}</button>)}</div>
     <form ref={form} className="desktop-settings-form" onSubmit={e => { e.preventDefault(); void save(); }}>
       <div className="desktop-page" id="settings-panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
-        {locked && tab !== "appearance" && <div className="desktop-alert desktop-alert-info">{p.status === "recording" ? text("采集中暂不能修改这些设置。请先点击右上角“暂停采集”。", "Pause collection before editing these settings.") : text("回收已开始或任务已完成，这些设置暂时锁定。", "Recovery has begun or the task is complete. These settings are locked.")}</div>}
+        {locked && tab !== "appearance" && <div className="desktop-alert desktop-alert-info">{p.status === "recording" ? text("采集中暂不能修改这些设置。请先点击右上角“暂停采集”。", "Pause collection before editing these settings.") : text("采集或后台上传进行中，或任务已完成；这些设置暂时锁定。", "Recovery has begun or the task is complete. These settings are locked.")}</div>}
         {tab === "capture" && <>
           <div className="desktop-settings-intro"><h2>{text("采集设置", "Capture settings")}</h2><p>{text("调整采样频率与画质。修改后点击底部“保存全部修改”。", "Adjust sampling and image quality, then save all changes below.")}</p></div>
           <fieldset disabled={locked} className="desktop-card desktop-fieldset"><legend className="sr-only">{text("截图参数", "Screenshot parameters")}</legend><h3>{text("截图与显示器", "Screenshots and displays")}</h3>
@@ -93,11 +94,11 @@ export function InternalSettings() {
           <section className="desktop-card"><h3>{text("上传凭证", "Upload credential")}</h3><p className="desktop-muted mt-2">{data.uploadMissing.includes("credential") ? text("尚未检测到有效配置。请管理员在运行环境或当前用户的 upload-token 文件中配置上传凭证。", "No credential configuration detected. Ask the administrator to configure the runtime credential or per-user upload-token file.") : text("已检测到非空上传凭证，未进行在线有效性验证。", "A non-empty credential was detected. Its validity has not been verified online.")}</p><p className="desktop-caption mt-3">{text("凭证不会在界面显示，也不会写入截图或回执。", "The credential is neither displayed nor included in screenshots or receipts.")}</p></section>
           <div className="desktop-alert desktop-alert-info">{text("逐张上传原始 WebP，通过 HTTPS 传输，不制作加密包。首次确认上传时绑定本任务的到期删除；实际结束与批准结束取较早者，再加30天作为最晚删除截止。本机、OSS及受管恢复副本均须按期清理。保存配置本身不上传、不删除。", "Original WebP files are sent over HTTPS without an encrypted package. Upload confirmation binds this task to deletion no later than 30 days after the earlier actual/approved end. Local records, OSS and managed restores share that deadline. Saving alone neither uploads nor deletes.")}</div>
           */}
-          <section className="desktop-card"><h3>{text("上传队列", "Upload queue")}</h3><p className="desktop-muted mt-3">{text("待上传", "Pending")} {data.uploads.pending} · {text("已确认", "Verified")} {data.uploads.verified} · {text("OSS已接收", "OSS accepted")} {data.uploads.ossAccepted ?? 0} · {text("需处理", "Needs review")} {data.uploads.blocked}</p><p className="desktop-caption mt-2">{text("旧截图未加入新队列", "Legacy screenshots excluded")}：{data.uploads.legacy}</p>{data.uploads.lastError && <p role="status" className="desktop-caption mt-2">{data.uploads.lastError}</p>}<div className="mt-4">{data.uploadActive ? <button type="button" className="desktop-button" disabled={busy} onClick={()=>void act(internal.stopFrameUpload,text("已请求停止后台上传，正在进行的请求可能仍返回回执", "Upload stop requested; an in-flight request may still complete"))}>{text("停止后台上传", "Stop background upload")}</button> : <button type="button" className="desktop-button desktop-button-primary" disabled={config.uploadMode !== "ossDirect" || archiveExpired || busy || Boolean(draft) || data.uploadMissing.length>0 || Boolean(p.receipt || p.storedBundle || p.bundlePath)} onClick={()=>setUploadDialog(true)}>{text("确认并启用本次后台上传", "Review and enable upload for this run")}</button>}</div><p className="desktop-caption mt-3">{text("重启后上传默认关闭；停止上传不会改变采集状态。", "Upload is off after restart. Stopping upload does not change collection state.")}</p></section>
+          <section className="desktop-card"><h3>{text("上传队列", "Upload queue")}</h3><p className="desktop-caption mt-2">{data.uploadActive ? text("正在后台上传", "Background upload is running") : (data.config.autoUploadEnabled ?? true) ? text("自动上传已开启，等待配置或待传数据", "Automatic upload is enabled; waiting for setup or queued data") : text("自动上传已关闭", "Automatic upload is off")}</p><p className="desktop-muted mt-3">{text("待上传", "Pending")} {data.uploads.pending} · {text("已确认", "Verified")} {data.uploads.verified} · {text("OSS已接收", "OSS accepted")} {data.uploads.ossAccepted ?? 0} · {text("需处理", "Needs review")} {data.uploads.blocked}</p><p className="desktop-caption mt-2">{text("旧截图未加入新队列", "Legacy screenshots excluded")}：{data.uploads.legacy}</p>{data.uploads.lastError && <p role="status" className="desktop-caption mt-2">{data.uploads.lastError}</p>}<div className="mt-4">{(data.config.autoUploadEnabled ?? true) ? <button type="button" className="desktop-button" disabled={busy} onClick={()=>void act(internal.stopFrameUpload,text("已请求停止后台上传，正在进行的请求可能仍返回回执", "Upload stop requested; an in-flight request may still complete"))}>{text("停止自动上传", "Stop automatic upload")}</button> : <button type="button" className="desktop-button desktop-button-primary" disabled={config.uploadMode !== "ossDirect" || archiveExpired || busy || Boolean(draft) || data.uploadMissing.length>0 || Boolean(p.receipt || p.storedBundle || p.bundlePath)} onClick={()=>void act(()=>internal.setAutomaticUpload(true),text("自动上传已开启", "Automatic upload enabled"))}>{text("开启自动上传", "Enable automatic upload")}</button>}</div>{data.uploads.blocked > 0 && <button type="button" className="desktop-button mt-3" disabled={busy || data.uploadActive || Boolean(draft) || data.uploadMissing.length>0} onClick={()=>void act(()=>internal.retryOssQueue(data),text("已请求重试需处理截图", "Review-required frames queued for retry"))}>{text("重试需处理截图", "Retry frames needing review")}</button>}<p className="desktop-caption mt-3">{text("上传默认开启；配置就绪后自动发送，无需确认。停止选择会保存，停止上传不会改变采集状态。", "Upload is on by default and starts when ready without confirmation. Stop is remembered and does not change collection state.")}</p></section>
         </>}
       </div>
       {draft && <div className="desktop-savebar" role="status"><div><strong>{text("有未保存的修改", "Unsaved changes")}</strong><p>{text("保存后才会应用到采集与上传。", "Collection and upload use saved settings.")}</p></div><div className="flex gap-2"><button type="button" className="desktop-button" disabled={busy} onClick={discard}>{text("放弃修改", "Discard changes")}</button><button type="submit" className="desktop-button desktop-button-primary" disabled={locked}>{busy ? text("保存中…", "Saving…") : text("保存全部修改", "Save all changes")}</button></div></div>}
     </form>
-    {uploadDialog && <UploadConfirmDialog background onClose={()=>setUploadDialog(false)}/>}
+
   </div>;
 }

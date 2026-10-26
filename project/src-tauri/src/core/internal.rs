@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct InternalConfig {
+    pub auto_upload_enabled: bool,
+    pub participant_name: String,
     pub capture_interval_secs: u64,
     pub poll_width: u32,
     pub poll_quality: f32,
@@ -35,6 +37,8 @@ pub struct InternalConfig {
 impl Default for InternalConfig {
     fn default() -> Self {
         Self {
+            auto_upload_enabled: true,
+            participant_name: String::new(),
             capture_interval_secs: 12,
             poll_width: 1600,
             poll_quality: 85.0,
@@ -90,7 +94,15 @@ impl Default for InternalConfig {
 }
 
 impl InternalConfig {
+    pub fn require_participant_name(&self) -> Result<(), String> {
+        validate_participant_name(&self.participant_name)?;
+        if self.upload_mode == "ossDirect" && self.participant_name.is_empty() {
+            return Err("请先填写姓名".into());
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
+        validate_participant_name(&self.participant_name)?;
         if !["receiver", "ossDirect"].contains(&self.upload_mode.as_str()) { return Err("上传模式无效".into()); }
         if !(10..=15).contains(&self.capture_interval_secs) {
             return Err("截图间隔必须为 10–15 秒".into());
@@ -177,6 +189,19 @@ impl InternalConfig {
     }
 }
 
+/// A display name becomes one literal OSS path segment, never an identifier or a grant scope.
+/// Empty is accepted only for old profiles/queue records; actions enforce the required field.
+pub fn validate_participant_name(name: &str) -> Result<(), String> {
+    if name != name.trim() || name.chars().count() > 64 || name.len() > 256
+        || matches!(name, "." | "..")
+        || name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\')
+            || matches!(c as u32, 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f | 0xfeff))
+    {
+        return Err("姓名须为1至64个字符，不能包含路径分隔符、控制字符或隐藏方向字符".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskStatus {
@@ -232,9 +257,12 @@ pub struct InternalControl {
     /// Authorization is deliberately runtime-only: restart never sends old data.
     pub frame_upload_active: AtomicBool,
     pub frame_upload_running: AtomicBool,
+    pub cloud_refresh: Mutex<()>,
+    pub cloud_status: Mutex<super::cloud_auth::CloudStatus>,
+    pub auto_failed_grant: Mutex<Option<String>>,
     pub progress: Mutex<TaskProgress>,
     pub capture_notice: Mutex<super::desktop::CaptureNotice>,
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 
 pub struct NativeJob<'a>(&'a InternalControl);
@@ -278,16 +306,21 @@ pub fn deny_personal_action() -> Result<(), String> {
 pub fn start_collection(app: &tauri::AppHandle, state: &crate::AppState) -> Result<(), String> {
     use tauri::Emitter;
     state.0.writer.check_health()?;
-    if !super::acquisition::screen_capture_granted() || !super::acquisition::ax_trusted() {
-        return Err("请先授予屏幕录制与辅助功能权限，然后再开始采集".into());
-    }
-    state.0.screen_ok.store(true, Ordering::SeqCst);
-    state.0.internal.start()?;
+    let screen=super::acquisition::screen_capture_granted();
+    state.0.screen_ok.store(screen, Ordering::SeqCst);
+    start_local_policy(&state.0.paths,&state.0.internal,screen&&super::acquisition::ax_trusted(),super::preset::activation_raw())?;
     let _ = app.emit(
         "tracking_state_changed",
         serde_json::json!({"isRunning": true}),
     );
     Ok(())
+}
+/// The local policy is separate from native OS checks so its complete state
+/// transition can be verified with synthetic permissions and no screen capture.
+pub(super) fn start_local_policy(paths:&super::storage::DataPaths,control:&InternalControl,permissions_ready:bool,preset:Option<&str>)->Result<(),String> {
+    if !permissions_ready {return Err("请先授予屏幕录制与辅助功能权限，然后再开始采集".into());}
+    if let Some(raw)=preset {super::cloud_auth::prepare_preset(&paths.root,control,raw)?;super::frame_upload::bind_local_retention(paths,control)?;}
+    control.start()
 }
 
 pub fn allow_webview_navigation(url: &reqwest::Url) -> bool {
@@ -501,13 +534,18 @@ impl InternalControl {
             tracking,
             frame_upload_active: AtomicBool::new(false),
             frame_upload_running: AtomicBool::new(false),
+            cloud_refresh: Mutex::new(()),
+            cloud_status: Mutex::new(super::cloud_auth::CloudStatus::default()),
+            auto_failed_grant: Mutex::new(None),
             progress: Mutex::new(progress),
             capture_notice: Mutex::new(super::desktop::CaptureNotice::default()),
             root: root.to_owned(),
         }))
     }
 
-    pub fn save_config(&self, config: InternalConfig) -> Result<(), String> {
+    pub fn save_config(&self, mut config: InternalConfig) -> Result<(), String> {
+        config.participant_name = config.participant_name.trim().to_string();
+        config.require_participant_name()?;
         config.validate()?;
         let _guard = self.gate.write();
         if let Some(b)=super::archive::load(&self.root)? { if b.upload_mode!=config.upload_mode || b.upload_url!=config.upload_url || b.survey_id!=config.upload_survey_id || b.device_id!=config.upload_device_id || b.planned_end_ms!=super::archive::end_ms(&config)? { return Err("归档已绑定，不能修改目的地或结束时间".into()); } }
@@ -536,9 +574,23 @@ impl InternalControl {
         Ok(())
     }
 
+    /// Name-only onboarding never sends a stale full config back from the UI.
+    pub fn save_participant_name(&self,name:&str)->Result<(),String> {
+        let name=name.trim();validate_participant_name(name)?;
+        if name.is_empty() {return Err("请填写姓名".into());}
+        let _guard=self.gate.write();let mut cfg=self.config.read().clone();
+        if cfg.participant_name==name {return Ok(());}
+        let p=self.progress.lock();
+        if self.frame_upload_running.load(Ordering::SeqCst) || matches!(p.status,TaskStatus::Recording|TaskStatus::Uploading|TaskStatus::Uploaded) || p.receipt.is_some() || p.stored_bundle.is_some() || p.bundle_path.is_some() {return Err("任务进行中不能修改姓名，请先联系管理员".into());}
+        cfg.participant_name=name.into();cfg.validate()?;
+        write_json_atomic(&self.root.join("internal-config.json"),&cfg)?;
+        *self.config.write()=cfg;Ok(())
+    }
+
     pub fn start(&self) -> Result<(), String> {
         let _transition = self.transition.lock();
         let _guard = self.gate.write();
+        self.config.read().require_participant_name()?;
         let mut p = self.progress.lock();
         if let Some(ref e) = p.integrity_error {
             return Err(e.clone());
@@ -687,6 +739,15 @@ impl InternalControl {
 }
 
 #[cfg(test)]
+pub(crate) fn fill_test_participant_name(control: &InternalControl) {
+    let mut cfg = control.config.read().clone();
+    if cfg.participant_name.is_empty() {
+        cfg.participant_name = "测试用户".into();
+        control.save_config(cfg).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -702,6 +763,42 @@ mod tests {
             if let Some(bytes) = previous { fs::write(&path, bytes).unwrap(); }
         }
     }
+
+    #[test]
+    fn name_is_empty_on_upgrade_but_required_before_direct_actions() {
+        let d = tempfile::tempdir().unwrap();
+        let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(c.config.read().participant_name, "");
+        let blank = c.config.read().clone();
+        assert!(c.save_config(blank).unwrap_err().contains("姓名"));
+        assert!(c.start().unwrap_err().contains("姓名"));
+        assert!(!c.tracking.load(Ordering::SeqCst));
+        let mut cfg = c.config.read().clone();
+        cfg.participant_name = "  张三  ".into();
+        c.save_config(cfg).unwrap();
+        assert_eq!(c.config.read().participant_name, "张三");
+        fill_test_participant_name(&c);
+        c.start().unwrap();
+        c.pause(false).unwrap();
+        assert_eq!(InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap().config.read().participant_name, "张三");
+        let old = serde_json::json!({"uploadMode":"ossDirect"});
+        let cfg: InternalConfig = serde_json::from_value(old).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.require_participant_name().is_err());
+    }
+
+    #[test]
+    fn participant_names_reject_unsafe_or_oversized_segments() {
+        for name in ["", "张三", "John Smith", "O’Neil", "张三 · A"] {
+            validate_participant_name(name).unwrap();
+        }
+        validate_participant_name(&"A".repeat(64)).unwrap();
+        for name in [".", "..", "../x", "a/b", "a\\b", " 张三", "张三 ", "a\nb", "\u{202e}张三", "\u{200b}张三"] {
+            assert!(validate_participant_name(name).is_err(), "{name:?}");
+        }
+        assert!(validate_participant_name(&"A".repeat(65)).is_err());
+    }
+
     #[test]
     fn configuration_writes_cannot_race_bundle_or_cleanup() {
         let d = tempfile::tempdir().unwrap();
@@ -727,6 +824,7 @@ mod tests {
     fn pause_cancels_new_native_jobs_and_waits_for_existing_job_cleanup() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         let epoch = c.epoch.load(Ordering::SeqCst);
         let job = c.begin_native(epoch).unwrap();
@@ -832,6 +930,7 @@ mod tests {
     fn clean_pause_before_first_tick_still_freezes_the_started_target() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         c.pause(false).unwrap();
         c.edit_progress(|p| {p.needs_flush = false; Ok(())}).unwrap();
@@ -847,6 +946,7 @@ mod tests {
     fn forty_eight_hour_boundary_stops_once_and_does_not_count_sleep_or_pause() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         c.edit_progress(|p| {p.elapsed_ms = p.target_ms - 1000; Ok(())}).unwrap();
         assert!(!c.advance(60_000).unwrap());
@@ -892,6 +992,7 @@ mod tests {
     fn clean_pause_can_resume_after_restart_but_unclean_task_stays_blocked() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         c.pause(false).unwrap();
         // The application clears this only after aggregation and writer barriers acknowledge.
@@ -901,6 +1002,7 @@ mod tests {
         })
         .unwrap();
         let restored = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&restored);
         restored.start().unwrap();
         let unclean = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(unclean.progress.lock().integrity_error.is_some());
@@ -934,6 +1036,7 @@ mod tests {
     fn deadline_stays_terminal_when_progress_save_fails() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         c.progress.lock().target_ms = 1000;
         let restore_target = block_write_target(&d.path().join("internal-task.json"));
@@ -947,6 +1050,7 @@ mod tests {
     fn active_capture_does_not_block_nonterminal_clock_progress() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         let _active_capture = c.active(c.epoch.load(Ordering::SeqCst)).unwrap();
         assert!(!c.advance(1000).unwrap());
@@ -956,6 +1060,7 @@ mod tests {
     fn duration_survives_restart_without_resuming() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         c.advance(2_000).unwrap();
         c.advance(60_000).unwrap();
@@ -969,6 +1074,7 @@ mod tests {
     fn deadline_blocks_resume_and_invalidates_pending_capture() {
         let d = tempfile::tempdir().unwrap();
         let c = InternalControl::load(d.path(), Arc::new(AtomicBool::new(false))).unwrap();
+        fill_test_participant_name(&c);
         c.start().unwrap();
         let epoch = c.epoch.load(Ordering::SeqCst);
         c.progress.lock().target_ms = 1_000;

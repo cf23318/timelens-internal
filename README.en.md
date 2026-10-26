@@ -1,12 +1,14 @@
 # TimeLens Internal
 
+Employee onboarding: grant system access → enter a name → start. A name is self-declared; anyone with the app can register. The public CI package contains service settings only, without activation credentials or OSS secrets. Devices keep independent private credentials and automatically request and renew upload grants. No employee-side upload setup is required.
+
 An internal desktop adaptation of [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5 (f8e7107), under the [MIT license](LICENSE). Current source test version: **0.17.10**; check Releases for published installers. See the [Chinese README](README.md) for full configuration and acceptance details.
 
 - Chinese and light appearance by default; collection starts manually. Pause/resume is available, and restarting leaves collection paused.
 - Periodic WebP screenshots (12-second default attempt interval), foreground-window events, local timeline and replay. Replay works with OCR disabled; optional OCR runs locally. This is sampled screenshots, not continuous video.
 - New tasks default to 48 accumulated local collection hours. The foreground display is captured by default; all displays are optional. Windows input counters are not implemented.
 - Foreground privacy rules block listed apps, sensitive titles and banking domains. Unreadable browser addresses block screenshots. Background content may still appear; there is no pixel masking. New titles are redacted; old records are not rewritten automatically.
-- Upload is off until configured and explicitly confirmed. New profiles use direct OSS uploads with imported grants valid for up to seven days; the administrator UI only exposes OSS. Shared grants group uploads by device but do not isolate cloud write permissions between devices in the batch. Each original WebP and required metadata is uploaded; the activity database stays local. Legacy receiver tasks remain supported. No new age archive is created. Explicitly enrolled tasks expire within 30 days after the earlier known actual/approved end; legacy profiles are not adopted. Restarting disables image upload again. Direct OSS reconciliation, readback and expiry deletion require the dedicated administrator tools and an online management machine.
+- OSS upload is enabled by default when setup is ready; stopping it is persisted. Collection still starts manually. Cloudflare self-registration/renewal and administrator ledger synchronization are described in [the issuer guide](docs/cloudflare-issuer.md). New profiles register automatically and use direct OSS grants valid for up to seven days; the administrator UI only exposes OSS. Shared grants group uploads by device but do not isolate cloud write permissions between devices in the batch. Each original WebP and required metadata is uploaded; the activity database stays local. Legacy receiver tasks remain supported. No new age archive is created. Explicitly enrolled tasks expire within 30 days after the earlier known actual/approved end; legacy profiles are not adopted. Restarting preserves the automatic-upload preference. Direct OSS reconciliation, readback and expiry deletion require the dedicated administrator tools and an online management machine.
 - Version 0.17.10 unifies task and toolbar receipt status and retries connection failures and HTTP 408/429/5xx with persisted backoff. OSS acceptance remains distinct from administrator reconciliation; ambiguous 409 responses are never treated as successful uploads. Capture quality and collection rules are unchanged.
 - External AI and online updates are disabled. Upstream AI reports and upstream download links do not describe this internal build. Example endpoints do not prove deployment.
 
@@ -40,7 +42,7 @@ New task enrollment uses the v2 receiver protocol. Receipts, OSS listings and pa
 
 ## Offline device grants and direct OSS upload
 
-The local adaptation also supports a persistent per-profile device ID, a Mac offline grant generator and device-scoped POST V4 uploads to Beijing OSS. See [the offline-grant guide](docs/oss-offline-upload.md). Importing does not start capture or upload. The administrator Secret stays off employee clients.
+The local adaptation also supports a persistent per-profile device ID, a Mac offline grant generator and device-scoped POST V4 uploads to Beijing OSS. See [the offline-grant guide](docs/oss-offline-upload.md). Importing does not start capture; pending images upload when automatic upload is enabled and configuration is ready. The administrator Secret stays off employee clients.
 
 “OSS accepted” means POST response and CRC validation, distinct from receiver inventory reconciliation/readback. Direct objects use a separate administrator registry and retention worker. Local task retention still applies; keep the dedicated administrator process online for cloud and managed-copy deletion.
 

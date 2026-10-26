@@ -11,6 +11,7 @@ interface InternalState {
   message: string;
   busy: boolean;
   draft: internal.InternalConfig | null;
+  participantDraft:string|null;
   refresh: () => Promise<void>;
   act: (action: () => Promise<unknown>, message: string) => Promise<boolean>;
   edit: (patch: Partial<internal.InternalConfig>) => void;
@@ -20,7 +21,7 @@ let inFlight: Promise<void> | null = null;
 let progressRevision = 0;
 let captureRevision = 0;
 export const useInternalStore = create<InternalState>((set, get) => ({
-  data: null, error: "", loadError: "", message: "", busy: false, draft: null,
+  data: null, error: "", loadError: "", message: "", busy: false, draft: null, participantDraft:null,
   refresh: () => {
     if (inFlight) return inFlight;
     const revision = progressRevision;

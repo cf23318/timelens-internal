@@ -454,6 +454,7 @@ mod tests {
         initialize_owner(&p, &c, &task).unwrap();
         assert!(!owner_matches(&p, &task));
         assert!(bind(&p, &config(), &control.progress.lock()).is_err());
+        crate::core::internal::fill_test_participant_name(&control);
         assert!(control.start().is_ok());
         assert_eq!(control.progress.lock().target_ms, 48 * 3_600_000);
         assert!(!control.config.read().all_displays);

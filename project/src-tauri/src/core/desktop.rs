@@ -37,6 +37,8 @@ pub fn snapshot_stats(conn: &Connection) -> Result<SnapshotStats, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UploadConfirmation {
+    #[serde(default)]
+    pub participant_name: String,
     #[serde(default="receiver_mode")]
     pub upload_mode: String,
     #[serde(default)]
@@ -58,6 +60,9 @@ fn receiver_mode()->String { "receiver".into() }
 
 pub fn upload_missing(config: &InternalConfig, token_present: bool) -> Vec<&'static str> {
     let mut missing = Vec::new();
+    if config.upload_mode == "ossDirect" && config.participant_name.trim().is_empty() {
+        missing.push("participantName");
+    }
     if config.upload_url.is_empty() {
         missing.push("server");
     }
@@ -91,6 +96,7 @@ pub fn validate_confirmation(
         return Ok(());
     }
     if expected.upload_mode != config.upload_mode || expected.upload_url != config.upload_url
+        || expected.participant_name != config.participant_name
         || expected.encryption_recipient != config.encryption_recipient
         || expected.domestic_server_confirmed != config.domestic_server_confirmed
         || expected.survey_id != config.upload_survey_id
@@ -100,6 +106,7 @@ pub fn validate_confirmation(
         return Err("上传配置已变化，请重新查看目的地并确认".into());
     }
     config.validate()?;
+    config.require_participant_name()?;
     if !upload_missing(config, token_present).is_empty() {
         return Err("上传准备尚未完成，请先检查管理员配置；采集数据仍保留在本机".into());
     }
@@ -113,6 +120,16 @@ pub fn token_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_upload_requires_a_name_even_without_the_settings_form() {
+        let mut cfg = InternalConfig::default();
+        cfg.upload_mode = "ossDirect".into();
+        assert!(upload_missing(&cfg, false).contains(&"participantName"));
+        assert!(cfg.require_participant_name().is_err());
+        cfg.participant_name = "张三".into();
+        assert!(!upload_missing(&cfg, false).contains(&"participantName"));
+        assert!(cfg.require_participant_name().is_ok());
+    }
     use crate::core::{internal::InternalControl, storage::migrations::run_migrations};
     use std::sync::{atomic::AtomicBool, Arc};
 
@@ -145,6 +162,7 @@ mod tests {
         config.upload_device_id = "device".into();
         config.archive_end_at="2026-10-31T17:00:00Z".into();
         let expected = UploadConfirmation {
+            participant_name: config.participant_name.clone(),
             upload_mode: "receiver".into(), grant_fingerprint: String::new(),
             task_id: progress.task_id.clone(),
             upload_url: config.upload_url.clone(),
@@ -156,6 +174,8 @@ mod tests {
             archive_end_at:config.archive_end_at.clone(),
         };
         assert!(validate_confirmation(&expected, &config, &progress, true).is_ok());
+        let mut renamed = config.clone(); renamed.participant_name="改名".into();
+        assert!(validate_confirmation(&expected,&renamed,&progress,true).unwrap_err().contains("变化"));
         assert!(validate_confirmation(&expected, &config, &progress, false).is_err());
         let mut changed = expected.clone();
         changed.task_id = "stale".into();
@@ -181,6 +201,7 @@ mod tests {
         let mut progress = control.progress.lock().clone();
         let config = InternalConfig::default();
         let expected = UploadConfirmation {
+            participant_name: config.participant_name.clone(),
             upload_mode: "receiver".into(), grant_fingerprint: String::new(),
             task_id: progress.task_id.clone(),
             upload_url: String::new(),
@@ -211,6 +232,7 @@ mod tests {
         let control = InternalControl::load(root.path(), Arc::new(AtomicBool::new(false))).unwrap();
         control.note_capture(0, "privacy");
         assert!(control.capture_notice.lock().code.is_empty());
+        crate::core::internal::fill_test_participant_name(&control);
         control.start().unwrap();
         let epoch = control.epoch.load(Ordering::SeqCst);
         control.note_capture(epoch, "privacy");
@@ -224,6 +246,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        crate::core::internal::fill_test_participant_name(&control);
         control.start().unwrap();
         control.note_capture(epoch, "privacy");
         assert!(control.capture_notice.lock().code.is_empty());
