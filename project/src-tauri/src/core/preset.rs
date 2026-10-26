@@ -10,7 +10,8 @@ pub fn employee_mode()->bool {RAW!="null"}
 pub(super) fn activation_raw()->Option<&'static str> {employee_mode().then_some(RAW)}
 pub fn build_info()->Value {
     let credential=serde_json::from_str::<Value>(RAW).is_ok_and(|v|v["format"]=="timelens-cloudflare-activation-v1");
-    json!({"schema":1,"buildInfoProtocol":"timelens-build-inspection-v1","employeeMode":employee_mode(),"mode":if employee_mode(){"employee"}else{"generic-test"},"bootstrapCredentialEmbedded":credential,"presetFingerprint":if employee_mode(){format!("{:x}",Sha256::digest(RAW.as_bytes()))}else{String::new()}})
+    let discovery=serde_json::from_str::<Value>(RAW).is_ok_and(|v|v["format"]=="timelens-cloudflare-discovery-v1");
+    json!({"schema":1,"buildInfoProtocol":"timelens-build-inspection-v1","employeeMode":employee_mode(),"mode":if employee_mode(){"employee"}else{"generic-test"},"bootstrapCredentialEmbedded":credential,"configurationDiscovery":discovery,"presetFingerprint":if employee_mode(){format!("{:x}",Sha256::digest(RAW.as_bytes()))}else{String::new()}})
 }
 pub fn prepare(root:&Path,control:&InternalControl)->Result<(),String> {
     if employee_mode() {super::cloud_auth::prepare_preset(root,control,RAW)?;}Ok(())

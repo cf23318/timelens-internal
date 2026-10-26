@@ -1,3 +1,4 @@
+import { describeSyncFailure } from "./employeeSyncIssue";
 import { useTranslation } from "react-i18next";
 export { taskLabel, taskOverviewLabel, directFramesAccepted } from "./taskStatus";
 
@@ -45,6 +46,7 @@ export function missingLabel(code: string, english = false): string {
 }
 export function friendlyError(error: string, english = false, employee = false): string {
   if (/姓名/.test(error)) return english ? employee ? "Enter a valid name on the collection task page." : "Enter a valid name in Settings → Administrator before collection or upload." : error;
+  if (employee && /云端|连接|网络|超时|HTTP\s+\d{3}/.test(error)) { const issue=describeSyncFailure(error,true,false,english); return `${issue.title}：${issue.detail}`; }
   if (employee && /上传准备|尚未配置|凭证|激活|预置|服务器|配置/.test(error)) return english ? "Automatic setup is unavailable. The app keeps checking; contact the administrator if it persists. No upload settings are required." : "自动配置暂时不可用，软件会继续检查；持续异常请联系管理员，无需自行修改上传设置。";
   if (/权限|permission|accessibility|screen capture/i.test(error)) return english ? "Permission check failed. Review system permissions and retry." : "权限未满足，请在“任务与权限”中检查后重试。";
   if (/变化|stale/i.test(error)) return english ? "The task or configuration changed. Review it again before confirming." : "任务或配置已变化，请刷新并重新确认。";

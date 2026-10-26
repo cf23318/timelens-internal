@@ -1,6 +1,6 @@
 # TimeLens Internal · 内部采集版
 
-基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前源码测试版本为 **0.17.10**，已发布安装包以 Releases 为准。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
+基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前源码测试版本为 **0.17.12**，已发布安装包以 Releases 为准。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
 
 [English](README.en.md) · [下载安装包](https://github.com/cf23318/timelens-internal/releases) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
@@ -8,9 +8,11 @@
 
 员工首次使用：完成系统权限 → 首页填写姓名 → 点击“开始采集”。姓名按用户要求作为自助登记信息，不核验真实身份；任何取得软件并填姓名的人都可注册。固定设备ID和独立私有凭据由本机生成并保存，后续自动领取和续期上传授权，员工不导入JSON、不配置地址或Token。
 
-公开CI员工包只含公开服务配置，不含激活码或OSS长期Secret；可以直接下载对应Build产物，核对BUILD-INFO和SHA256SUMS。界面默认中文和浅色，保留手动开始、暂停及持久停止同步。首次离线可先记录，联网后用原身份和原截止补传。
+公开CI员工包只内置Cloudflare配置接口地址，不内置实际OSS Bucket、图片域名、激活码或长期Secret；首次联网获取配置后自动登记。已有任务继续使用原身份和原截止，准备完成后可离线采集、联网补传。界面默认中文和浅色，保留手动开始、暂停及持久停止同步。
 
-图片直传北京OSS，不经Cloudflare中转。每设备拥有独立目录和固定留存批准结束；客户端在授权到期前24小时自动检查续期。Cloudflare签发台账、管理员对账、回读与到期删除需配套运行，详见 [配置与部署说明](docs/cloudflare-issuer.md)。安装包目前无组织签名／公证；构建成功与实机验收分别记录。
+图片直传北京OSS，不经Cloudflare中转。签发和配置请求使用系统手动HTTP/HTTPS代理设置（支持环境变量覆盖，暂不执行PAC脚本）；图片和清单保持直连。连接超时、HTTP拒绝等会显示安全原因与处理建议，不展示请求地址、代理凭据或响应正文。每设备拥有独立目录和固定留存批准结束；客户端在授权到期前24小时自动检查续期。Cloudflare签发台账、管理员对账、回读与到期删除需配套运行，详见 [配置与部署说明](docs/cloudflare-issuer.md)。安装包目前无组织签名／公证；构建成功与实机验收分别记录。
+
+隐藏域名不是访问控制：直传时客户端仍会在运行时收到上传地址，并把授权保存在当前用户的私有配置中。云端禁止读取、下载和列目录依靠私有Bucket/对象ACL及仅POST上传的授权；管理员使用独立凭据回读。软件本机回放已有截图不属于云端下载。不要把隐藏地址描述为无法通过抓包或本机文件得知。
 
 ## 上传状态与断网重试（0.17.10）
 

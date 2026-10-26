@@ -45,7 +45,7 @@ async function inspectBinary(binary) {
   } finally {await rm(inspection,{recursive:true,force:true});}
 }
 const deployment=await inspectBinary(path.join(release,platform==="windows"?"timelens.exe":"timelens"));
-if(process.env.TIMELENS_PUBLIC_EMPLOYEE_BUILD==='1' && (!deployment.employeeMode || deployment.bootstrapCredentialEmbedded))throw new Error("Public employee packages must use credential-free self-registration");
+if(process.env.TIMELENS_PUBLIC_EMPLOYEE_BUILD==='1' && (!deployment.employeeMode || deployment.bootstrapCredentialEmbedded || !deployment.configurationDiscovery))throw new Error("Public employee packages may embed only the configuration service, never an OSS destination");
 if(process.env.TIMELENS_ACTIVATION_CONFIG) {
   const digest=createHash("sha256").update(await readFile(process.env.TIMELENS_ACTIVATION_CONFIG)).digest("hex");
   if(!deployment.employeeMode || deployment.presetFingerprint!==digest)throw new Error("Compiled activation preset differs from build input; refuse stale package");
@@ -53,8 +53,8 @@ if(process.env.TIMELENS_ACTIVATION_CONFIG) {
 const artifactInspection=[];
 async function sameDeployment(binary,component) {
   const value=await inspectBinary(binary);
-  if(value.employeeMode!==deployment.employeeMode || value.bootstrapCredentialEmbedded!==deployment.bootstrapCredentialEmbedded || value.presetFingerprint!==deployment.presetFingerprint)throw new Error(`${component} activation preset differs from standalone binary; refuse stale installer`);
-  artifactInspection.push({component,employeeMode:value.employeeMode,bootstrapCredentialEmbedded:value.bootstrapCredentialEmbedded,presetFingerprint:value.presetFingerprint});
+  if(value.employeeMode!==deployment.employeeMode || value.bootstrapCredentialEmbedded!==deployment.bootstrapCredentialEmbedded || value.configurationDiscovery!==deployment.configurationDiscovery || value.presetFingerprint!==deployment.presetFingerprint)throw new Error(`${component} activation preset differs from standalone binary; refuse stale installer`);
+  artifactInspection.push({component,employeeMode:value.employeeMode,bootstrapCredentialEmbedded:value.bootstrapCredentialEmbedded,configurationDiscovery:value.configurationDiscovery,presetFingerprint:value.presetFingerprint});
 }
 const output = process.env.TIMELENS_DISTRIBUTION_DIR ? path.resolve(process.env.TIMELENS_DISTRIBUTION_DIR) : path.join(project, "src-tauri", "target", "distribution", platform);
 if(process.env.TIMELENS_DISTRIBUTION_DIR) {

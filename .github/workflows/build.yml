@@ -31,7 +31,7 @@ jobs:
           cache-dependency-path: project/package-lock.json
       - run: npm ci
         working-directory: project
-      - run: npm run build && npm run verify:no-net && npm run test:upload-status
+      - run: npm run build && npm run verify:no-net && npm run test:upload-status && npm run test:employee-sync
         working-directory: project
       - uses: actions/setup-python@v5
         with:
@@ -113,7 +113,7 @@ jobs:
           node --input-type=module <<'NODE'
           import fs from 'node:fs';import path from 'node:path';
           const source='config/employee-registration.json',raw=fs.readFileSync(source,'utf8'),value=JSON.parse(raw);
-          if(value.format!=='timelens-cloudflare-registration-v1'||value.activationCode||value.accessKeySecret)throw Error('Expected credential-free registration configuration');
+          if(value.format!=='timelens-cloudflare-discovery-v1'||Object.keys(value).sort().join(',')!=='format,issuerUrl')throw Error('Employee packages may embed only the configuration service origin');
           const file=path.join(process.env.RUNNER_TEMP,'timelens-public-service.json');
           fs.writeFileSync(file,raw,{mode:0o600});
           fs.appendFileSync(process.env.GITHUB_ENV,'TIMELENS_ACTIVATION_CONFIG='+file+'\n');
