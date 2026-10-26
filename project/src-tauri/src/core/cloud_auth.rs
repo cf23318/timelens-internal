@@ -12,7 +12,7 @@ const DAY: i64 = 86_400_000;
 pub struct CloudStatus { pub configured: bool, pub issuer_url: String, pub last_checked_ms: i64, pub last_error: Option<String> }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
-struct Enrollment { issuer_url: String, device_id: String, device_secret: String, activation_code: Option<String>, expected:Expected, #[serde(default)] force_refresh:bool, #[serde(default)] preset_managed:bool }
+struct Enrollment { issuer_url: String, device_id: String, device_secret: String, activation_code: Option<String>, expected:Expected, #[serde(default)] force_refresh:bool, #[serde(default)] preset_managed:bool, #[serde(default)] registration_pending:bool }
 #[derive(Serialize,Deserialize,Clone)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 struct Expected {batch_id:String,scope:String,bucket:String,archive_end_at:String}
@@ -22,6 +22,17 @@ impl Expected {
 #[derive(Deserialize)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 struct Activation { format: String, issuer_url: String, activation_code: String, batch_id:String, scope:String, bucket:String, archive_end_at:String }
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct Registration {format:String,issuer_url:String,batch_id:String,scope:String,bucket:String,study_window_days:u32}
+fn registration_enrollment(root:&Path,raw:&str)->Result<Enrollment,String> {
+    let a:Registration=serde_json::from_str(raw).map_err(|_|"公开注册配置无效")?;
+    if a.format!="timelens-cloudflare-registration-v1" || a.scope!="device" || !(1..=30).contains(&a.study_window_days) || !super::frame_upload::valid_id(&a.batch_id) {return Err("公开注册批次无效".into());}
+    // Fixed once, before any network request; retries/restarts never extend it.
+    let end=Utc::now().timestamp()*1000+i64::from(a.study_window_days)*DAY;
+    let end=DateTime::<Utc>::from_timestamp_millis(end).ok_or("设备调研期限无效")?.to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+    Ok(Enrollment{issuer_url:url(&a.issuer_url)?.to_string(),device_id:oss_direct::device_id(root)?,device_secret:format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),activation_code:None,expected:Expected{batch_id:a.batch_id,scope:a.scope,bucket:a.bucket,archive_end_at:end},force_refresh:false,preset_managed:false,registration_pending:true})
+}
 fn is_secret(s: &str) -> bool { s.len()==64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) }
 fn url(value: &str) -> Result<reqwest::Url,String> {
     let u=reqwest::Url::parse(value).map_err(|_|"云端签发地址无效")?;
@@ -31,7 +42,7 @@ fn url(value: &str) -> Result<reqwest::Url,String> {
 fn enrollment(root:&Path)->Result<Enrollment,String> {
     let e:Enrollment=serde_json::from_slice(&oss_direct::private_read(&root.join(FILE))?).map_err(|_|"设备激活配置无效")?;
     url(&e.issuer_url)?;
-    if e.device_id!=oss_direct::device_id(root)? || !is_secret(&e.device_secret) || e.activation_code.as_ref().is_some_and(|s|!is_secret(s)) { return Err("设备激活身份不匹配".into()); }
+    if e.device_id!=oss_direct::device_id(root)? || !is_secret(&e.device_secret) || e.activation_code.as_ref().is_some_and(|s|!is_secret(s)) || e.registration_pending && e.activation_code.is_some() { return Err("设备激活身份不匹配".into()); }
     Ok(e)
 }
 pub fn summary(root:&Path, control:&InternalControl)->CloudStatus {
@@ -54,9 +65,11 @@ pub fn install_renewal(root:&Path,control:&InternalControl,raw:&str)->Result<(),
     if let Some(b)=super::archive::load(root)? {super::archive::ensure_live(root,&b.task_id,Utc::now().timestamp_millis())?;}
     super::internal::write_json_atomic(&root.join(oss_direct::GRANT_FILE),&next)
 }
-fn request(client:&reqwest::blocking::Client,e:&Enrollment,force:bool)->Result<String,String> {
+fn request(client:&reqwest::blocking::Client,e:&Enrollment,force:bool,name:&str)->Result<String,String> {
     let base=url(&e.issuer_url)?;
-    let r=if let Some(code)=&e.activation_code {
+    let r=if e.registration_pending {
+        client.post(base.join("v1/register").unwrap()).json(&serde_json::json!({"batchId":e.expected.batch_id,"participantName":name,"deviceId":e.device_id,"deviceSecret":e.device_secret,"archiveEndAt":e.expected.archive_end_at}))
+    } else if let Some(code)=&e.activation_code {
         client.post(base.join("v1/activate").unwrap()).json(&serde_json::json!({"activationCode":code,"deviceId":e.device_id,"deviceSecret":e.device_secret}))
     } else {client.post(base.join("v1/renew").unwrap()).bearer_auth(&e.device_secret).json(&serde_json::json!({"deviceId":e.device_id,"force":force}))};
     let mut response=r.send().map_err(|_|"云端续期连接失败；已有授权及待传图片保留")?;
@@ -75,8 +88,8 @@ fn refresh_locked(root:&Path,control:&InternalControl,force:bool)->Result<(),Str
 fn refresh_with_client(root:&Path,control:&InternalControl,force:bool,client:&reqwest::blocking::Client)->Result<(),String> {
     let mut e=enrollment(root)?;
     let cfg=control.config.read().clone();
-    if !force && !e.force_refresh && e.activation_code.is_none() && oss_direct::load(root,&cfg).is_ok_and(|g|!refresh_due(&g.expires_at,Utc::now().timestamp_millis())) {return Ok(());}
-    let raw=match request(client,&e,force||e.force_refresh) {
+    if !force && !e.force_refresh && !e.registration_pending && e.activation_code.is_none() && oss_direct::load(root,&cfg).is_ok_and(|g|!refresh_due(&g.expires_at,Utc::now().timestamp_millis())) {return Ok(());}
+    let raw=match request(client,&e,force||e.force_refresh,&cfg.participant_name) {
         Ok(raw)=>raw,
         Err(error)=>{
             if e.force_refresh && !retryable_renewal(&error) {e.force_refresh=false;super::internal::write_json_atomic(&root.join(FILE),&e)?;}
@@ -87,6 +100,7 @@ fn refresh_with_client(root:&Path,control:&InternalControl,force:bool,client:&re
     if !e.expected.matches(&grant) {return Err("云端返回的授权与激活批次不符".into());}
     if root.join(oss_direct::GRANT_FILE).exists() {install_renewal(root,control,&raw)?;} else {install_initial(root,control,&grant,e.preset_managed)?;}
     e.activation_code=None;
+    e.registration_pending=false;
     e.force_refresh=false;
     super::internal::write_json_atomic(&root.join(FILE),&e)
 }
@@ -136,10 +150,10 @@ pub fn prepare_preset(root:&Path,control:&InternalControl,raw:&str)->Result<(),S
         std::thread::sleep(Duration::from_millis(10));
     };
     let existing=root.join(FILE).exists();
-    let mut e=if existing {enrollment(root)?} else {
+    let mut e=if existing {enrollment(root)?} else if serde_json::from_str::<serde_json::Value>(raw).ok().is_some_and(|v|v["format"]=="timelens-cloudflare-registration-v1") {registration_enrollment(root,raw)?} else {
         let a:Activation=serde_json::from_str(raw).map_err(|_|"安装包预置配置无效，请联系管理员")?;
         if a.format!="timelens-cloudflare-activation-v1" || !is_secret(&a.activation_code) || !super::frame_upload::valid_id(&a.batch_id) || !["device","shared"].contains(&a.scope.as_str()) {return Err("安装包预置批次无效，请联系管理员".into());}
-        Enrollment{issuer_url:url(&a.issuer_url)?.to_string(),device_id:oss_direct::device_id(root)?,device_secret:format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),activation_code:Some(a.activation_code),expected:Expected{batch_id:a.batch_id,scope:a.scope,bucket:a.bucket,archive_end_at:a.archive_end_at},force_refresh:false,preset_managed:false}
+        Enrollment{issuer_url:url(&a.issuer_url)?.to_string(),device_id:oss_direct::device_id(root)?,device_secret:format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),activation_code:Some(a.activation_code),expected:Expected{batch_id:a.batch_id,scope:a.scope,bucket:a.bucket,archive_end_at:a.archive_end_at},force_refresh:false,preset_managed:false,registration_pending:false}
     };
     let _gate=control.gate.write();
     let old=control.config.read().clone();let p=control.progress.lock().clone();
@@ -212,7 +226,7 @@ pub fn activate(root:&Path,control:&InternalControl,raw:&str)->Result<(),String>
             e.issuer_url=issuer;e.activation_code=Some(a.activation_code);
             e.expected=expected;
         } e
-    } else {Enrollment{issuer_url:issuer,device_id:oss_direct::device_id(root)?,device_secret:format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),activation_code:Some(a.activation_code),expected,force_refresh:false,preset_managed:false}};
+    } else {Enrollment{issuer_url:issuer,device_id:oss_direct::device_id(root)?,device_secret:format!("{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple()),activation_code:Some(a.activation_code),expected,force_refresh:false,preset_managed:false,registration_pending:false}};
     // Persist before activation so a lost successful reply is safely retryable.
     super::internal::write_json_atomic(&root.join(FILE),&e)?;
     let result=refresh_locked(root,control,true);
@@ -270,6 +284,14 @@ mod tests {
         assert!(r.status.success());String::from_utf8(r.stdout).unwrap()
     }
     fn preset_raw(batch:&str)->String {serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":"https://issuer.example.com/","activationCode":"a".repeat(64),"batchId":batch,"scope":"device","bucket":"test-bucket","archiveEndAt":"2099-01-01T00:00:00.000Z"}).to_string()}
+    #[test] fn public_registration_prepares_once_without_a_shared_activation_secret() {
+        let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();c.save_participant_name("cf").unwrap();
+        let mut raw=serde_json::json!({"format":"timelens-cloudflare-registration-v1","issuerUrl":"https://issuer.example.com/","batchId":"employees","scope":"device","bucket":"test-bucket","studyWindowDays":7});
+        let before=Utc::now().timestamp()*1000;prepare_preset(t.path(),&c,&raw.to_string()).unwrap();let e=enrollment(t.path()).unwrap();
+        assert!(e.registration_pending&&e.activation_code.is_none());let end=DateTime::parse_from_rfc3339(&e.expected.archive_end_at).unwrap().timestamp_millis();assert!(end>=before+7*DAY&&end<=Utc::now().timestamp()*1000+7*DAY);
+        let saved=oss_direct::private_read(&t.path().join(FILE)).unwrap();raw["studyWindowDays"]=30.into();
+        let reopened=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();prepare_preset(t.path(),&reopened,&raw.to_string()).unwrap();assert_eq!(saved,oss_direct::private_read(&t.path().join(FILE)).unwrap());
+    }
     #[test] fn automatic_preset_preserves_identity_stop_choice_and_old_scope_after_update() {
         let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();
         assert!(prepare_preset(t.path(),&c,&preset_raw("pilot")).is_err());assert!(!t.path().join(FILE).exists());
@@ -321,7 +343,9 @@ mod tests {
             assert!(!t.path().join(FILE).exists()); // Reject before credentials or cloud registration.
         }
     }
-    #[test] fn tls_activation_retries_then_renews_with_the_same_private_device_credential() {
+    #[test] fn tls_activation_retries_then_renews_with_the_same_private_device_credential() {tls_bootstrap_round_trip(false);}
+    #[test] fn tls_registration_retries_then_renews_without_an_activation_code() {tls_bootstrap_round_trip(true);}
+    fn tls_bootstrap_round_trip(public:bool) {
         use std::{io::Write,net::TcpListener};
         use rustls::{pki_types::PrivatePkcs8KeyDer,ServerConfig,ServerConnection,StreamOwned};
         let _=rustls::crypto::ring::default_provider().install_default();
@@ -331,13 +355,14 @@ mod tests {
         let t=tempfile::tempdir().unwrap();let c=InternalControl::load(t.path(),Arc::new(AtomicBool::new(false))).unwrap();super::super::internal::fill_test_participant_name(&c);
         let device=oss_direct::device_id(t.path()).unwrap();let raw=grant(&device,"device",0,Utc::now().timestamp_millis()+7*DAY);
         let g:Grant=serde_json::from_str(&raw).unwrap();
-        let e=Enrollment{issuer_url:format!("https://{addr}/"),device_id:device,device_secret:"c".repeat(64),activation_code:Some("d".repeat(64)),expected:Expected{batch_id:g.user_id,scope:"device".into(),bucket:g.bucket,archive_end_at:g.archive_end_at},force_refresh:false,preset_managed:false};
-        let preset=serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":e.issuer_url,"activationCode":e.activation_code,"batchId":e.expected.batch_id,"scope":e.expected.scope,"bucket":e.expected.bucket,"archiveEndAt":e.expected.archive_end_at});
+        let e=Enrollment{issuer_url:format!("https://{addr}/"),device_id:device,device_secret:"c".repeat(64),activation_code:Some("d".repeat(64)),expected:Expected{batch_id:g.user_id,scope:"device".into(),bucket:g.bucket,archive_end_at:g.archive_end_at},force_refresh:false,preset_managed:false,registration_pending:false};
+        let preset=if public {serde_json::json!({"format":"timelens-cloudflare-registration-v1","issuerUrl":e.issuer_url,"batchId":e.expected.batch_id,"scope":e.expected.scope,"bucket":e.expected.bucket,"studyWindowDays":7})} else {serde_json::json!({"format":"timelens-cloudflare-activation-v1","issuerUrl":e.issuer_url,"activationCode":e.activation_code,"batchId":e.expected.batch_id,"scope":e.expected.scope,"bucket":e.expected.bucket,"archiveEndAt":e.expected.archive_end_at})};
         let paths=super::super::storage::DataPaths{root:t.path().to_owned(),data_dir:t.path().join("data"),db_path:t.path().join("data/db.sqlite"),shots_dir:t.path().join("data/shots"),exports_dir:t.path().join("exports")};paths.ensure_dirs().unwrap();
         let mut conn=rusqlite::Connection::open(&paths.db_path).unwrap();super::super::storage::migrations::run_migrations(&mut conn).unwrap();
         super::super::archive::initialize_owner(&paths,&conn,&c.progress.lock().task_id).unwrap();
         assert!(super::super::internal::start_local_policy(&paths,&c,false,Some(&preset.to_string())).is_err());assert!(!t.path().join(FILE).exists());assert!(!c.tracking.load(Ordering::SeqCst));
         super::super::internal::start_local_policy(&paths,&c,true,Some(&preset.to_string())).unwrap();let e=enrollment(t.path()).unwrap();let expected_secret=e.device_secret.clone();
+        let raw=if public {grant(&e.device_id,"device",0,DateTime::parse_from_rfc3339(&e.expected.archive_end_at).unwrap().timestamp_millis())} else {raw};
         let body=serde_json::json!({"grant":serde_json::from_str::<serde_json::Value>(&raw).unwrap()}).to_string();
         let plan=DateTime::parse_from_rfc3339(&e.expected.archive_end_at).unwrap().timestamp_millis();
         let renewed=serde_json::json!({"grant":serde_json::from_str::<serde_json::Value>(&grant(&e.device_id,"device",60000,plan)).unwrap()}).to_string();
@@ -349,7 +374,7 @@ mod tests {
                     if let Some(end)=bytes.windows(4).position(|v|v==b"\r\n\r\n") {let h=String::from_utf8_lossy(&bytes[..end]);let len=h.lines().find_map(|l|l.to_ascii_lowercase().strip_prefix("content-length:").map(|n|n.trim().parse::<usize>().unwrap())).unwrap();if bytes.len()>=end+4+len {break;}}
                 }
                 let req=String::from_utf8(bytes).unwrap();
-                if i<2 {assert!(req.starts_with("POST /v1/activate"));assert!(req.contains(&expected_secret));assert!(req.contains(&"d".repeat(64)));}
+                if i<2 {assert!(req.starts_with(if public {"POST /v1/register"}else{"POST /v1/activate"}));assert!(req.contains(&expected_secret));if public {assert!(!req.contains("activationCode"));assert!(req.contains("participantName")&&req.contains("archiveEndAt"));}else{assert!(req.contains(&"d".repeat(64)));}}
                 else {assert!(req.starts_with("POST /v1/renew"));assert!(req.contains(&format!("Bearer {}",expected_secret)));assert!(!req.contains(&"d".repeat(64)));}
                 let (status,b)=if i==0||i==3 {("503 Service Unavailable","{}".to_string())}else if i==4 {assert!(req.contains("\"force\":true"));("200 OK",renewed.clone())}else{("200 OK",body.clone())};
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",b.len()).unwrap();stream.flush().unwrap();
@@ -360,10 +385,10 @@ mod tests {
         let mut offline=enrollment(t.path()).unwrap();offline.issuer_url=format!("https://{closed_addr}/");super::super::internal::write_json_atomic(&t.path().join(FILE),&offline).unwrap();
         assert!(refresh_with_client(t.path(),&c,true,&client).unwrap_err().contains("连接失败"));
         super::super::internal::write_json_atomic(&t.path().join(FILE),&e).unwrap();
-        assert!(refresh_with_client(t.path(),&c,true,&client).is_err());assert!(enrollment(t.path()).unwrap().activation_code.is_some());
+        assert!(refresh_with_client(t.path(),&c,true,&client).is_err());let retry=enrollment(t.path()).unwrap();assert!(if public {retry.registration_pending}else{retry.activation_code.is_some()});
         c.pause(true).unwrap();c.edit_progress(|p|{p.needs_flush=false;Ok(())}).unwrap();super::super::frame_upload::bind_local_retention(&paths,&c).unwrap();
         let binding=super::super::archive::load(t.path()).unwrap().unwrap();assert!(binding.effective_end_ms<binding.planned_end_ms);
-        refresh_with_client(t.path(),&c,true,&client).unwrap();assert!(enrollment(t.path()).unwrap().activation_code.is_none());
+        refresh_with_client(t.path(),&c,true,&client).unwrap();assert!(enrollment(t.path()).unwrap().activation_code.is_none());assert!(!enrollment(t.path()).unwrap().registration_pending);
         refresh_with_client(t.path(),&c,true,&client).unwrap();
         let old=oss_direct::load(t.path(),&c.config.read()).unwrap();assert!(!refresh_due(&old.expires_at,Utc::now().timestamp_millis()));
         assert!(matches!(recover_with_client(t.path(),&c,&old,&client),Recovery::RetryLater));

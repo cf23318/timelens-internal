@@ -18,7 +18,7 @@ def endpoint(value):
 def post(config,path,payload,token_key='syncToken'):
     token=config[token_key]
     if not isinstance(token,str) or not re.fullmatch(r'[a-f0-9]{64}',token): raise ValueError('Invalid issuer credential')
-    req=urllib.request.Request(endpoint(config['issuerUrl'])+path,data=json.dumps(payload,separators=(',',':')).encode(),method='POST',headers={'Content-Type':'application/json','Authorization':'Bearer '+token})
+    req=urllib.request.Request(endpoint(config['issuerUrl'])+path,data=json.dumps(payload,separators=(',',':')).encode(),method='POST',headers={'Content-Type':'application/json','Authorization':'Bearer '+token,'User-Agent':'TimeLens-Admin/1'})
     with urllib.request.build_opener(NoRedirect()).open(req,timeout=25) as r:
         raw=r.read(4*1024*1024+1)
         if len(raw)>4*1024*1024 or r.status not in (200,201): raise ValueError('Invalid issuer response')

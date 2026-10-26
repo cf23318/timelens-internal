@@ -6,11 +6,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      employee_build:
-        description: 'Build internally configured employee packages (encrypted artifacts only)'
-        type: boolean
-        default: false
   workflow_call:
 
 permissions:
@@ -36,7 +31,7 @@ jobs:
           cache-dependency-path: project/package-lock.json
       - run: npm ci
         working-directory: project
-      - run: npm run build && npm run verify:no-net && npm run test:upload-status && node --test scripts/test-employee-build.mjs
+      - run: npm run build && npm run verify:no-net && npm run test:upload-status
         working-directory: project
       - uses: actions/setup-python@v5
         with:
@@ -60,7 +55,6 @@ jobs:
 
   build:
     name: Build ${{ matrix.name }}
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.employee_build) }}
     needs: checks
     strategy:
       fail-fast: false
@@ -114,16 +108,26 @@ jobs:
           security import "$RUNNER_TEMP/certificate.p12" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "timelens_ci" build.keychain
           rm "$RUNNER_TEMP/certificate.p12"
+      - name: Stage public employee service configuration (no credentials)
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';import path from 'node:path';
+          const source='config/employee-registration.json',raw=fs.readFileSync(source,'utf8'),value=JSON.parse(raw);
+          if(value.format!=='timelens-cloudflare-registration-v1'||value.activationCode||value.accessKeySecret)throw Error('Expected credential-free registration configuration');
+          const file=path.join(process.env.RUNNER_TEMP,'timelens-public-service.json');
+          fs.writeFileSync(file,raw,{mode:0o600});
+          fs.appendFileSync(process.env.GITHUB_ENV,'TIMELENS_ACTIVATION_CONFIG='+file+'\n');
+          NODE
       - name: Build installer
         env:
-          # Public CI artifacts are generic diagnostic builds, never employee credentials.
-          TIMELENS_ALLOW_UNCONFIGURED_BUILD: '1'
           APPLE_SIGNING_IDENTITY: ${{ github.event_name != 'pull_request' && secrets.APPLE_SIGNING_IDENTITY || '' }}
         run: |
           # Empty is treated as a signing identity by Tauri; unset for ad-hoc test builds.
           if [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then unset APPLE_SIGNING_IDENTITY; fi
           npm run tauri -- build --bundles ${{ matrix.bundle }}
       - name: Record source commit and checksums
+        env:
+          TIMELENS_PUBLIC_EMPLOYEE_BUILD: '1'
         run: node scripts/collect-build.mjs ${{ matrix.name }}
       - name: Upload test package
         uses: actions/upload-artifact@v4
@@ -132,100 +136,3 @@ jobs:
           path: project/src-tauri/target/distribution/${{ matrix.name }}/
           if-no-files-found: error
           retention-days: 30
-
-  employee:
-    name: Employee ${{ matrix.name }} (encrypted)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.employee_build == true }}
-    needs: checks
-    environment: timelens-employee-build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            name: windows
-            bundle: nsis
-          - os: macos-latest
-            name: macos
-            bundle: app,dmg
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    defaults:
-      run:
-        working-directory: project
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      # Employee builds intentionally restore/save NO dependency or Rust cache.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: npm ci
-      - run: python -m pip install -e '../upload-server[test]'
-      - name: Rust tests before injecting private preset
-        env:
-          TIMELENS_TEST_PYTHON: python
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features frame-contract-tests --lib
-      - name: Prepare private employee preset
-        env:
-          ACTIVATION_CONFIG_JSON: ${{ secrets.TIMELENS_ACTIVATION_CONFIG_JSON }}
-        run: |
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';
-          import path from 'node:path';
-          try {
-          const raw=process.env.ACTIVATION_CONFIG_JSON;
-          const parsed=JSON.parse(raw||'null');
-          if(!parsed || !/^[a-f0-9]{64}$/.test(parsed.activationCode||''))throw Error('Missing activation preset');
-          console.log('::add-mask::'+parsed.activationCode);
-          const file=path.join(process.env.RUNNER_TEMP,'timelens.activation.private.json');
-          fs.writeFileSync(file,raw,{flag:'wx',mode:0o600});
-          fs.appendFileSync(process.env.GITHUB_ENV,'TIMELENS_ACTIVATION_CONFIG='+file+'\n');
-          } catch { console.error('Private activation preset preparation failed; credential details suppressed.'); process.exit(1); }
-          NODE
-      - name: Build employee installer
-        run: npm run tauri -- build --bundles ${{ matrix.bundle }}
-      - name: Inspect actual employee packages
-        run: node scripts/collect-build.mjs ${{ matrix.name }}
-      - name: Encrypt private distribution
-        env:
-          TIMELENS_BUILD_ENCRYPTION_KEY: ${{ secrets.TIMELENS_BUILD_ENCRYPTION_KEY }}
-          PACKAGE_PLATFORM: ${{ matrix.name }}
-        run: |
-          python - <<'PY'
-          import os,pathlib,zipfile
-          source=pathlib.Path('src-tauri/target/distribution')/os.environ['PACKAGE_PLATFORM']
-          target=pathlib.Path(os.environ['RUNNER_TEMP'])/'timelens-employee.zip'
-          with zipfile.ZipFile(target,'x',compression=zipfile.ZIP_STORED) as z:
-            for p in source.rglob('*'):
-              if p.is_symlink():raise RuntimeError('Unexpected distribution symlink')
-              if p.is_file():z.write(p,p.relative_to(source))
-          PY
-          mkdir -p src-tauri/target/employee-encrypted
-          node scripts/protect-employee-build.mjs seal "$RUNNER_TEMP/timelens-employee.zip" "src-tauri/target/employee-encrypted/TimeLens-${{ matrix.name }}.tle"
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';import {createHash} from 'node:crypto';
-          const p='src-tauri/target/employee-encrypted/TimeLens-'+process.env.PACKAGE_PLATFORM+'.tle';
-          fs.writeFileSync(p+'.sha256',createHash('sha256').update(fs.readFileSync(p)).digest('hex')+'\n');
-          NODE
-      - name: Upload encrypted employee package only
-        uses: actions/upload-artifact@v4
-        with:
-          name: TimeLens-employee-${{ matrix.name }}-encrypted
-          path: |
-            project/src-tauri/target/employee-encrypted/*.tle
-            project/src-tauri/target/employee-encrypted/*.sha256
-          if-no-files-found: error
-          retention-days: 7
-      - name: Remove private preset and plaintext build outputs
-        if: always()
-        run: |
-          rm -f -- "$RUNNER_TEMP/timelens.activation.private.json" "$RUNNER_TEMP/timelens-employee.zip"
-          rm -rf -- src-tauri/target/release src-tauri/target/distribution

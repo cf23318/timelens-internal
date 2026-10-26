@@ -40,11 +40,12 @@ async function inspectBinary(binary) {
     await mkdir(profile);
     execFileSync(binary,["--timelens-build-info-file",file],{timeout:10000,env:{...process.env,TIMELENS_PROFILE_DIR:profile}});
     const value=JSON.parse(await readFile(file,"utf8"));
-    if(value.schema!==1 || value.buildInfoProtocol!=="timelens-build-inspection-v1" || typeof value.employeeMode!=="boolean" || value.bootstrapCredentialEmbedded!==value.employeeMode)throw new Error("Compiled deployment metadata is invalid");
+    if(value.schema!==1 || value.buildInfoProtocol!=="timelens-build-inspection-v1" || typeof value.employeeMode!=="boolean" || typeof value.bootstrapCredentialEmbedded!=="boolean" || value.bootstrapCredentialEmbedded&&!value.employeeMode)throw new Error("Compiled deployment metadata is invalid");
     return value;
   } finally {await rm(inspection,{recursive:true,force:true});}
 }
 const deployment=await inspectBinary(path.join(release,platform==="windows"?"timelens.exe":"timelens"));
+if(process.env.TIMELENS_PUBLIC_EMPLOYEE_BUILD==='1' && (!deployment.employeeMode || deployment.bootstrapCredentialEmbedded))throw new Error("Public employee packages must use credential-free self-registration");
 if(process.env.TIMELENS_ACTIVATION_CONFIG) {
   const digest=createHash("sha256").update(await readFile(process.env.TIMELENS_ACTIVATION_CONFIG)).digest("hex");
   if(!deployment.employeeMode || deployment.presetFingerprint!==digest)throw new Error("Compiled activation preset differs from build input; refuse stale package");
@@ -52,8 +53,8 @@ if(process.env.TIMELENS_ACTIVATION_CONFIG) {
 const artifactInspection=[];
 async function sameDeployment(binary,component) {
   const value=await inspectBinary(binary);
-  if(value.employeeMode!==deployment.employeeMode || value.presetFingerprint!==deployment.presetFingerprint)throw new Error(`${component} activation preset differs from standalone binary; refuse stale installer`);
-  artifactInspection.push({component,employeeMode:value.employeeMode,presetFingerprint:value.presetFingerprint});
+  if(value.employeeMode!==deployment.employeeMode || value.bootstrapCredentialEmbedded!==deployment.bootstrapCredentialEmbedded || value.presetFingerprint!==deployment.presetFingerprint)throw new Error(`${component} activation preset differs from standalone binary; refuse stale installer`);
+  artifactInspection.push({component,employeeMode:value.employeeMode,bootstrapCredentialEmbedded:value.bootstrapCredentialEmbedded,presetFingerprint:value.presetFingerprint});
 }
 const output = process.env.TIMELENS_DISTRIBUTION_DIR ? path.resolve(process.env.TIMELENS_DISTRIBUTION_DIR) : path.join(project, "src-tauri", "target", "distribution", platform);
 if(process.env.TIMELENS_DISTRIBUTION_DIR) {
@@ -140,7 +141,7 @@ if (platform === "macos") {
     signing.push({ name: file.name, authenticodeStatus: signature.Status, statusMessage: signature.StatusMessage });
   }
 }
-await writeFile(path.join(output, "INTERNAL-TEST-PACKAGE.txt"), (deployment.employeeMode ? "Employee-configured package contains a batch activation credential. Distribute internally; never publish it as a credential-free generic package.\n" : "Generic diagnostic package. No employee data or activation credentials included. Employee onboarding requires a configured build.\n")+"Inspect BUILD-INFO.json for source, preset and signature state. Do not treat an unsigned package as a signed production release.\n");
+await writeFile(path.join(output, "INTERNAL-TEST-PACKAGE.txt"), (deployment.bootstrapCredentialEmbedded ? "Employee-configured package contains a batch activation credential. Distribute internally; never publish it as a credential-free generic package.\n" : deployment.employeeMode ? "Employee self-registration package. Contains public service configuration only, no activation credential or OSS secret. Enter a name to register; no upload setup required.\n" : "Generic diagnostic package. No employee data or activation credentials included. Employee onboarding requires a configured build.\n")+"Inspect BUILD-INFO.json for source, preset and signature state. Do not treat an unsigned package as a signed production release.\n");
 await writeFile(path.join(output, "BUILD-INFO.json"), JSON.stringify({
   version, sourceCommit, sourceDirty, sourceChanges, sourceDiffSha256: createHash("sha256").update(sourceDiff).digest("hex"), sourceTreeSha256, platform, architecture: process.arch, signing,
   runUrl: process.env.GITHUB_SERVER_URL && `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,

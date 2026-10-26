@@ -10,13 +10,14 @@ class Storage {
   async put(k,v){if(typeof k==='object'){for(const [a,b] of Object.entries(k))this.map.set(a,structuredClone(b));}else this.map.set(k,structuredClone(v));}
   async list({prefix,limit}){return new Map([...this.map].filter(([k])=>k.startsWith(prefix)).slice(0,limit).map(([k,v])=>[k,structuredClone(v)]));}
 }
-function fixture(){
+function fixture(extra={}){
   const storage=new Storage();let queue=Promise.resolve();
-  const issuer=new Issuer({storage,blockConcurrencyWhile(fn){const p=queue.then(fn);queue=p.catch(()=>{});return p;}},env);
+  const activeEnv={...env,...extra};
+  const issuer=new Issuer({storage,blockConcurrencyWhile(fn){const p=queue.then(fn);queue=p.catch(()=>{});return p;}},activeEnv);
   const call=async(path,payload,token)=>{const r=await issuer.fetch(new Request('https://issuer.example.com'+path,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify(payload)}));return {status:r.status,body:await r.json(),headers:r.headers};};
   const batch=async(scope='device',maxDevices=2,id='pilot')=>(await call('/admin/batches',{batchId:id,scope,maxDevices,archiveEndAt:new Date(Date.now()+7*DAY).toISOString(),activationExpiresAt:new Date(Date.now()+DAY).toISOString()},env.ISSUER_ADMIN_TOKEN)).body;
   const activate=(a,id=device,key='c'.repeat(64))=>call('/v1/activate',{activationCode:a.activationCode,deviceId:id,deviceSecret:key});
-  return {storage,call,batch,activate};
+  return {storage,call,batch,activate,env:activeEnv,issuer};
 }
 test('Worker HMAC grants match Python signer byte for byte',()=>{
   return (async()=>{
@@ -96,4 +97,51 @@ test('sync accepts the full service device limit and rejects overflow',async()=>
   const row={deviceId:device,deadlineMs:Date.now()+DAY};
   assert.equal((await f.call('/admin/sync',{deadlines:Array(2000).fill(row)},env.ISSUER_SYNC_TOKEN)).status,200);
   assert.equal((await f.call('/admin/sync',{deadlines:Array(2001).fill(row)},env.ISSUER_SYNC_TOKEN)).status,400);
+});
+
+async function publicFixture(maxDevices=4){
+  const f=fixture({OPEN_REGISTRATION_BATCH:'employees',OPEN_REGISTRATION_WINDOW_DAYS:'7'});
+  assert.equal((await f.call('/admin/batches',{batchId:'employees',scope:'device',maxDevices,archiveEndAt:'2099-01-01T00:00:00Z',activationExpiresAt:'2099-01-01T00:00:00Z'},env.ISSUER_ADMIN_TOKEN)).status,201);
+  f.payload=(id=device)=>({batchId:'employees',participantName:'cf',deviceId:id,deviceSecret:'c'.repeat(64),archiveEndAt:new Date(Math.floor(Date.now()/1000)*1000+7*DAY).toISOString()});
+  return f;
+}
+test('public registration needs only a name and fresh private device identity',async()=>{
+  const f=await publicFixture();const info=await f.issuer.fetch(new Request('https://issuer.example.com/v1/config'));
+  assert.equal(info.status,200);const c=await info.json();assert.equal(c.format,'timelens-cloudflare-registration-v1');assert.equal(c.studyWindowDays,7);assert.ok(!JSON.stringify(c).includes('activationCode'));
+  const p=f.payload();assert.equal((await f.call('/v1/register',{...p,participantName:'  '})).status,400);
+  assert.equal((await f.call('/v1/register',{...p,participantName:'../bad'})).status,400);
+  for(const name of ['.','..','bad\u200bname','bad\u0085name'])assert.equal((await f.call('/v1/register',{...p,participantName:name})).status,400);
+  assert.equal((await f.call('/v1/register',{...p,participantName:'cf:测试'})).status,200);
+  const r=await f.call('/v1/register',p);assert.equal(r.status,200);assert.equal(r.body.grant.archiveEndAt,p.archiveEndAt);assert.ok(r.body.grant.prefix.endsWith('/'+device+'/'));
+  const saved=await f.storage.get('device:'+device);assert.ok(!saved.participantName && !saved.deviceSecret);assert.equal(saved.deadlineMs,Date.parse(p.archiveEndAt)+30*DAY);
+});
+test('public employees joining on different days retain independent deadlines',async t=>{
+  const f=await publicFixture(),first=f.payload(),r=await f.call('/v1/register',first);assert.equal(r.status,200);
+  const now=Date.now();t.mock.method(Date,'now',()=>now+2*DAY);
+  const second=f.payload(other);assert.equal((await f.call('/v1/register',second)).status,200);
+  const rows=(await f.call('/admin/sync',{deadlines:[]},env.ISSUER_SYNC_TOKEN)).body.devices;
+  assert.equal(rows.find(d=>d.deviceId===device).plannedEndMs,Date.parse(first.archiveEndAt));assert.equal(rows.find(d=>d.deviceId===other).plannedEndMs,Date.parse(second.archiveEndAt));
+  assert.equal(rows.find(d=>d.deviceId===other).deadlineMs,Date.parse(second.archiveEndAt)+30*DAY);
+  const renew=await f.call('/v1/renew',{deviceId:device,force:true},'c'.repeat(64));assert.equal(renew.status,200);assert.equal(renew.body.grant.archiveEndAt,first.archiveEndAt);
+});
+test('public retry is idempotent and cannot change the private key or deadline',async()=>{
+  const f=await publicFixture(1),p=f.payload();const [a,b]=await Promise.all([f.call('/v1/register',p),f.call('/v1/register',p)]);
+  assert.equal(a.status,200);assert.deepEqual(a.body,b.body);assert.equal((await f.storage.get('batch:employees')).count,1);
+  assert.equal((await f.call('/v1/register',{...p,deviceSecret:'d'.repeat(64)})).status,409);
+  assert.equal((await f.call('/v1/register',{...p,archiveEndAt:new Date(Date.parse(p.archiveEndAt)+1000).toISOString()})).status,409);
+  assert.equal((await f.call('/v1/register',f.payload(other))).status,403);
+});
+test('public admission closes without breaking existing retry or renewal barriers',async()=>{
+  const f=await publicFixture(),p=f.payload();await f.call('/v1/register',p);
+  const b=await f.storage.get('batch:employees');b.activationEndMs=Date.now()-1000;await f.storage.put('batch:employees',b);f.env.OPEN_REGISTRATION_BATCH='another';
+  const deadline=Date.now()+DAY;await f.call('/admin/sync',{deadlines:[{deviceId:device,deadlineMs:deadline}]},env.ISSUER_SYNC_TOKEN);
+  const retry=await f.call('/v1/register',p);assert.equal(retry.status,200);assert.ok(Date.parse(retry.body.grant.expiresAt)<=deadline-120000);
+  assert.equal((await f.call('/v1/register',f.payload(other))).status,403);assert.equal((await f.call('/v1/renew',{deviceId:device},'c'.repeat(64))).status,200);
+  assert.equal((await f.storage.get('device:'+device)).deadlineMs,deadline);
+});
+test('public registration bounds clock skew and supports old offline tasks',async t=>{
+  const f=await publicFixture(),now=Math.floor(Date.now()/1000)*1000;t.mock.method(Date,'now',()=>now);
+  const p=f.payload();assert.equal((await f.call('/v1/register',{...p,archiveEndAt:new Date(now+7*DAY+120001).toISOString()})).status,400);
+  assert.equal((await f.call('/v1/register',{...p,archiveEndAt:new Date(now+7*DAY+120000).toISOString()})).status,200);
+  assert.equal((await f.call('/v1/register',{...f.payload(other),archiveEndAt:new Date(now-2*DAY).toISOString()})).status,200);
 });

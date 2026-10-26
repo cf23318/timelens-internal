@@ -1,4 +1,4 @@
-//! Employee packages carry a build-time batch activation profile. The raw value
+//! Employee packages carry public registration settings or a legacy activation profile. The raw value
 //! never goes to the WebView, status APIs, logs or BUILD-INFO output.
 use serde_json::{json,Value};
 use sha2::{Digest,Sha256};
@@ -9,7 +9,8 @@ const RAW:&str=include_str!(concat!(env!("OUT_DIR"),"/timelens-activation-preset
 pub fn employee_mode()->bool {RAW!="null"}
 pub(super) fn activation_raw()->Option<&'static str> {employee_mode().then_some(RAW)}
 pub fn build_info()->Value {
-    json!({"schema":1,"buildInfoProtocol":"timelens-build-inspection-v1","employeeMode":employee_mode(),"mode":if employee_mode(){"employee"}else{"generic-test"},"bootstrapCredentialEmbedded":employee_mode(),"presetFingerprint":if employee_mode(){format!("{:x}",Sha256::digest(RAW.as_bytes()))}else{String::new()}})
+    let credential=serde_json::from_str::<Value>(RAW).is_ok_and(|v|v["format"]=="timelens-cloudflare-activation-v1");
+    json!({"schema":1,"buildInfoProtocol":"timelens-build-inspection-v1","employeeMode":employee_mode(),"mode":if employee_mode(){"employee"}else{"generic-test"},"bootstrapCredentialEmbedded":credential,"presetFingerprint":if employee_mode(){format!("{:x}",Sha256::digest(RAW.as_bytes()))}else{String::new()}})
 }
 pub fn prepare(root:&Path,control:&InternalControl)->Result<(),String> {
     if employee_mode() {super::cloud_auth::prepare_preset(root,control,RAW)?;}Ok(())

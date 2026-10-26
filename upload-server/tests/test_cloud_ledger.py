@@ -4,6 +4,26 @@ from uuid import uuid4
 from test_direct_admin import archive, publish
 from timelens_upload import direct_admin as mod, cloud_ledger as cloud
 
+def test_cloud_requests_identify_the_administrator_client(monkeypatch):
+    # The deployed edge rejects Python-urllib's default agent before the Worker.
+    # Keep authentication and the no-redirect handler on this real request path.
+    import io
+    class Response(io.BytesIO):
+        status=200
+    class Opener:
+        def open(self,req,timeout):
+            assert req.get_header('User-agent')=='TimeLens-Admin/1'
+            assert req.get_header('Authorization')=='Bearer '+'a'*64
+            assert req.full_url=='https://issuer.example.com/admin/sync'
+            assert json.loads(req.data)=={'deadlines':[]}
+            return Response(b'{"devices":[]}')
+    def build(*handlers):
+        assert any(isinstance(h,cloud.NoRedirect) for h in handlers)
+        return Opener()
+    import json
+    monkeypatch.setattr(cloud.urllib.request,'build_opener',build)
+    assert cloud.post({'issuerUrl':'https://issuer.example.com/','syncToken':'a'*64},'/admin/sync',{'deadlines':[]})=={'devices':[]}
+
 def setup(a,g,monkeypatch):
     mod.write_private(a.root/'cloud-issuer.json',{'issuerUrl':'https://issuer.example.com/','syncToken':'b'*64})
     item={'deviceId':g['deviceId'],'userId':g['userId'],'bucket':g['bucket'],'scope':'device','plannedEndMs':mod.ms(g['archiveEndAt']),'deadlineMs':mod.ms(g['archiveEndAt'])+mod.RETENTION_MS,'lastGrantExpiresMs':mod.ms(g['expiresAt'])}

@@ -66,10 +66,11 @@ export class Issuer {
   constructor(ctx, env) { this.ctx = ctx; this.env = env; }
   async fetch(req) {
     try {
-      must(req.method==='POST',404);
+      const publicConfig=req.method==='GET' && new URL(req.url).pathname==='/v1/config';
+      must(req.method==='POST'||publicConfig,404);
       // Read the bounded request BEFORE locking persistent state. Slow anonymous
       // bodies cannot monopolize all device renewals.
-      const v=await body(req);
+      const v=publicConfig?{}:await body(req);
       // Catch inside the callback: a rejected blockConcurrencyWhile callback
       // resets the Durable Object, even if its caller catches the rejection.
       return await this.ctx.blockConcurrencyWhile(async()=>{
@@ -89,7 +90,7 @@ export class Issuer {
     // Valid grants are reused. Force refresh is throttled to once per minute.
     if (device.grant && Date.parse(device.grant.expiresAt) <= ceiling && Date.parse(device.grant.expiresAt) > now && (now < device.issuedMs + 60000 || !force && Date.parse(device.grant.expiresAt) > now + DAY)) return device.grant;
     const expires = Math.min(now + 7*DAY, ceiling);
-    const grant = await makeGrant(this.env, batch, device.deviceId, now, expires);
+    const grant = await makeGrant(this.env, {...batch,plannedEndMs:device.plannedEndMs??batch.plannedEndMs}, device.deviceId, now, expires);
     device.grant = grant; device.issuedMs = now; device.lastGrantExpiresMs = Math.max(device.lastGrantExpiresMs || 0, expires);
     // Persist expiry BEFORE sending a usable grant. A lost reply can be retried safely.
     await this.ctx.storage.put('device:'+device.deviceId, device);
@@ -97,6 +98,41 @@ export class Issuer {
   }
   async route(req,v) {
     const route = new URL(req.url).pathname, now = Math.floor(Date.now()/1000)*1000, s = this.ctx.storage;
+    if (req.method==='GET' && route==='/v1/config') {
+      const batch=await s.get('batch:'+this.env.OPEN_REGISTRATION_BATCH);
+      must(batch && !batch.disabled && batch.scope==='device',503);
+      const days=bounded(Number(this.env.OPEN_REGISTRATION_WINDOW_DAYS||7),1,30);
+      return json({format:'timelens-cloudflare-registration-v1',issuerUrl:origin(this.env.PUBLIC_ISSUER_URL)+'/',batchId:batch.batchId,scope:'device',bucket:this.env.OSS_BUCKET,studyWindowDays:days});
+    }
+    if (route==='/v1/register') {
+      exact(v,['batchId','participantName','deviceId','deviceSecret','archiveEndAt']);
+      must(id(v.batchId) && uuid(v.deviceId) && secret(v.deviceSecret));
+      const declared=typeof v.participantName==='string'?v.participantName:'';
+      const name=declared.trim();
+      must(name && [...name].length<=64 && !['.','..'].includes(name) && !/[\\/\p{Cc}\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u.test(declared));
+      const plan=date(v.archiveEndAt),digest=await hash(v.deviceSecret);
+      let device=await s.get('device:'+v.deviceId);
+      const batch=await s.get('batch:'+v.batchId);
+      must(batch && !batch.disabled && batch.scope==='device',403);
+      if(device) {
+        // Existing identities may recover a lost reply after admission closes.
+        // Never reset the original deadline, private key or device count.
+        must(device.batchId===v.batchId && device.secretHash===digest && (device.plannedEndMs??batch.plannedEndMs)===plan,409);
+      } else {
+        must(v.batchId===this.env.OPEN_REGISTRATION_BATCH && now<batch.activationEndMs && batch.count<batch.maxDevices,403);
+        const days=bounded(Number(this.env.OPEN_REGISTRATION_WINDOW_DAYS||7),1,30);
+        // A small positive clock skew is tolerated; old offline tasks still
+        // need a live retention window. The submitted end is fixed forever.
+        must(plan<=now+days*DAY+120000 && plan+RETENTION>now+DRAIN+60000);
+        const count=await s.get('device-count')||0;must(count<2000,409);
+        device={deviceId:v.deviceId,batchId:v.batchId,secretHash:digest,plannedEndMs:plan,deadlineMs:Math.min(batch.deadlineMs,plan+RETENTION),lastGrantExpiresMs:0,disabled:false};
+        batch.count++;
+        await s.put({['batch:'+v.batchId]:batch,['device:'+v.deviceId]:device,'device-count':count+1});
+      }
+      // Name is a self-declared display field, not authentication. It is not
+      // retained by this signer; the client freezes it into its OSS records.
+      return json({grant:await this.issue(batch,device,now)});
+    }
     if (route === '/admin/batches') {
       await this.admin(req); exact(v,['batchId','archiveEndAt','scope','maxDevices','activationExpiresAt','activationCode']);
       const publicOrigin=origin(this.env.PUBLIC_ISSUER_URL);
@@ -158,7 +194,7 @@ export class Issuer {
       return json({format:'timelens-issuer-ledger-v1',atMs:now,devices:[...devices.values()].map(d => {
         const b = batches.get('batch:'+d.batchId);
         return {deviceId:d.deviceId,userId:d.batchId,bucket:this.env.OSS_BUCKET,scope:b.scope,
-          plannedEndMs:b.plannedEndMs,deadlineMs:Math.min(b.deadlineMs,d.deadlineMs),lastGrantExpiresMs:d.lastGrantExpiresMs};
+          plannedEndMs:d.plannedEndMs??b.plannedEndMs,deadlineMs:Math.min(b.deadlineMs,d.deadlineMs),lastGrantExpiresMs:d.lastGrantExpiresMs};
       })});
     }
     must(false,404);

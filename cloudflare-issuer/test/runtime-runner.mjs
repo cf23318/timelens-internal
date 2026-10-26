@@ -15,7 +15,7 @@ let child,logs='';
 async function start(){
   child=spawn(process.execPath,['node_modules/wrangler/wrangler-dist/cli.js','dev','--local','--ip','127.0.0.1','--port',String(port),'--persist-to',path.join(temp,'state'),
     '--var','OSS_BUCKET:test-bucket','--var','OSS_ACCESS_KEY_ID:SYNTHETICKEY123','--var','OSS_ACCESS_KEY_SECRET:synthetic-oss-secret',
-    '--var','ISSUER_ADMIN_TOKEN:'+'a'.repeat(64),'--var','ISSUER_SYNC_TOKEN:'+'b'.repeat(64),'--var','PUBLIC_ISSUER_URL:https://issuer.example.com/'],{cwd:root,env,stdio:['ignore','pipe','pipe']});
+    '--var','ISSUER_ADMIN_TOKEN:'+'a'.repeat(64),'--var','ISSUER_SYNC_TOKEN:'+'b'.repeat(64),'--var','PUBLIC_ISSUER_URL:https://issuer.example.com/','--var','OPEN_REGISTRATION_BATCH:runtime-open'],{cwd:root,env,stdio:['ignore','pipe','pipe']});
   child.stdout.on('data',b=>{logs=(logs+b).slice(-8192);});child.stderr.on('data',b=>{logs=(logs+b).slice(-8192);});
   for(let i=0;i<100;i++){
     if(child.exitCode!==null)throw Error('Local runtime exited: '+logs);

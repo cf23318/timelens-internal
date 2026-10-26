@@ -1,0 +1,8 @@
+{
+  "format": "timelens-cloudflare-registration-v1",
+  "issuerUrl": "https://timelens-oss-issuer.cf23318-hermes.workers.dev/",
+  "batchId": "cf-new-user-20261026",
+  "scope": "device",
+  "bucket": "umall-video-record",
+  "studyWindowDays": 7
+}

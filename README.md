@@ -4,11 +4,13 @@
 
 [English](README.en.md) · [下载安装包](https://github.com/cf23318/timelens-internal/releases) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
-## Cloudflare自动续期与默认上传（本地开发，未发布）
+## Cloudflare自助登记与自动上传
 
-员工专用包现支持“完成系统授权 → 首页填写姓名 → 点开始采集”。管理员在构建时通过源码外私有文件预置激活配置，员工无需处理JSON、地址、token或上传设置。设备自动激活、续期和同步；首次离线也可记录，联网后自动补传。公开CI只生成不含真实预置的通用诊断包，不能当成员工开箱即用包。当前已安装软件和Release尚未更新。
+员工首次使用：完成系统权限 → 首页填写姓名 → 点击“开始采集”。姓名按用户要求作为自助登记信息，不核验真实身份；任何取得软件并填姓名的人都可注册。固定设备ID和独立私有凭据由本机生成并保存，后续自动领取和续期上传授权，员工不导入JSON、不配置地址或Token。
 
-新增姓名必填、Cloudflare Workers签发服务和设备独立激活凭据。客户端启动/运行时自动检查，在到期前24小时续签；上传默认开启，无需确认，停止选择会保存，采集仍需手动开始。图片直接到OSS，不经Cloudflare。管理员工具需同步云签发台账后再执行到期删除。当前尚未部署、打包或更新Release，详见 [配置与部署说明](docs/cloudflare-issuer.md)。
+公开CI员工包只含公开服务配置，不含激活码或OSS长期Secret；可以直接下载对应Build产物，核对BUILD-INFO和SHA256SUMS。界面默认中文和浅色，保留手动开始、暂停及持久停止同步。首次离线可先记录，联网后用原身份和原截止补传。
+
+图片直传北京OSS，不经Cloudflare中转。每设备拥有独立目录和固定留存批准结束；客户端在授权到期前24小时自动检查续期。Cloudflare签发台账、管理员对账、回读与到期删除需配套运行，详见 [配置与部署说明](docs/cloudflare-issuer.md)。安装包目前无组织签名／公证；构建成功与实机验收分别记录。
 
 ## 上传状态与断网重试（0.17.10）
 
