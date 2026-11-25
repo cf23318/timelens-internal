@@ -1,6 +1,6 @@
 # TimeLens Internal · 内部采集版
 
-基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前源码测试版本为 **0.17.12**，已发布安装包以 Releases 为准。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
+基于 [gitxuzhefeng/timelines](https://github.com/gitxuzhefeng/timelines) v0.17.5（f8e7107）改造，保留 [MIT 许可证](LICENSE)。当前源码测试版本为 **0.17.13**，已发布安装包以 Releases 为准。这是用于本地屏幕采样与受控逐张上传的桌面客户端，支持 macOS 和 Windows；内部版的安装包与上游个人版不同。
 
 [English](README.en.md) · [下载安装包](https://github.com/cf23318/timelens-internal/releases) · [构建与测试包](https://github.com/cf23318/timelens-internal/actions/workflows/build.yml) · [安装与配置](docs/internal-frame-install.md) · [接收服务](upload-server/README.md)
 
@@ -30,7 +30,9 @@
 - 默认每 12 秒尝试截图，可配置 10–15 秒；窗口切换截图保留原分辨率，定时图默认宽 1600、质量 85，WebP 压缩和近似画面去重。它保存离散截图，不是连续录屏视频。
 - 默认采集前台窗口所在显示器，可选择全部显示器。新任务默认累计采集 48 小时，可在未开始且未绑定归档前配置总目标，也可提前结束。暂停、退出及长时间采样中断不累计；电脑空闲会停止截图，采集任务计时仍继续。
 - 本地保存应用、脱敏窗口标题、时长及可获取的网址域名/路径；记录复制流向估计，不保存按键内容或剪贴板正文。Windows 没有实现输入计数。浏览器地址栏隐藏协议时以 `//域名/路径` 表示协议未知。
-- 时间线和时间回放直接读取本地截图，**不依赖 OCR**。OCR 默认关闭，开启时在本机识别文字。外部 AI、在线更新及旧个人版 AI/导出入口已禁用或移除。
+- 时间线和时间回放直接读取本地截图，**不依赖 OCR**。OCR 默认关闭，开启时在本机识别文字。外部 AI 及旧个人版 AI/导出入口已禁用或移除。
+- 打开软件时会在后台检查内部版 GitHub Release，每个本机数据目录最多每 3 小时请求一次。发现新版时显示下载入口，由用户选择是否安装。
+- 异常退出后恢复可校验的本地截图及待传记录。任务文件或设备编号异常时，「一键修复」会检查可验证的本机恢复记录，保留已有截图和待传队列。修复成功后，仍在暂停的任务可手动继续采集。
 
 ## 本地签发7天OSS直传授权
 

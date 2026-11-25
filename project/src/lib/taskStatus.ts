@@ -11,7 +11,8 @@ export function taskLabel(status: InternalOverview["progress"]["status"], englis
 /** OSS acceptance is distinct from administrator reconciliation. */
 export function directFramesAccepted(data: InternalOverview): boolean {
   const { progress: p, uploads: q, snapshots } = data;
-  return data.config.uploadMode === "ossDirect" && p.status === "completed"
+  return !data.startupError && !data.uploadStatusError
+    && data.config.uploadMode === "ossDirect" && p.status === "completed"
     && p.endedAtMs != null && !p.needsFlush && !p.integrityError
     && !p.receipt && !p.storedBundle && !p.bundlePath
     && q.pending === 0 && q.blocked === 0 && q.legacy === 0
@@ -20,8 +21,15 @@ export function directFramesAccepted(data: InternalOverview): boolean {
 
 /** Shared by the toolbar and task page so neither can show stale pending text. */
 export function taskOverviewLabel(data: InternalOverview, english = false, now = Date.now()): string {
+  if (data.startupError) return english ? "Local task needs review" : "本机任务需核对";
   if (data.archive?.deleted) return english ? "Expired and removed" : "已到期清理";
   if (data.archive && now >= data.archive.deadlineMs) return english ? "Expired · Cleanup pending" : "已到期 · 等待清理";
+  if (data.progress.status === "recording" && captureUnavailable(data.captureNotice?.code)) {
+    return english ? "Capture unavailable · Timer paused" : "截图暂不可用 · 已暂停计时";
+  }
+  if (data.progress.status === "completed" && data.uploadStatusError) {
+    return english ? "Ended · Sync unavailable" : "已结束 · 同步暂不可用";
+  }
   if (directFramesAccepted(data)) {
     if (data.progress.lastError) return data.uploadActive
       ? (english ? "OSS accepted · Retrying inventory" : "OSS已接收 · 清单重试中")
@@ -37,4 +45,8 @@ export function taskOverviewLabel(data: InternalOverview, english = false, now =
       : (english ? "Ended · Uploading" : "已结束 · 上传中");
   }
   return taskLabel(data.progress.status, english);
+}
+
+export function captureUnavailable(code?: string): boolean {
+  return code === "capture_error" || code === "save_error" || code === "permission";
 }

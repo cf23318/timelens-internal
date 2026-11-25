@@ -4661,6 +4661,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -6374,7 +6375,7 @@ dependencies = [
 
 [[package]]
 name = "timelens"
-version = "0.17.12"
+version = "0.17.13"
 dependencies = [
  "age",
  "arboard",
@@ -6407,12 +6408,14 @@ dependencies = [
  "open",
  "parking_lot",
  "pulldown-cmark",
+ "quick-xml 0.38.4",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
  "screenshots",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

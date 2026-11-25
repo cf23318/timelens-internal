@@ -1,10 +1,11 @@
 //! Crash journal for newly captured images only. Existing screenshots are never auto-enrolled.
 use super::{
     frame_upload::{frame_bytes, Frame, UploadDraft, MAX_FRAME_BYTES},
+    internal::{InternalControl, LEGACY_UNCLEAN_EXIT_ERROR},
     models::SnapshotRow,
     storage::DataPaths,
-    writer::WriterHandle,
 };
+pub(super) const RECOVERY_ERROR: &str = "本地截图恢复未完成：";
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -24,6 +25,35 @@ fn journal_dir(paths: &DataPaths) -> Result<PathBuf, String> {
 fn manifest(paths: &DataPaths, id: &str) -> Result<PathBuf, String> {
     uuid::Uuid::parse_str(id).map_err(|_| "恢复清单编号无效")?;
     Ok(journal_dir(paths)?.join(format!("{id}.json")))
+}
+pub fn check_capture_storage(paths: &DataPaths) -> Result<(), String> {
+    let journal = journal_dir(paths).map_err(|e| format!("截图暂存目录不可用：{e}"))?;
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let shots = super::storage::private_subdir(&paths.shots_dir, &day)
+        .map_err(|e| format!("截图目录不可用：{e}"))?;
+    for directory in [journal, shots] {
+        let mut probe = tempfile::Builder::new().prefix(".timelens-write-probe-")
+            .tempfile_in(directory).map_err(|e| format!("本机截图目录暂时无法写入：{e}"))?;
+        probe.write_all(&[0]).and_then(|_| probe.as_file().sync_all())
+            .map_err(|e| format!("本机截图目录暂时无法写入：{e}"))?;
+    }
+    Ok(())
+}
+
+pub fn replay_after_pause(paths: &DataPaths, task: &str) -> Result<(), String> {
+    if super::archive::load(&paths.root)?.is_some_and(|binding|
+        binding.task_id != task || binding.deleted || chrono::Utc::now().timestamp_millis() >= binding.deadline_ms)
+    {
+        return Ok(());
+    }
+    if fs::read_dir(journal_dir(paths)?).map_err(|e| e.to_string())?.next().is_none() {
+        return Ok(());
+    }
+    let mut conn = rusqlite::Connection::open_with_flags(&paths.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;").map_err(|e| e.to_string())?;
+    recover(paths, &mut conn, task)?;
+    Ok(())
 }
 fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
@@ -105,164 +135,297 @@ pub fn committed(paths: &DataPaths, id: &str) -> Result<(), String> {
     fs::remove_file(&p).map_err(|e| e.to_string())?;
     sync_dir(p.parent().unwrap())
 }
-pub fn recover(paths: &DataPaths, writer: &WriterHandle, task_id: &str) -> Result<usize, String> {
-    let root = journal_dir(paths)?;
-    let mut count = 0;
-    // Interrupted atomic JSON writes cannot masquerade as committed recovery entries.
-    for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
-        let p = entry.map_err(|e| e.to_string())?.path();
-        if let Some(id) = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".json.tmp"))
-        {
-            uuid::Uuid::parse_str(id).map_err(|_| "恢复临时清单名称无效")?;
-            let meta = fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
-            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 32768 {
-                return Err("恢复临时清单无效".into());
-            }
-            let quarantine = super::storage::private_subdir(&paths.data_dir, "recovery-quarantine")
-                .map_err(|e| e.to_string())?;
-            let q = quarantine.join(format!("{}-{}.json.tmp", id, uuid::Uuid::new_v4()));
-            fs::rename(&p, q).map_err(|e| e.to_string())?;
-            sync_dir(&root)?;
-            sync_dir(&quarantine)?;
-        }
-    }
-    for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
-        let p = entry.map_err(|e| e.to_string())?.path();
-        let meta = fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
-        if !meta.is_file()
-            || meta.file_type().is_symlink()
-            || meta.len() > 32768
-            || p.extension().and_then(|s| s.to_str()) != Some("json")
-        {
-            return Err("恢复清单类型无效，已保留现场".into());
-        }
-        let mut bytes = Vec::new();
-        fs::File::open(&p)
-            .map_err(|e| e.to_string())?
-            .take(32769)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > 32768 {
-            return Err("恢复清单过大".into());
-        }
-        let j: Journal = serde_json::from_slice(&bytes).map_err(|_| "恢复清单损坏，已保留现场")?;
-        if j.version != 1
-            || j.upload.task_id != task_id
-            || p != manifest(paths, &j.row.id)?
-            || j.row.file_size_bytes < 12
-            || j.row.file_size_bytes as u64 != j.upload.size_bytes
-            || j.upload.size_bytes > MAX_FRAME_BYTES
-        {
-            return Err("恢复清单身份不匹配，已保留现场".into());
-        }
-        let target = Path::new(&j.row.file_path);
-        let parent = target.parent().ok_or("恢复路径无效")?;
-        if parent
-            .canonicalize()
-            .map_err(|_| "恢复目录不可用")?
-            .parent()
-            != Some(
-                paths
-                    .shots_dir
-                    .canonicalize()
-                    .map_err(|_| "恢复根目录不可用")?
-                    .as_path(),
-            )
-        {
-            return Err("恢复图片路径越界".into());
-        }
-        if !target
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.starts_with(&format!("{}_", j.row.id)))
-        {
-            return Err("恢复文件名无效".into());
-        }
-        let part = target.with_extension("webp.part");
-        if !target.exists() {
-            if !part.exists() {
-                committed(paths, &j.row.id)?;
-                continue;
-            } // Crash before the image write started.
-            let pm = fs::symlink_metadata(&part).map_err(|e| e.to_string())?;
-            if pm.file_type().is_symlink()
-                || !pm.is_file()
-                || pm.len() != j.upload.size_bytes
-                || j.upload.size_bytes > MAX_FRAME_BYTES
-            {
-                return Err("恢复中的图片不完整，已保留现场".into());
-            }
-            use sha2::{Digest, Sha256};
-            let data = fs::read(&part).map_err(|e| e.to_string())?;
-            if format!("{:x}", Sha256::digest(&data)) != j.upload.sha256 {
-                return Err("恢复中的图片校验失败".into());
-            }
-            fs::hard_link(&part, target).map_err(|e| e.to_string())?;
-            fs::remove_file(&part).map_err(|e| e.to_string())?;
-            sync_dir(parent)?;
-        }
-        let f = Frame {
-            participant_name: j.upload.participant_name.clone(),
-            task_id:j.upload.task_id.clone(),
-            id: j.row.id.clone(),
-            path: j.row.file_path.clone(),
-            captured_at_ms: j.row.captured_at_ms,
-            display_id: j.upload.display_id,
-            sha256: j.upload.sha256.clone(),
-            size_bytes: j.upload.size_bytes,
-            attempts: 0,
-        };
-        frame_bytes(paths, &f)?;
-        if part.exists() {
-            let pm = fs::symlink_metadata(&part).map_err(|e| e.to_string())?;
-            if !pm.is_file() || pm.file_type().is_symlink() || pm.len() != j.upload.size_bytes {
-                return Err("恢复临时图片不匹配，已保留现场".into());
-            }
-            use sha2::{Digest, Sha256};
-            let data = fs::read(&part).map_err(|e| e.to_string())?;
-            if format!("{:x}", Sha256::digest(&data)) != j.upload.sha256 {
-                return Err("恢复临时图片校验失败".into());
-            }
-            fs::remove_file(&part).map_err(|e| e.to_string())?;
-            sync_dir(parent)?;
-        }
-        writer.send_snapshot_confirmed(j.row.clone(), j.upload)?;
-        committed(paths, &j.row.id)?;
-        count += 1;
-    }
-    Ok(count)
+fn quarantine(paths: &DataPaths, file: &Path, name: &str) -> Result<(), String> {
+    let dir = super::storage::private_subdir(&paths.data_dir, "recovery-quarantine")
+        .map_err(|e| e.to_string())?;
+    fs::rename(file, dir.join(format!("{}-{name}", uuid::Uuid::new_v4())))
+        .map_err(|e| e.to_string())?;
+    sync_dir(&dir)?;
+    sync_dir(file.parent().unwrap())
 }
 
-/// Restore verifiable image journals before applying the conservative unclean-exit audit gate.
-/// A real writer integrity marker still blocks recovery; this never clears unknown event loss.
+#[derive(Debug, Default)]
+struct RecoverySummary {
+    restored: usize,
+    incomplete: usize,
+    deferred: usize,
+}
+
+enum EntryOutcome {
+    Ready(Journal),
+    Incomplete,
+    Ignored,
+}
+
+fn file_metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn recover_entry(
+    paths: &DataPaths,
+    task_id: &str,
+    path: &Path,
+) -> Result<EntryOutcome, String> {
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or("恢复清单名称无效")?;
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err("恢复清单类型无效，已保留现场".into());
+    }
+    if let Some(id) = name.strip_suffix(".json.tmp") {
+        uuid::Uuid::parse_str(id).map_err(|_| "恢复临时清单名称无效")?;
+        quarantine(paths, path, name)?;
+        return Ok(EntryOutcome::Ignored);
+    }
+    let id = name.strip_suffix(".json").ok_or("恢复清单扩展名无效")?;
+    uuid::Uuid::parse_str(id).map_err(|_| "恢复清单编号无效")?;
+    let mut bytes = Vec::new();
+    fs::File::open(path).map_err(|e| e.to_string())?
+        .take(32769)
+        .read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let journal = if bytes.len() <= 32768 {
+        serde_json::from_slice::<Journal>(&bytes).ok()
+    } else {
+        None
+    };
+    let Some(j) = journal else {
+        quarantine(paths, path, name)?;
+        return Ok(EntryOutcome::Incomplete);
+    };
+    if j.version != 1
+        || j.upload.task_id != task_id
+        || id != j.row.id
+        || j.row.file_size_bytes < 12
+        || j.row.file_size_bytes as u64 != j.upload.size_bytes
+        || j.upload.size_bytes > MAX_FRAME_BYTES
+    {
+        return Err("恢复清单身份不匹配，已保留现场".into());
+    }
+    let target = Path::new(&j.row.file_path);
+    let parent = target.parent().ok_or("恢复路径无效")?;
+    if parent.canonicalize().map_err(|_| "恢复目录不可用")?.parent()
+        != Some(paths.shots_dir.canonicalize().map_err(|_| "恢复根目录不可用")?.as_path())
+        || target.extension().and_then(|s| s.to_str()) != Some("webp")
+        || !target.file_name().and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with(&format!("{id}_")))
+    {
+        return Err("恢复图片路径越界或文件名无效".into());
+    }
+
+    let part = target.with_extension("webp.part");
+    let part_meta = file_metadata(&part)?;
+    let has_target = file_metadata(target)?.is_some();
+    if !has_target {
+        let Some(meta) = part_meta.as_ref() else {
+            committed(paths, id)?;
+            return Ok(EntryOutcome::Ignored);
+        };
+        if !valid_part(&part, meta, &j.upload)? {
+            quarantine(paths, &part, &format!("{id}.webp.part"))?;
+            quarantine(paths, path, name)?;
+            return Ok(EntryOutcome::Incomplete);
+        }
+        fs::hard_link(&part, target).map_err(|e| e.to_string())?;
+        sync_dir(parent)?;
+    }
+
+    let frame = Frame {
+        participant_name: j.upload.participant_name.clone(),
+        task_id: j.upload.task_id.clone(),
+        id: j.row.id.clone(),
+        path: j.row.file_path.clone(),
+        captured_at_ms: j.row.captured_at_ms,
+        display_id: j.upload.display_id,
+        sha256: j.upload.sha256.clone(),
+        size_bytes: j.upload.size_bytes,
+        attempts: 0,
+    };
+    frame_bytes(paths, &frame)?;
+    if let Some(meta) = part_meta {
+        if valid_part(&part, &meta, &j.upload)? {
+            fs::remove_file(&part).map_err(|e| e.to_string())?;
+            sync_dir(parent)?;
+        } else {
+            quarantine(paths, &part, &format!("{id}.webp.part"))?;
+        }
+    }
+
+    Ok(EntryOutcome::Ready(j))
+}
+
+fn valid_part(path: &Path, meta: &fs::Metadata, upload: &UploadDraft) -> Result<bool, String> {
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err("恢复中的图片文件类型无效，已保留现场".into());
+    }
+    if meta.len() != upload.size_bytes {
+        return Ok(false);
+    }
+    use sha2::{Digest, Sha256};
+    let mut data = Vec::new();
+    fs::File::open(path).map_err(|e| e.to_string())?
+        .take(upload.size_bytes + 1)
+        .read_to_end(&mut data).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(&data)) == upload.sha256
+        && data.get(..4) == Some(b"RIFF") && data.get(8..12) == Some(b"WEBP"))
+}
+
+fn recover(paths: &DataPaths, conn: &mut rusqlite::Connection, task_id: &str) -> Result<RecoverySummary, String> {
+    let root = journal_dir(paths)?;
+    let mut summary = RecoverySummary::default();
+    let entries = fs::read_dir(root).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| e.to_string())?;
+    for entry in entries {
+        match recover_entry(paths, task_id, &entry.path()) {
+            Ok(EntryOutcome::Ready(journal)) => {
+                match super::writer::restore_snapshot(conn, &journal.row, &journal.upload) {
+                    Ok(()) => {
+                        summary.restored += 1;
+                        if let Err(error) = committed(paths, &journal.row.id) {
+                            log::warn!("截图已恢复，暂时无法清理恢复清单：{error}");
+                            summary.deferred += 1;
+                        }
+                    }
+                    Err(error) if matches!(error, rusqlite::Error::InvalidQuery)
+                        || error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+                    {
+                        log::warn!("截图恢复记录与数据库不一致，已保留：{error}");
+                        summary.deferred += 1;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(EntryOutcome::Incomplete) => summary.incomplete += 1,
+            Ok(EntryOutcome::Ignored) => {}
+            Err(error) => {
+                log::warn!("跳过单条截图恢复记录：{error}");
+                summary.deferred += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+pub(super) fn is_legacy_writer_fault(message: &str) -> bool {
+    matches!(message,
+        "数据库写入失败，已禁止自动清理：FOREIGN KEY constraint failed"
+        | "数据库写入失败，已禁止自动清理：database is locked"
+        | "数据库写入失败，已禁止自动清理：database table is locked"
+        | "数据库写入失败，已禁止自动清理：database or disk is full"
+        | "数据库队列已满，存在未写入的数据；已禁止自动清理"
+        | "数据库写入线程已中断，已禁止自动清理"
+    )
+}
+
+fn is_legacy_recovery_error(message: &str) -> bool {
+    message == LEGACY_UNCLEAN_EXIT_ERROR
+        || message.starts_with(RECOVERY_ERROR)
+        || matches!(message,
+            "恢复临时清单无效"
+            | "恢复临时清单名称无效"
+            | "恢复清单类型无效，已保留现场"
+            | "恢复清单损坏，已保留现场"
+            | "恢复清单过大"
+            | "恢复清单身份不匹配，已保留现场"
+            | "恢复中的图片不完整，已保留现场"
+            | "恢复中的图片校验失败"
+            | "恢复中的图片文件类型无效，已保留现场"
+            | "恢复临时图片不匹配，已保留现场"
+            | "恢复临时图片校验失败"
+            | "等待截图数据库提交超时，恢复清单已保留"
+        )
+}
+
+pub(super) fn database_passes_check(conn: &rusqlite::Connection) -> bool {
+    conn.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .is_ok_and(|check| check == "ok")
+        && conn.prepare("PRAGMA foreign_key_check").and_then(|mut stmt| {
+            stmt.query([])?.next().map(|row| row.is_none())
+        }).unwrap_or(false)
+}
+
+/// Replay in SQLite transactions before the writer and upload worker start.
 pub fn startup(
     paths: &DataPaths,
-    writer: &WriterHandle,
-    control: &super::internal::InternalControl,
+    conn: &mut rusqlite::Connection,
+    control: &InternalControl,
 ) -> Result<(), String> {
-    let task = control.progress.lock().task_id.clone();
-    if let Err(error) = recover(paths, writer, &task) {
+    let progress = control.progress.lock().clone();
+    if super::archive::ensure_live(&paths.root, &progress.task_id, chrono::Utc::now().timestamp_millis()).is_err() {
+        return Ok(());
+    }
+    let marker_path = paths.data_dir.join("integrity-error.json");
+    if let Some(error) = super::writer::read_integrity_marker(&marker_path) {
+        if !is_legacy_writer_fault(&error) || !database_passes_check(conn) {
+            return control.edit_progress(|p| {
+                p.last_error = Some(error.clone());
+                p.integrity_error = Some(error);
+                Ok(())
+            });
+        }
+        // Keep the old diagnostic, but let a healthy database process the pending journal.
+        // Clear the matching task message first so an interruption here is retryable.
         control.edit_progress(|p| {
-            p.integrity_error = Some(error.clone());
-            p.last_error = Some(error);
+            for slot in [&mut p.integrity_error, &mut p.last_error] {
+                if slot.as_ref() == Some(&error) {
+                    *slot = None;
+                }
+            }
             Ok(())
         })?;
+        if let Err(error) = quarantine(paths, &marker_path, "writer-error.json") {
+            log::warn!("已确认数据库可恢复，旧错误标记暂未移动：{error}");
+        }
     }
-    let audit = control.progress.lock().integrity_error.clone();
-    if let Some(error) = audit {
-        *writer.metrics.last_error.lock() = Some(error);
+
+    match recover(paths, conn, &progress.task_id) {
+        Ok(summary) => {
+            // Older capture code could persist a single file error without a journal
+            // or leave it behind after committing the last journal.
+            let old_file_error = progress.integrity_error.as_deref()
+                .is_some_and(|error| error.contains("(os error "))
+                && database_passes_check(conn);
+            let obsolete = |error: &str| is_legacy_recovery_error(error)
+                || (old_file_error && error.contains("(os error "))
+                || (is_legacy_writer_fault(error) && database_passes_check(conn));
+            if !progress.needs_flush && summary.incomplete + summary.deferred == 0
+                && !progress.integrity_error.as_deref().is_some_and(obsolete)
+                && !progress.last_error.as_deref().is_some_and(obsolete)
+            {
+                return Ok(());
+            }
+            control.edit_progress(|p| {
+                if p.integrity_error.as_deref().is_some_and(obsolete) {
+                    p.integrity_error = None;
+                }
+                if p.last_error.as_deref().is_some_and(obsolete) {
+                    p.last_error = None;
+                }
+                p.needs_flush = false;
+                if summary.incomplete + summary.deferred > 0 {
+                    p.last_error = Some(format!(
+                        "截图恢复时隔离了 {} 条不完整记录，保留了 {} 条待核对记录。",
+                        summary.incomplete, summary.deferred
+                    ));
+                }
+                Ok(())
+            })
+        }
+        Err(error) => control.edit_progress(|p| {
+            let error = format!("{RECOVERY_ERROR}{error}");
+            p.last_error = Some(error.clone());
+            p.integrity_error.get_or_insert(error);
+            // The previous process has exited. A recovery-folder failure need not block capture.
+            p.needs_flush = false;
+            Ok(())
+        }),
     }
-    Ok(())
 }
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        models::{SessionUpdateOp, WriteEvent},
-        storage::db,
-    };
+    use super::super::storage::db;
     use super::*;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -271,7 +434,7 @@ mod tests {
     fn fixture() -> (
         tempfile::TempDir,
         DataPaths,
-        WriterHandle,
+        rusqlite::Connection,
         SnapshotRow,
         UploadDraft,
         Vec<u8>,
@@ -286,26 +449,12 @@ mod tests {
             root,
         };
         paths.ensure_dirs().unwrap();
-        let w = super::super::writer::spawn_writer_thread(
-            db::open_write(&paths.db_path).unwrap(),
-            Arc::new(Default::default()),
-        );
-        w.try_send(WriteEvent::SessionUpdate(SessionUpdateOp::Insert {
-            id: "session".into(),
-            app_name: "fixture".into(),
-            bundle_id: None,
-            window_title: "synthetic".into(),
-            start_ms: 0,
-            end_ms: 1000,
-            duration_ms: 1000,
-            intent: None,
-            raw_event_count: 0,
-            is_active: 0,
-            extracted_url: None,
-            extracted_file_path: None,
-        }))
-        .unwrap();
-        w.flush().unwrap();
+        let conn = db::open_write(&paths.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO window_sessions(id, start_ms, end_ms, duration_ms, app_name, window_title, is_active)
+             VALUES ('session', 0, 1000, 1000, 'fixture', 'synthetic', 0)",
+            [],
+        ).unwrap();
         let task = uuid::Uuid::new_v4().to_string();
         let id = uuid::Uuid::new_v4().to_string();
         let dir = super::super::storage::private_subdir(&paths.shots_dir, "1970-01-01").unwrap();
@@ -325,16 +474,16 @@ mod tests {
             perceptual_hash: None,
         };
         let draft = UploadDraft::new(&task, "display-1", &bytes, "测试 人员").unwrap();
-        (temp, paths, w, row, draft, bytes)
+        (temp, paths, conn, row, draft, bytes)
     }
     #[test]
     fn crash_after_image_commit_recovers_once_without_enrolling_legacy() {
-        let (_t, p, w, row, draft, bytes) = fixture();
+        let (_t, p, mut conn, row, draft, bytes) = fixture();
         stage(&p, &row, &draft, &bytes).unwrap();
-        assert!(recover(&p, &w, &uuid::Uuid::new_v4().to_string()).is_err());
+        assert_eq!(recover(&p, &mut conn, &uuid::Uuid::new_v4().to_string()).unwrap().deferred, 1);
         assert!(Path::new(&row.file_path).exists());
-        assert_eq!(recover(&p, &w, &draft.task_id).unwrap(), 1);
-        assert_eq!(recover(&p, &w, &draft.task_id).unwrap(), 0);
+        assert_eq!(recover(&p, &mut conn, &draft.task_id).unwrap().restored, 1);
+        assert_eq!(recover(&p, &mut conn, &draft.task_id).unwrap().restored, 0);
         let c = rusqlite::Connection::open(&p.db_path).unwrap();
         assert_eq!(c.query_row("SELECT participant_name FROM frame_upload_outbox WHERE snapshot_id=?",[&row.id],|r|r.get::<_,String>(0)).unwrap(),draft.participant_name);
         assert_eq!(
@@ -356,7 +505,7 @@ mod tests {
             "final-and-part",
             "db-committed",
         ] {
-            let (_t, p, w, row, draft, bytes) = fixture();
+            let (_t, p, mut conn, row, draft, bytes) = fixture();
             let target = Path::new(&row.file_path);
             let part = target.with_extension("webp.part");
             stage(&p, &row, &draft, &bytes).unwrap();
@@ -380,30 +529,37 @@ mod tests {
                     fs::hard_link(target, &part).unwrap();
                 }
                 "db-committed" => {
-                    w.send_snapshot_confirmed(row.clone(), draft.clone())
-                        .unwrap();
+                    super::super::writer::restore_snapshot(&mut conn, &row, &draft).unwrap();
+                    conn.execute("UPDATE frame_upload_outbox SET status='verified' WHERE snapshot_id=?", [&row.id]).unwrap();
                 }
                 _ => unreachable!(),
             }
-            let result = recover(&p, &w, &draft.task_id);
-            if phase == "partial-part" {
-                assert!(result.is_err());
-                assert!(m.exists());
-                assert!(part.exists());
-                continue;
-            }
-            assert!(result.is_ok(), "{phase}: {result:?}");
+            let result = recover(&p, &mut conn, &draft.task_id);
+            let summary = result.unwrap_or_else(|e| panic!("{phase}: {e}"));
             assert!(!m.exists());
             assert!(!part.exists());
-            if ["complete-part", "final-and-part", "db-committed"].contains(&phase) {
+            let complete = ["complete-part", "final-and-part", "db-committed"].contains(&phase);
+            assert_eq!(summary.restored, usize::from(complete));
+            assert_eq!(summary.incomplete, usize::from(phase == "partial-part"));
+            if complete {
                 assert_eq!(fs::read(target).unwrap(), bytes);
             }
-            assert_eq!(recover(&p, &w, &draft.task_id).unwrap(), 0);
+            if phase == "partial-part" {
+                let quarantine = p.data_dir.join("recovery-quarantine");
+                assert_eq!(fs::read_dir(quarantine).unwrap().count(), 2);
+                let conn = rusqlite::Connection::open(&p.db_path).unwrap();
+                assert_eq!(super::super::frame_upload::stats(&conn, &draft.task_id).unwrap().pending, 0);
+            }
+            if phase == "db-committed" {
+                let status: String = conn.query_row("SELECT status FROM frame_upload_outbox WHERE snapshot_id=?", [&row.id], |r| r.get(0)).unwrap();
+                assert_eq!(status, "verified");
+            }
+            assert_eq!(recover(&p, &mut conn, &draft.task_id).unwrap().restored, 0);
         }
     }
     #[test]
-    fn real_unclean_startup_recovers_images_but_keeps_pause_and_audit() {
-        let (_t, p, w, row, mut draft, bytes) = fixture();
+    fn unclean_startup_recovers_images_and_allows_explicit_resume() {
+        let (_t, p, mut conn, mut row, mut draft, bytes) = fixture();
         let c = super::super::internal::InternalControl::load(
             &p.root,
             Arc::new(AtomicBool::new(false)),
@@ -411,20 +567,40 @@ mod tests {
         .unwrap();
         crate::core::internal::fill_test_participant_name(&c);
         c.start().unwrap();
+        c.advance(2000).unwrap();
         draft.task_id = c.progress.lock().task_id.clone();
+        row.session_id = "not-committed-before-exit".into();
         stage(&p, &row, &draft, &bytes).unwrap();
+        let mut incomplete = row.clone();
+        incomplete.id = uuid::Uuid::new_v4().to_string();
+        let target = Path::new(&row.file_path).with_file_name(format!("{}_display-1_poll.webp", incomplete.id));
+        incomplete.file_path = target.to_string_lossy().into_owned();
+        stage(&p, &incomplete, &draft, &bytes).unwrap();
+        fs::rename(&target, target.with_extension("webp.part")).unwrap();
+        fs::write(target.with_extension("webp.part"), b"interrupted").unwrap();
+        fs::write(manifest(&p, &uuid::Uuid::new_v4().to_string()).unwrap(), b"{").unwrap();
         drop(c);
         let restored = super::super::internal::InternalControl::load(
             &p.root,
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        assert!(restored.progress.lock().integrity_error.is_some());
-        assert!(w.check_health().is_ok());
-        startup(&p, &w, &restored).unwrap();
+        assert!(restored.progress.lock().needs_flush);
+        startup(&p, &mut conn, &restored).unwrap();
         assert!(!restored.tracking.load(Ordering::SeqCst));
-        assert!(restored.progress.lock().integrity_error.is_some());
-        assert!(w.check_health().is_err());
+        let progress = restored.progress.lock().clone();
+        assert_eq!(progress.task_id, draft.task_id);
+        assert_eq!(progress.elapsed_ms, 2000);
+        assert!(!progress.needs_flush);
+        assert!(progress.integrity_error.is_none());
+        assert!(progress.last_error.as_deref().unwrap().contains("2 条不完整记录"));
+        assert!(super::super::cloud_auth::auto_ready(&restored.config.read(), &progress));
+        assert!(database_passes_check(&conn));
+        let session: (String, i64) = conn.query_row(
+            "SELECT window_title, is_active FROM window_sessions WHERE id=?",
+            [&row.session_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(session, ("恢复的截图".into(), 0));
         let c = rusqlite::Connection::open(&p.db_path).unwrap();
         assert_eq!(
             super::super::frame_upload::stats(&c, &draft.task_id)
@@ -433,6 +609,89 @@ mod tests {
             1
         );
         assert!(Path::new(&row.file_path).exists());
+        startup(&p, &mut conn, &restored).unwrap();
+        assert_eq!(super::super::frame_upload::stats(&c, &draft.task_id).unwrap().pending, 1);
+        restored.start().unwrap();
+        assert!(restored.tracking.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn old_blocked_task_recovers_even_if_pause_retry_already_cleared_needs_flush() {
+        let (_t, paths, mut conn, _, _, _) = fixture();
+        let control = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+        crate::core::internal::fill_test_participant_name(&control);
+        control.start().unwrap();
+        control.pause(false).unwrap();
+        control.edit_progress(|p| {
+            p.needs_flush = false;
+            p.integrity_error = Some(LEGACY_UNCLEAN_EXIT_ERROR.into());
+            p.last_error = p.integrity_error.clone();
+            Ok(())
+        }).unwrap();
+        drop(control);
+        let reopened = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+        startup(&paths, &mut conn, &reopened).unwrap();
+        assert!(!reopened.tracking.load(Ordering::SeqCst));
+        assert!(reopened.progress.lock().integrity_error.is_none());
+        reopened.start().unwrap();
+    }
+    #[test]
+    fn failed_writer_is_not_reset_by_legacy_task_recovery() {
+        let (_t, paths, mut conn, _, _, _) = fixture();
+        let control = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+        let error = "数据库写入失败";
+        let marker = paths.data_dir.join("integrity-error.json");
+        super::super::internal::write_json_atomic(&marker, &error).unwrap();
+        startup(&paths, &mut conn, &control).unwrap();
+        assert!(marker.exists());
+        assert_eq!(control.progress.lock().integrity_error.as_deref(), Some(error));
+    }
+    #[test]
+    fn legacy_database_and_capture_errors_unblock_after_verified_recovery() {
+        for error in [
+            "数据库写入失败，已禁止自动清理：FOREIGN KEY constraint failed",
+            "数据库写入失败，已禁止自动清理：database is locked",
+            "数据库队列已满，存在未写入的数据；已禁止自动清理",
+            "恢复中的图片不完整，已保留现场",
+            "Permission denied (os error 13)",
+        ] {
+            let (_t, paths, mut conn, mut row, mut draft, bytes) = fixture();
+            let control = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+            crate::core::internal::fill_test_participant_name(&control);
+            control.start().unwrap();
+            draft.task_id = control.progress.lock().task_id.clone();
+            row.session_id = "uncommitted".into();
+            stage(&paths, &row, &draft, &bytes).unwrap();
+            control.edit_progress(|p| {
+                p.integrity_error = Some(error.into());
+                p.last_error = Some(error.into());
+                Ok(())
+            }).unwrap();
+            let marker = paths.data_dir.join("integrity-error.json");
+            if is_legacy_writer_fault(error) {
+                super::super::internal::write_json_atomic(&marker, &error).unwrap();
+            }
+            let reopened = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+            startup(&paths, &mut conn, &reopened).unwrap();
+            assert!(!marker.exists());
+            assert!(reopened.progress.lock().integrity_error.is_none(), "{error}");
+            assert_eq!(super::super::frame_upload::stats(&conn, &draft.task_id).unwrap().pending, 1);
+            reopened.start().unwrap();
+        }
+    }
+    #[test]
+    fn blocked_quarantine_keeps_the_old_marker_without_blocking_a_healthy_writer() {
+        let (_t, paths, mut conn, _row, _draft, _bytes) = fixture();
+        let control = InternalControl::load(&paths.root, Arc::new(AtomicBool::new(false))).unwrap();
+        crate::core::internal::fill_test_participant_name(&control);
+        let marker = paths.data_dir.join("integrity-error.json");
+        let error = "数据库写入失败，已禁止自动清理：database is locked";
+        super::super::internal::write_json_atomic(&marker, &error).unwrap();
+        fs::write(paths.data_dir.join("recovery-quarantine"), b"blocked").unwrap();
+        startup(&paths, &mut conn, &control).unwrap();
+        assert!(marker.exists());
+        let writer = super::super::writer::spawn_recovered_writer_thread(conn, Arc::new(Default::default()));
+        writer.check_health().unwrap();
+        control.start().unwrap();
     }
     #[cfg(unix)]
     #[test]
@@ -448,11 +707,18 @@ mod tests {
         assert!(!Path::new(&row.file_path).exists());
     }
     #[test]
-    fn database_failure_returns_error_and_keeps_image_and_manifest() {
-        let (_t, p, w, mut row, draft, bytes) = fixture();
+    fn database_busy_preserves_the_image_and_retry_restores_the_outbox() {
+        let (_t, p, conn, mut row, draft, bytes) = fixture();
+        conn.busy_timeout(std::time::Duration::from_millis(25)).unwrap();
+        let blocker = rusqlite::Connection::open(&p.db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let w = super::super::writer::spawn_writer_thread(conn, Arc::new(Default::default()));
         row.session_id = "missing-session".into();
         stage(&p, &row, &draft, &bytes).unwrap();
-        assert!(w.send_snapshot_confirmed(row.clone(), draft).is_err());
+        assert!(w.send_snapshot_confirmed(row.clone(), draft.clone()).is_err());
+        assert!(w.check_health().is_ok());
+        assert!(w.flush().is_err());
+        assert!(!p.data_dir.join("integrity-error.json").exists());
         let c = rusqlite::Connection::open(&p.db_path).unwrap();
         for table in ["snapshots", "frame_upload_outbox"] {
             assert_eq!(
@@ -464,5 +730,21 @@ mod tests {
         }
         assert!(Path::new(&row.file_path).exists());
         assert!(manifest(&p, &row.id).unwrap().exists());
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        w.flush().unwrap();
+        replay_after_pause(&p, &draft.task_id).unwrap();
+        assert!(!manifest(&p, &row.id).unwrap().exists());
+        assert_eq!(super::super::frame_upload::stats(&c, &draft.task_id).unwrap().pending, 1);
+    }
+
+    #[test]
+    fn screenshot_commits_when_the_session_insert_was_lost() {
+        let (_t, p, conn, mut row, draft, bytes) = fixture();
+        row.session_id = "dropped-session".into();
+        stage(&p, &row, &draft, &bytes).unwrap();
+        let w = super::super::writer::spawn_writer_thread(conn, Arc::new(Default::default()));
+        w.send_snapshot_confirmed(row, draft.clone()).unwrap();
+        let conn = db::open_read(&p.db_path).unwrap();
+        assert_eq!(super::super::frame_upload::stats(&conn.lock(), &draft.task_id).unwrap().pending, 1);
     }
 }

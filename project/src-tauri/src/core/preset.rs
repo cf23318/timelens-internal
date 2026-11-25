@@ -7,7 +7,6 @@ use super::internal::InternalControl;
 
 const RAW:&str=include_str!(concat!(env!("OUT_DIR"),"/timelens-activation-preset.json"));
 pub fn employee_mode()->bool {RAW!="null"}
-pub(super) fn activation_raw()->Option<&'static str> {employee_mode().then_some(RAW)}
 pub fn build_info()->Value {
     let credential=serde_json::from_str::<Value>(RAW).is_ok_and(|v|v["format"]=="timelens-cloudflare-activation-v1");
     let discovery=serde_json::from_str::<Value>(RAW).is_ok_and(|v|v["format"]=="timelens-cloudflare-discovery-v1");
@@ -16,10 +15,9 @@ pub fn build_info()->Value {
 pub fn prepare(root:&Path,control:&InternalControl)->Result<(),String> {
     if employee_mode() {super::cloud_auth::prepare_preset(root,control,RAW)?;}Ok(())
 }
-pub fn summary(root:&Path,control:&InternalControl)->Value {
+pub fn summary(cloud_configured: bool, grant_valid: bool)->Value {
     let managed=employee_mode();
-    let cloud=super::cloud_auth::summary(root,control);
-    json!({"employeeMode":managed,"activationPending":managed && !super::oss_direct::summary(root,&control.config.read())["valid"].as_bool().unwrap_or(false),"configured":cloud.configured})
+    json!({"employeeMode":managed,"activationPending":managed && !grant_valid,"configured":cloud_configured})
 }
 
 #[cfg(test)]

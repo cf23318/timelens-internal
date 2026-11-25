@@ -156,32 +156,84 @@ pub fn get_internal_progress(state: State<'_, AppState>) -> crate::core::interna
 pub async fn get_internal_overview(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (config, progress) = {
-            let _gate = state.0.internal.gate.read();
-            let progress = state.0.internal.progress.lock().clone();
-            let config = state.0.internal.config.read().clone();
-            (config, progress)
+        let config = state.0.internal.config.read().clone();
+        let progress = state.0.internal.progress.lock().clone();
+        let startup_issue = state.0.internal.startup_issue.lock().clone();
+        let startup_error = startup_issue.as_ref().map(|issue| &issue.detail);
+        let (stats, uploads) = {
+            let conn = state.0.read_conn.lock();
+            (crate::core::desktop::snapshot_stats(&conn)?,
+             crate::core::frame_upload::stats(&conn, &progress.task_id))
         };
-        let stats = crate::core::desktop::snapshot_stats(&state.0.read_conn.lock())?;
+        let device = if startup_error.is_none() {
+            crate::core::oss_direct::device_id(&state.0.paths.root).ok()
+        } else { None };
+        let device_unavailable = startup_error.is_none() && config.upload_mode == "ossDirect"
+            && device.is_none();
+        let upload_status_error = if uploads.is_err() { Some("queue") }
+            else if config.validate_upload().is_err() { Some("config") }
+            else if device_unavailable { Some("device") }
+            else { None };
         let token_present = config.upload_mode == "receiver" && crate::core::frame_upload::read_token(&state.0.paths.root).is_ok();
         let mut missing = crate::core::desktop::upload_missing(&config, token_present);
         let direct = config.upload_mode == "ossDirect";
-        let grant = crate::core::oss_direct::summary(&state.0.paths.root,&config);
+        let grant = if device.is_some() {
+            crate::core::oss_direct::summary(&state.0.paths.root,&config)
+        } else { serde_json::json!({"valid": false}) };
         if direct && grant["valid"] != true { missing.push("ossGrant"); }
         if !crate::core::archive::owner_matches(&state.0.paths,&progress.task_id) { missing.push("profile"); }
+        if upload_status_error.is_some() { missing.push("uploadState"); }
+        let archive = match crate::core::archive::load(&state.0.paths.root) {
+            Ok(archive) => archive,
+            Err(_) if startup_error.is_some() => None,
+            Err(error) => return Err(error),
+        };
+        let cloud_issuer = if startup_error.is_none() {
+            crate::core::cloud_auth::summary(&state.0.paths.root, &state.0.internal)
+        } else { crate::core::cloud_auth::CloudStatus::default() };
+        let onboarding = crate::core::preset::summary(cloud_issuer.configured, grant["valid"] == true);
         Ok(serde_json::json!({
-            "fixedDeviceId": crate::core::oss_direct::device_id(&state.0.paths.root)?,
+            "fixedDeviceId": device,
+            "startupError": startup_error,
+            "startupIssue": startup_issue,
+            "uploadStatusError": upload_status_error,
+            "deviceIdentityUnavailable": device_unavailable,
             "ossGrant": grant,
-            "cloudIssuer": crate::core::cloud_auth::summary(&state.0.paths.root,&state.0.internal),
-            "onboarding": crate::core::preset::summary(&state.0.paths.root,&state.0.internal),
-            "archive": crate::core::archive::load(&state.0.paths.root)?,
+            "cloudIssuer": cloud_issuer,
+            "onboarding": onboarding,
+            "archive": archive,
             "config": config, "progress": progress, "snapshots": stats,
             "captureNotice": state.0.internal.capture_notice.lock().clone(),
             "uploadMissing": missing,
-            "uploads": crate::core::frame_upload::stats(&state.0.read_conn.lock(), &progress.task_id)?,
+            "uploads": uploads.unwrap_or_default(),
             "uploadActive": state.0.internal.frame_upload_running.load(Ordering::SeqCst),
         }))
     }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn repair_local_task(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if state.0.exiting.load(Ordering::SeqCst) {
+            return Err("TimeLens 正在退出".into());
+        }
+        let task_repaired = state.0.internal.repair_local_task(&state.0.paths, &state.0.writer)?;
+        let device_result = state.0.internal.repair_device_identity();
+        if task_repaired {
+            crate::core::archive::spawn(app.clone());
+            crate::core::cloud_auth::spawn(app);
+        }
+        let (device_repaired, device_error) = match device_result {
+            Ok(repaired) => (repaired, None),
+            Err(error) => (false, Some(error)),
+        };
+        Ok(serde_json::json!({
+            "taskRepaired": task_repaired,
+            "deviceRepaired": device_repaired,
+            "deviceError": device_error,
+        }))
+    }).await.map_err(|_| "本机任务修复未完成，请重试".to_string())?
 }
 
 #[tauri::command]
@@ -199,10 +251,12 @@ pub async fn finish_internal_task(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        state.0.internal.require_operable()?;
         {
             let _gate = state.0.internal.gate.read();
             let progress = state.0.internal.progress.lock().clone();
             let config = state.0.internal.config.read().clone();
+            config.validate_upload()?;
             if config.upload_mode == "ossDirect" {
                 crate::core::oss_direct::validate_confirmation(&state.0.paths.root,&config,&progress,&confirmation)?;
             } else {
@@ -708,24 +762,19 @@ pub fn get_app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateCheckResult {
-    pub has_update: bool,
-    pub latest_version: String,
-    pub release_url: String,
-    pub release_notes: String,
+#[tauri::command]
+pub async fn check_for_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    checker: State<'_, crate::core::updates::UpdateChecker>,
+) -> Result<Option<String>, String> {
+    Ok(checker.check(&state.0.paths.root, &app.package_info().version).await)
 }
 
 #[tauri::command]
-pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
-    let current = app.package_info().version.to_string();
-    Ok(UpdateCheckResult {
-        has_update: false,
-        latest_version: current,
-        release_url: String::new(),
-        release_notes: "内部采集版已停用在线更新".into(),
-    })
+pub fn open_update_release(version: String) -> Result<(), String> {
+    let url = crate::core::updates::release_url(&version).ok_or("发行版本号无效")?;
+    open::that_detached(url).map_err(|_| "无法打开默认浏览器".into())
 }
 
 /// 用系统默认浏览器打开 URL（window.open 在 Tauri 2 中不会开系统浏览器）

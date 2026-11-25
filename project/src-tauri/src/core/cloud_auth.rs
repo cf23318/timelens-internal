@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use super::{internal::{InternalControl, InternalConfig, TaskProgress}, oss_direct::{self, Grant}};
 
-const FILE: &str = "cloud-issuer-device.json";
+pub(super) const FILE: &str = "cloud-issuer-device.json";
 const DAY: i64 = 86_400_000;
 #[derive(Default, Clone, Serialize)]
 #[serde(rename_all="camelCase")]
@@ -63,10 +63,32 @@ fn url(value: &str) -> Result<reqwest::Url,String> {
     Ok(u)
 }
 fn enrollment(root:&Path)->Result<Enrollment,String> {
+    let e = saved_enrollment(root)?;
+    if e.device_id != oss_direct::device_id(root)? { return Err("设备激活身份不匹配".into()); }
+    Ok(e)
+}
+fn saved_enrollment(root:&Path)->Result<Enrollment,String> {
     let e:Enrollment=serde_json::from_slice(&oss_direct::private_read(&root.join(FILE))?).map_err(|_|"设备激活配置无效")?;
     url(&e.issuer_url)?;
-    if e.device_id!=oss_direct::device_id(root)? || !is_secret(&e.device_secret) || e.activation_code.as_ref().is_some_and(|s|!is_secret(s)) || e.registration_pending && e.activation_code.is_some() { return Err("设备激活身份不匹配".into()); }
+    if !is_secret(&e.device_secret) || e.activation_code.as_ref().is_some_and(|s|!is_secret(s)) || e.registration_pending && e.activation_code.is_some() { return Err("设备激活身份不匹配".into()); }
     Ok(e)
+}
+pub(super) fn enrolled_device_for_repair(
+    root: &Path,
+    config: &InternalConfig,
+    grant: Option<&Grant>,
+) -> Result<String, String> {
+    let e = saved_enrollment(root)?;
+    if !["device", "shared"].contains(&e.expected.scope.as_str())
+        || (!config.upload_device_id.is_empty() && (
+            config.upload_url != format!("https://{}.oss-cn-beijing.aliyuncs.com/", e.expected.bucket)
+                || config.upload_survey_id != e.expected.batch_id || config.archive_end_at != e.expected.archive_end_at
+        ))
+        || grant.is_some_and(|grant| !e.expected.matches(grant))
+    {
+        return Err("云端登记与本机任务的上传范围不一致，已保留现有记录".into());
+    }
+    Ok(e.device_id)
 }
 pub fn summary(root:&Path, control:&InternalControl)->CloudStatus {
     let mut s=control.cloud_status.lock().clone();
@@ -155,9 +177,9 @@ fn install_initial(root:&Path,control:&InternalControl,grant:&Grant,preset_manag
     if !old.upload_url.is_empty() {grant.matches_config(&old)?;}
     let mut cfg=old.clone();cfg.upload_mode="ossDirect".into();cfg.upload_url=grant.endpoint.clone();cfg.upload_survey_id=grant.user_id.clone();cfg.upload_device_id=grant.device_id.clone();cfg.archive_end_at=grant.archive_end_at.clone();cfg.domestic_server_confirmed=true;
     cfg.validate()?;cfg.require_participant_name()?;
-    super::internal::write_json_atomic(&root.join("internal-config.json"),&cfg)?;
+    super::internal::write_config(root, &cfg, &p.task_id)?;
     if let Err(e)=super::internal::write_json_atomic(&root.join(oss_direct::GRANT_FILE),grant) {
-        super::internal::write_json_atomic(&root.join("internal-config.json"),&old).map_err(|_|"首次授权失败且配置恢复失败，请停止上传并核对")?;return Err(e);
+        super::internal::write_config(root, &old, &p.task_id).map_err(|_|"首次授权失败且配置恢复失败，请停止上传并核对")?;return Err(e);
     }
     *control.config.write()=cfg;Ok(())
 }
@@ -216,7 +238,7 @@ pub fn prepare_preset(root:&Path,control:&InternalControl,raw:&str)->Result<(),S
     }
     if !existing || !e.preset_managed {e.preset_managed=true;super::internal::write_json_atomic(&root.join(FILE),&e)?;}
     if serde_json::to_vec(&cfg).unwrap()!=serde_json::to_vec(&old).unwrap() {
-        super::internal::write_json_atomic(&root.join("internal-config.json"),&cfg)?;*control.config.write()=cfg;
+        super::internal::write_config(root, &cfg, &p.task_id)?;*control.config.write()=cfg;
     }
     Ok(())
 }
@@ -245,6 +267,7 @@ fn recover_with_client(root:&Path,control:&InternalControl,grant:&Grant,client:&
     match r {Err(error) if retryable_renewal(&error)=>Recovery::RetryLater,Ok(()) if oss_direct::load(root,&control.config.read()).is_ok_and(|next|next.fingerprint()!=grant.fingerprint())=>Recovery::Updated,_=>Recovery::Unchanged}
 }
 pub fn activate(root:&Path,control:&InternalControl,raw:&str)->Result<(),String> {
+    control.require_operable()?;
     let a:Activation=serde_json::from_str(raw).map_err(|_|"云端激活配置格式无效")?;
     if a.format!="timelens-cloudflare-activation-v1" || !is_secret(&a.activation_code) {return Err("云端激活配置无效".into());}
     let issuer=url(&a.issuer_url)?.to_string();
@@ -276,15 +299,17 @@ pub fn activate(root:&Path,control:&InternalControl,raw:&str)->Result<(),String>
     let mut s=control.cloud_status.lock();s.last_checked_ms=Utc::now().timestamp_millis();s.last_error=result.as_ref().err().cloned(); result
 }
 pub fn set_auto(control:&InternalControl,enabled:bool)->Result<(),String> {
-    let _gate=control.gate.write();
+    control.require_operable()?;
+    let _gate=control.gate.try_write_for(Duration::from_secs(8)).ok_or("采集仍在保存，请稍后再改上传设置")?;
     let mut cfg=control.config.read().clone();cfg.auto_upload_enabled=enabled;
-    super::internal::write_json_atomic(&control.root.join("internal-config.json"),&cfg)?;
+    let task = control.progress.lock().task_id.clone();
+    super::internal::write_config(&control.root, &cfg, &task)?;
     *control.config.write()=cfg;
     if enabled {*control.auto_failed_grant.lock()=None;}
     if !enabled {control.frame_upload_active.store(false,Ordering::SeqCst);} Ok(())
 }
 pub fn auto_ready(cfg:&InternalConfig,p:&TaskProgress)->bool {
-    cfg.upload_mode=="ossDirect" && cfg.auto_upload_enabled && cfg.require_participant_name().is_ok() && p.integrity_error.is_none() && p.receipt.is_none() && p.stored_bundle.is_none() && p.bundle_path.is_none() && (!p.needs_flush || p.status==super::internal::TaskStatus::Recording)
+    cfg.upload_mode=="ossDirect" && cfg.auto_upload_enabled && cfg.validate_upload().is_ok() && cfg.require_participant_name().is_ok() && p.integrity_error.is_none() && p.receipt.is_none() && p.stored_bundle.is_none() && p.bundle_path.is_none() && (!p.needs_flush || p.status==super::internal::TaskStatus::Recording)
 }
 pub fn spawn(app:tauri::AppHandle) {
     std::thread::spawn(move|| {
@@ -293,11 +318,30 @@ pub fn spawn(app:tauri::AppHandle) {
         loop {
             let Some(state)=app.try_state::<crate::AppState>() else {break;};
             if !state.0.running.load(Ordering::SeqCst) || state.0.exiting.load(Ordering::SeqCst) {break;}
+            if state.0.internal.device_repaired.swap(false, Ordering::SeqCst) {
+                next_refresh = 0;
+                failures = 0;
+                next_prepare = 0;
+                prepare_failures = 0;
+            }
             let cfg=state.0.internal.config.read().clone();
             if cfg.upload_mode=="ossDirect" {
+                if let Err(error) = cfg.validate_upload() {
+                    state.0.internal.cloud_status.lock().last_error = Some(error);
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
                 if super::preset::employee_mode() && !cfg.participant_name.trim().is_empty() {
                     if Utc::now().timestamp_millis()<next_prepare {std::thread::sleep(Duration::from_secs(5));continue;}
-                    if let Err(error)=super::preset::prepare(&state.0.paths.root,&state.0.internal) {
+                    if let Err(error) = super::preset::prepare(&state.0.paths.root, &state.0.internal)
+                        .and_then(|_| {
+                            let started = state.0.internal.progress.lock().status != super::internal::TaskStatus::Ready;
+                            if started && super::archive::load(&state.0.paths.root)?.is_none() {
+                                super::frame_upload::bind_local_retention(&state.0.paths, &state.0.internal)?;
+                            }
+                            Ok(())
+                        })
+                    {
                         {let mut s=state.0.internal.cloud_status.lock();s.last_error=Some(error);s.last_checked_ms=Utc::now().timestamp_millis();}
                         prepare_failures=prepare_failures.saturating_add(1);
                         next_prepare=Utc::now().timestamp_millis()+super::frame_upload::retry_delay_ms(prepare_failures);
@@ -456,8 +500,13 @@ mod tests {
         let paths=super::super::storage::DataPaths{root:t.path().to_owned(),data_dir:t.path().join("data"),db_path:t.path().join("data/db.sqlite"),shots_dir:t.path().join("data/shots"),exports_dir:t.path().join("exports")};paths.ensure_dirs().unwrap();
         let mut conn=rusqlite::Connection::open(&paths.db_path).unwrap();super::super::storage::migrations::run_migrations(&mut conn).unwrap();
         super::super::archive::initialize_owner(&paths,&conn,&c.progress.lock().task_id).unwrap();
-        assert!(super::super::internal::start_local_policy(&paths,&c,false,Some(&preset.to_string())).is_err());assert!(!t.path().join(FILE).exists());assert!(!c.tracking.load(Ordering::SeqCst));
-        super::super::internal::start_local_policy(&paths,&c,true,Some(&preset.to_string())).unwrap();let e=enrollment(t.path()).unwrap();let expected_secret=e.device_secret.clone();
+        assert!(super::super::internal::start_local_policy(&c, false).is_err());
+        assert!(!c.tracking.load(Ordering::SeqCst));
+        super::super::internal::start_local_policy(&c, true).unwrap();
+        assert!(!t.path().join(FILE).exists());
+        prepare_preset(t.path(), &c, &preset.to_string()).unwrap();
+        super::super::frame_upload::bind_local_retention(&paths, &c).unwrap();
+        let e=enrollment(t.path()).unwrap();let expected_secret=e.device_secret.clone();
         let raw=if public {grant(&e.device_id,"device",0,DateTime::parse_from_rfc3339(&e.expected.archive_end_at).unwrap().timestamp_millis())} else {raw};
         let body=serde_json::json!({"grant":serde_json::from_str::<serde_json::Value>(&raw).unwrap()}).to_string();
         let plan=DateTime::parse_from_rfc3339(&e.expected.archive_end_at).unwrap().timestamp_millis();

@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path, sync::atomic::Ordering, time::Duration};
 use tauri::{Emitter, Manager};
 pub const MAX_FRAME_BYTES: u64 = 20 * 1024 * 1024;
+pub(super) const FRAME_READ_ERROR: &str = "无法读取截图";
+pub(super) const SHOTS_UNAVAILABLE: &str = "截图库不可用";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,7 +117,7 @@ impl Frame {
         Ok(())
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadStats {
     pub pending: i64,
@@ -191,8 +193,11 @@ pub fn read_token(root: &Path) -> Result<String, String> {
 }
 pub fn frame_bytes(paths: &DataPaths, frame: &Frame) -> Result<Vec<u8>, String> {
     uuid::Uuid::parse_str(&frame.id).map_err(|_| "截图编号无效")?;
+    let base = paths.shots_dir.canonicalize().map_err(|_| SHOTS_UNAVAILABLE)?;
     let p = Path::new(&frame.path);
-    let meta = fs::symlink_metadata(p).map_err(|_| "待传截图缺失")?;
+    let meta = fs::symlink_metadata(p).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound { "待传截图缺失" } else { FRAME_READ_ERROR }
+    })?;
     if !meta.is_file()
         || meta.file_type().is_symlink()
         || meta.len() != frame.size_bytes
@@ -201,8 +206,7 @@ pub fn frame_bytes(paths: &DataPaths, frame: &Frame) -> Result<Vec<u8>, String> 
     {
         return Err("待传截图大小或类型无效".into());
     }
-    let base = paths.shots_dir.canonicalize().map_err(|_| "截图库不可用")?;
-    let actual = p.canonicalize().map_err(|_| "截图路径无效")?;
+    let actual = p.canonicalize().map_err(|_| FRAME_READ_ERROR)?;
     if !actual.starts_with(&base)
         || actual.extension().and_then(|s| s.to_str()) != Some("webp")
         || !actual
@@ -221,10 +225,10 @@ pub fn frame_bytes(paths: &DataPaths, frame: &Frame) -> Result<Vec<u8>, String> 
     }
     let mut bytes = Vec::new();
     opts.open(p)
-        .map_err(|_| "无法读取截图")?
+        .map_err(|_| FRAME_READ_ERROR)?
         .take(MAX_FRAME_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "无法读取截图")?;
+        .map_err(|_| FRAME_READ_ERROR)?;
     if bytes.len() as u64 != frame.size_bytes
         || &bytes[..4] != b"RIFF"
         || &bytes[8..12] != b"WEBP"
@@ -528,9 +532,11 @@ pub fn begin(
     expected: &super::desktop::UploadConfirmation,
 ) -> Result<(), String> {
     let state = app.state::<crate::AppState>().inner().clone();
+    state.0.internal.require_operable()?;
     if state.0.internal.config.read().upload_mode == "ossDirect" { return super::oss_direct::begin(app,expected); }
     let _gate = state.0.internal.gate.read();
     let cfg = state.0.internal.config.read().clone();
+    cfg.validate_upload()?;
     let p = state.0.internal.progress.lock().clone();
     super::desktop::validate_confirmation(
         expected,

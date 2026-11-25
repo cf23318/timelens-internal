@@ -1,80 +1,79 @@
-import { useTranslation } from "react-i18next";
-import { useAppStore } from "../stores/appStore";
+import { useEffect, useState } from "react";
+import { useDesktopText } from "../lib/desktop";
 import * as api from "../services/tauri";
 
-export default function UpdateNotice() {
-  const { t } = useTranslation();
-  const result = useAppStore((s) => s.updateCheckResult);
-  const dismissed = useAppStore((s) => s.updateDismissed);
-  const dismiss = useAppStore((s) => s.dismissUpdate);
+const SNOOZE_KEY = "timelens_update_snooze";
+const SNOOZE_MS = 3 * 60 * 60 * 1000;
 
-  if (!result?.hasUpdate || dismissed) return null;
+interface Snooze {
+  version: string;
+  untilMs: number;
+}
+
+function readSnooze(): Snooze | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(SNOOZE_KEY) ?? "null") as Snooze | null;
+    if (typeof value?.version === "string" && Number.isFinite(value.untilMs) && value.untilMs > Date.now()) {
+      return value;
+    }
+  } catch { /* Unavailable storage only affects reminder persistence. */ }
+  return null;
+}
+
+export default function UpdateNotice() {
+  const { text } = useDesktopText();
+  const [version, setVersion] = useState<string | null>(null);
+  const [snoozed, setSnoozed] = useState(readSnooze);
+  const [openFailedVersion, setOpenFailedVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const check = () => {
+      void api.checkForUpdate()
+        .then((latest) => {
+          if (!active) return;
+          const now = Date.now();
+          setSnoozed((previous) => previous && previous.untilMs > now ? previous : null);
+          setVersion(latest);
+        })
+        .catch(() => {});
+    };
+    check();
+    const listening = api.listenEvent("update_check_requested", check).catch(() => null);
+    return () => {
+      active = false;
+      void listening.then((stop) => stop?.());
+    };
+  }, []);
+
+  if (!version || version === snoozed?.version) return null;
+
+  function remindLater(currentVersion: string) {
+    const next: Snooze = { version: currentVersion, untilMs: Date.now() + SNOOZE_MS };
+    setSnoozed(next);
+    try {
+      localStorage.setItem(SNOOZE_KEY, JSON.stringify(next));
+    } catch { /* The running window can still defer this version. */ }
+  }
 
   return (
-    <div
-      className="fixed inset-0 z-[95] flex items-center justify-center bg-[var(--tl-overlay-strong)] p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={t("updateNotice.title")}
-    >
-      <div
-        className="relative flex max-h-[80vh] w-full max-w-md flex-col rounded-xl border border-[var(--tl-line)] bg-[var(--tl-sheet-bg)] shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-[var(--tl-line)] px-5 py-4">
-          <div className="flex items-center gap-3">
-            <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-[var(--tl-accent-12)] text-lg font-bold text-[var(--tl-cyan)]">
-              T
-            </span>
-            <div>
-              <h2 className="text-base font-semibold text-[var(--tl-ink)]">
-                {t("updateNotice.title")}
-              </h2>
-              <p className="text-[0.72rem] text-[var(--tl-muted)]">
-                v{result.latestVersion}
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            className="rounded-lg px-2 py-1 text-xl leading-none text-[var(--tl-muted)] hover:text-[var(--tl-ink)]"
-            onClick={dismiss}
-          >
-            ×
-          </button>
+    <div className="desktop-global-notice">
+      <div className="desktop-alert desktop-alert-info flex flex-wrap items-center justify-between gap-3">
+        <div role="status">
+          <strong>{text("有新版本可用", "Update available")} · v{version}</strong>
+          {openFailedVersion === version && (
+            <p>{text("无法打开浏览器。请前往 GitHub 发布页下载。", "Could not open your browser. Open the GitHub releases page to download.")}</p>
+          )}
         </div>
-
-        {/* Release notes */}
-        {result.releaseNotes && (
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-            <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-[0.1em] text-[var(--tl-muted)]">
-              {t("updateNotice.whatsNew")}
-            </p>
-            <pre className="whitespace-pre-wrap rounded-lg bg-white/[0.03] p-3 font-mono text-[0.72rem] leading-relaxed text-[var(--tl-ink)]">
-              {result.releaseNotes}
-            </pre>
-          </div>
-        )}
-
-        {/* Actions */}
-        <div className="flex items-center justify-end gap-3 border-t border-[var(--tl-line)] px-5 py-3">
-          <button
-            type="button"
-            className="rounded-lg px-4 py-2 text-[0.78rem] font-medium text-[var(--tl-muted)] hover:text-[var(--tl-ink)]"
-            onClick={dismiss}
-          >
-            {t("updateNotice.later")}
+        <div className="flex items-center gap-2">
+          <button className="desktop-button" onClick={() => remindLater(version)}>
+            {text("稍后", "Later")}
           </button>
-          <button
-            type="button"
-            className="rounded-lg bg-[var(--tl-p3-accent)] px-5 py-2 text-[0.78rem] font-semibold text-white hover:opacity-90"
-            onClick={() => {
-              void api.openUrl(result.releaseUrl);
-              dismiss();
-            }}
-          >
-            {t("updateNotice.viewUpdate")}
+          <button className="desktop-button desktop-button-primary" onClick={() => {
+            setOpenFailedVersion(null);
+            void api.openUpdateRelease(version).catch(() => setOpenFailedVersion(version));
+          }}>
+            {text("前往下载", "View download")}
           </button>
         </div>
       </div>
