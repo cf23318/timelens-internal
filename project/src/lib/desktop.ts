@@ -1,6 +1,6 @@
 import { describeSyncFailure } from "./employeeSyncIssue";
 import { useTranslation } from "react-i18next";
-export { taskLabel, taskOverviewLabel, directFramesAccepted } from "./taskStatus";
+export { taskLabel, taskOverviewLabel, directFramesAccepted, captureUnavailable } from "./taskStatus";
 
 export function useDesktopText() {
   const { i18n } = useTranslation();
@@ -39,6 +39,7 @@ export function missingLabel(code: string, english = false): string {
     archiveEnd: ["批准调研结束时间（含时区）", "Approved study end with timezone"],
     survey: ["调研编号", "Survey ID"], device: ["设备编号", "Device ID"],
     ossGrant: ["有效的本机OSS上传授权", "Valid OSS upload grant for this device"],
+    uploadState: ["可用的本机上传状态", "Available local upload state"],
     server: ["上传地址", "Upload endpoint"], key: ["加密公钥", "Encryption public key"],
     domestic: ["国内服务器确认", "Domestic server confirmation"], credential: ["管理员上传凭证", "Administrator upload credential"],
   };

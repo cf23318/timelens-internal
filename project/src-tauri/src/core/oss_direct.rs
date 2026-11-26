@@ -20,6 +20,7 @@ use std::{
 use tauri::{Emitter, Manager};
 
 pub(super) const GRANT_FILE: &str = "oss-upload-grant.json";
+const DEVICE_FILE: &str = "device-identity.json";
 const MAX_GRANT: usize = 65536;
 const CONNECTION_ERROR: &str = "OSS上传连接失败；待传图片保留，若已接收但回执丢失需管理员核验";
 const AUTH_RETRY: &str = "云端续期暂不可用；待传图片保留，联网后自动重试";
@@ -59,18 +60,116 @@ pub(super) fn private_read(path: &Path) -> Result<Vec<u8>, String> {
 /// Stable for this local profile, independent of study/task and upload credentials.
 pub fn device_id(root: &Path) -> Result<String, String> {
     let _lock = ID_LOCK.lock();
-    let path = root.join("device-identity.json");
-    if fs::symlink_metadata(&path).is_ok() {
-        let id: String = serde_json::from_slice(&private_read(&path)?)
-            .map_err(|_| "固定设备ID文件损坏，请管理员核对")?;
-        if uuid::Uuid::parse_str(&id).is_err() || id.len() != 36 {
-            return Err("固定设备ID无效".into());
-        }
+    if let Some(id) = existing_device_id(root)? {
         return Ok(id);
     }
     let id = uuid::Uuid::new_v4().to_string();
-    super::internal::write_json_atomic(&path, &id)?;
+    super::internal::write_json_atomic(&root.join(DEVICE_FILE), &id)?;
     Ok(id)
+}
+
+pub(super) fn device_identity_needs_repair(root: &Path) -> bool {
+    let _lock = ID_LOCK.lock();
+    existing_device_id(root).is_err()
+}
+
+/// A genuinely new profile has no identity to restore.
+fn existing_device_id(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join(DEVICE_FILE);
+    if file_present(&path)? {
+        return read_device_id(&path).map(Some);
+    }
+    let has_device_config = fs::read(root.join("internal-config.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<InternalConfig>(&bytes).ok())
+        .is_some_and(|cfg| cfg.upload_mode == "ossDirect" && !cfg.upload_device_id.is_empty());
+    if has_device_config
+        || file_present(&root.join(super::cloud_auth::FILE))?
+        || file_present(&root.join(GRANT_FILE))?
+        || super::archive::load(root)?.is_some_and(|archive| archive.upload_mode == "ossDirect")
+    {
+        return Err("原设备编号文件缺失，可尝试一键修复".into());
+    }
+    Ok(None)
+}
+
+fn file_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("本机设备记录暂时无法访问，请检查文件权限后重试".into()),
+    }
+}
+
+fn valid_device_id(id: &str) -> bool {
+    id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
+fn read_device_id(path: &Path) -> Result<String, String> {
+    let id: String = serde_json::from_slice(&private_read(path)?)
+        .map_err(|_| "固定设备编号文件格式异常，可尝试一键修复")?;
+    if !valid_device_id(&id) {
+        return Err("固定设备编号格式无效，可尝试一键修复".into());
+    }
+    Ok(id)
+}
+
+pub(super) fn repair_device_id(root: &Path, cfg: &InternalConfig, task: &str) -> Result<bool, String> {
+    let _lock = ID_LOCK.lock();
+    let path = root.join(DEVICE_FILE);
+    match existing_device_id(root) {
+        Ok(Some(id)) if !cfg.upload_device_id.is_empty() && cfg.upload_device_id != id => {
+            return Err("现有设备编号与上传配置冲突，已保留本机记录".into());
+        }
+        Ok(_) => return Ok(false),
+        Err(_) => {}
+    }
+
+    let grant = if file_present(&root.join(GRANT_FILE))? {
+        let bytes = private_read(&root.join(GRANT_FILE))?;
+        let grant: Grant = serde_json::from_slice(&bytes)
+            .map_err(|_| "本机授权记录无法校验，已保留现有记录")?;
+        // Check the original scope at issuance, even if the grant expired.
+        // The regular upload path still checks expiry against the current time.
+        grant.validate(&grant.device_id, millis(&grant.issued_at)?)?;
+        if !cfg.upload_device_id.is_empty() {
+            grant.matches_config(cfg)?;
+        }
+        Some(grant)
+    } else {
+        None
+    };
+    let enrolled = if file_present(&root.join(super::cloud_auth::FILE))? {
+        Some(super::cloud_auth::enrolled_device_for_repair(root, cfg, grant.as_ref())?)
+    } else {
+        None
+    };
+    let archive = super::archive::load(root)?;
+    if let Some(binding) = &archive {
+        if super::archive::read_owner(root)?.as_deref() != Some(task)
+            || binding.task_id != task || binding.upload_mode != "ossDirect"
+            || binding.upload_url != cfg.upload_url || binding.survey_id != cfg.upload_survey_id
+            || super::archive::end_ms(cfg).ok() != Some(binding.planned_end_ms)
+        {
+            return Err("本机归档与原任务的上传范围不一致，已保留现有记录".into());
+        }
+    }
+    let mut evidence = [
+        grant.as_ref().map(|g| g.device_id.as_str()),
+        enrolled.as_deref(),
+        archive.as_ref().map(|b| b.device_id.as_str()),
+        (!cfg.upload_device_id.is_empty()).then_some(cfg.upload_device_id.as_str()),
+    ].into_iter().flatten();
+    let id = evidence.next().ok_or("没有找到可核对的原设备编号，待传截图已保留")?;
+    let corroborating = evidence.next().ok_or("本机记录不足以确认原设备编号，待传截图已保留")?;
+    if !valid_device_id(id) || id != corroborating || evidence.any(|other| other != id) {
+        return Err("本机记录中的设备编号冲突，待传截图已保留".into());
+    }
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.len() > MAX_GRANT as u64) {
+        return Err("设备编号文件大小异常，待传截图已保留".into());
+    }
+    super::internal::preserve_damaged_file(root, DEVICE_FILE)?;
+    super::internal::write_json_atomic(&path, &id)?;
+    Ok(true)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -324,6 +423,7 @@ pub fn import(
     control: &super::internal::InternalControl,
     raw: &str,
 ) -> Result<(), String> {
+    control.require_operable()?;
     let g = Grant::parse(raw, &device_id(root)?, Utc::now().timestamp_millis())?;
     let _gate = control.gate.write();
     let p = control.progress.lock().clone();
@@ -365,9 +465,9 @@ pub fn import(
         }
         super::archive::ensure_live(root, &p.task_id, Utc::now().timestamp_millis())?;
     }
-    super::internal::write_json_atomic(&root.join("internal-config.json"), &cfg)?;
+    super::internal::write_config(root, &cfg, &p.task_id)?;
     if let Err(e) = super::internal::write_json_atomic(&root.join(GRANT_FILE), &g) {
-        super::internal::write_json_atomic(&root.join("internal-config.json"), &old)
+        super::internal::write_config(root, &old, &p.task_id)
             .map_err(|_| "导入失败且配置恢复失败，请停止上传并由管理员检查")?;
         return Err(e);
     }
@@ -523,7 +623,8 @@ fn record(conn: &Connection, f: &Frame, r: &Accepted) -> Result<(), String> {
 fn record_failure(conn: &Connection, frame: &Frame, error: &str) -> Result<bool, String> {
     let status = error.split("HTTP ").nth(1)
         .and_then(|v| v.get(..3)).and_then(|v| v.parse::<u16>().ok());
-    let retryable = error == CONNECTION_ERROR || error==AUTH_RETRY || status.is_some_and(|v| v == 408 || v == 429 || (500..600).contains(&v));
+    let retryable = matches!(error, CONNECTION_ERROR | AUTH_RETRY | frame_upload::FRAME_READ_ERROR)
+        || status.is_some_and(|v| v == 408 || v == 429 || (500..600).contains(&v));
     let blocked = error.contains("校验失败") || error.contains("批准结束") || !retryable;
     conn.execute(
         "UPDATE frame_upload_outbox SET status=?2,attempts=attempts+1,next_retry_ms=?3,last_error=?4 WHERE snapshot_id=?1",
@@ -532,6 +633,23 @@ fn record_failure(conn: &Connection, frame: &Frame, error: &str) -> Result<bool,
     ).map_err(|e| e.to_string())?;
     Ok(blocked || !retryable)
 }
+
+fn read_queued_image(
+    paths: &super::storage::DataPaths,
+    conn: &Connection,
+    frame: &Frame,
+) -> Result<Option<Vec<u8>>, String> {
+    match frame_upload::frame_bytes(paths, frame) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error == frame_upload::SHOTS_UNAVAILABLE => Err(error),
+        Err(error) => {
+            // A bad or temporarily locked frame must not disable a healthy grant.
+            record_failure(conn, frame, &error)?;
+            Ok(None)
+        }
+    }
+}
+
 fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, task: String) {
     let mut attempted_grant=None;
     let result = (|| -> Result<(), String> {
@@ -608,12 +726,13 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
             }
             if let Some(frame) = next(&conn, &task)? {
                 frame_upload::bind(&conn, &frame, &cfg)?;
-                let result = frame_upload::frame_bytes(&state.0.paths, &frame).and_then(|bytes| {
-                    if !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {
-                        return Err("后台上传已停止".into());
-                    }
-                    send(&client, &grant, &frame, &bytes)
-                });
+                let Some(bytes) = read_queued_image(&state.0.paths, &conn, &frame)? else {
+                    continue;
+                };
+                if !state.0.internal.frame_upload_active.load(Ordering::SeqCst) {
+                    break;
+                }
+                let result = send(&client, &grant, &frame, &bytes);
                 match result {
                     Ok(receipt) => {
                         super::archive::ensure_live(
@@ -642,7 +761,7 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                             p.last_error = Some(error.clone());
                             Ok(())
                         })?;
-                        if fatal {
+                        if fatal && !error.starts_with("OSS返回 HTTP 409；") {
                             return Err(error);
                         }
                     }
@@ -652,8 +771,10 @@ fn worker(app: tauri::AppHandle, state: crate::AppState, cfg: InternalConfig, ta
                 if progress.ended_at_ms.is_some()
                     && !progress.needs_flush
                     && stats.pending == 0
-                    && stats.blocked == 0
                 {
+                    if stats.blocked > 0 {
+                        break;
+                    }
                     if let Err(error) = super::oss_manifest::publish(
                         &client,
                         &grant,
@@ -717,8 +838,10 @@ pub fn begin(
 pub fn begin_auto(app:&tauri::AppHandle)->Result<(),String> { begin_inner(app,None,false) }
 fn begin_inner(app:&tauri::AppHandle,expected:Option<&super::desktop::UploadConfirmation>,reset:bool)->Result<(),String> {
     let state = app.state::<crate::AppState>().inner().clone();
+    state.0.internal.require_operable()?;
     let _gate = state.0.internal.gate.read();
     let cfg = state.0.internal.config.read().clone();
+    cfg.validate_upload()?;
     let p = state.0.internal.progress.lock().clone();
     if let Some(expected)=expected {validate_confirmation(&state.0.paths.root,&cfg,&p,expected)?;}
     else {
@@ -726,7 +849,7 @@ fn begin_inner(app:&tauri::AppHandle,expected:Option<&super::desktop::UploadConf
         if state.0.internal.auto_failed_grant.lock().as_ref()==Some(&load(&state.0.paths.root,&cfg)?.fingerprint()) {return Ok(());}
         let conn=frame_upload::db(&state.0.paths)?;
         let stats=frame_upload::stats(&conn,&p.task_id)?;
-        let needs_end=p.ended_at_ms.is_some() && load(&state.0.paths.root,&cfg)?.manifest_fields.is_some() && !super::archive::load(&state.0.paths.root)?.is_some_and(|b|b.end_synced);
+        let needs_end=stats.blocked==0 && p.ended_at_ms.is_some() && load(&state.0.paths.root,&cfg)?.manifest_fields.is_some() && !super::archive::load(&state.0.paths.root)?.is_some_and(|b|b.end_synced);
         if p.status!=TaskStatus::Recording && stats.pending==0 && !needs_end {return Ok(());}
     }
     if p.receipt.is_some()
@@ -774,7 +897,10 @@ mod tests {
     #[test]
     fn fixed_id_survives_restart_and_corruption_never_regenerates() {
         let t = tempfile::tempdir().unwrap();
+        assert!(!device_identity_needs_repair(t.path()));
+        assert!(!t.path().join(DEVICE_FILE).exists());
         let id = device_id(t.path()).unwrap();
+        assert!(!device_identity_needs_repair(t.path()));
         assert_eq!(id, device_id(t.path()).unwrap());
         let handles = (0..8)
             .map(|_| {
@@ -790,6 +916,7 @@ mod tests {
             &"broken",
         )
         .unwrap();
+        assert!(device_identity_needs_repair(t.path()));
         assert!(device_id(t.path()).is_err());
         assert!(
             String::from_utf8(fs::read(t.path().join("device-identity.json")).unwrap())
@@ -813,6 +940,7 @@ mod tests {
         for (error, fatal, status) in [
             (CONNECTION_ERROR, false, "pending"),
             (AUTH_RETRY, false, "pending"),
+            (frame_upload::FRAME_READ_ERROR, false, "pending"),
             ("OSS返回 HTTP 408", false, "pending"),
             ("OSS返回 HTTP 429", false, "pending"),
             ("OSS返回 HTTP 503", false, "pending"),
@@ -831,6 +959,38 @@ mod tests {
             assert_eq!((row.0.as_str(),row.1,row.3.as_str()), (status,1,error));
             assert!(row.2 > Utc::now().timestamp_millis());
         }
+    }
+
+    #[test]
+    fn missing_local_image_does_not_block_the_next_queued_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let paths = super::super::storage::DataPaths {
+            data_dir: root.join("data"),
+            shots_dir: root.join("data/shots"),
+            db_path: root.join("data/db.sqlite"),
+            exports_dir: root.join("exports"),
+            root,
+        };
+        paths.ensure_dirs().unwrap();
+        let conn = super::super::storage::db::open_write(&paths.db_path).unwrap();
+        conn.execute("INSERT INTO window_sessions(id, start_ms, end_ms, duration_ms, app_name, window_title)
+                      VALUES ('session', 0, 2, 2, 'fixture', 'synthetic')", []).unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        for (id, at) in [(&first, 1), (&second, 2)] {
+            conn.execute("INSERT INTO snapshots(id, session_id, file_path, captured_at_ms, file_size_bytes, trigger_type)
+                          VALUES (?1, 'session', ?2, ?3, 12, 'poll')",
+                         params![id, paths.shots_dir.join(format!("{id}_fixture.webp")).to_str(), at]).unwrap();
+            conn.execute("INSERT INTO frame_upload_outbox(snapshot_id, task_id, display_id, sha256, size_bytes)
+                          VALUES (?1, 'task', 1, 'fixture', 12)", [id]).unwrap();
+        }
+        let frame = next(&conn, "task").unwrap().unwrap();
+        assert_eq!(frame.id, first);
+        assert!(read_queued_image(&paths, &conn, &frame).unwrap().is_none());
+        let stats = frame_upload::stats(&conn, "task").unwrap();
+        assert_eq!((stats.pending, stats.blocked), (1, 1));
+        assert_eq!(next(&conn, "task").unwrap().unwrap().id, second);
     }
 
     #[cfg(feature = "frame-contract-tests")]
@@ -898,6 +1058,77 @@ mod tests {
                 .current_dir(server_root()).env("PYTHONPATH", server_root()).output().unwrap();
             assert!(out.status.success());
             String::from_utf8(out.stdout).unwrap()
+        }
+
+        #[test]
+        fn repair_restores_missing_and_damaged_identity_without_changing_oss_scope() {
+            let (_t, paths, conn, control, grant) = fixture();
+            let root = &paths.root;
+            import(root, &control, &serde_json::to_string(&grant).unwrap()).unwrap();
+            let cfg = control.config.read().clone();
+            let progress = control.progress.lock().clone();
+            super::super::super::archive::initialize_owner(&paths, &conn, &progress.task_id).unwrap();
+            super::super::super::archive::bind(&paths, &cfg, &progress).unwrap();
+            let enrollment = json!({
+                "issuerUrl": "https://issuer.example.com/",
+                "deviceId": grant.device_id,
+                "deviceSecret": "a".repeat(64),
+                "expected": {
+                    "batchId": grant.user_id, "scope": "device", "bucket": grant.bucket,
+                    "archiveEndAt": grant.archive_end_at
+                }
+            });
+            let enrollment_file = root.join(super::super::super::cloud_auth::FILE);
+            super::super::super::internal::write_json_atomic(&enrollment_file, &enrollment).unwrap();
+            let before = fs::read(root.join(GRANT_FILE)).unwrap();
+            let enrollment_before = fs::read(&enrollment_file).unwrap();
+            let identity = root.join(DEVICE_FILE);
+            fs::remove_file(&identity).unwrap();
+            assert!(device_id(root).unwrap_err().contains("缺失"));
+            assert!(!identity.exists());
+            control.start().unwrap();
+            assert!(control.repair_device_identity().unwrap());
+            assert!(control.tracking.load(Ordering::SeqCst));
+            assert_eq!(device_id(root).unwrap(), grant.device_id);
+            assert_eq!(load(root, &cfg).unwrap().prefix, grant.prefix);
+            assert_eq!(fs::read(root.join(GRANT_FILE)).unwrap(), before);
+            assert_eq!(fs::read(&enrollment_file).unwrap(), enrollment_before);
+            assert!(super::super::super::cloud_auth::summary(root, &control).configured);
+            assert!(!control.frame_upload_running.load(Ordering::SeqCst));
+            fs::write(&identity, b"damaged-id").unwrap();
+            assert!(control.repair_device_identity().unwrap());
+            assert_eq!(device_id(root).unwrap(), grant.device_id);
+            let backups = fs::read_dir(root.join("local-repair")).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(fs::read(backups[0].path()).unwrap(), b"damaged-id");
+            assert!(!control.repair_device_identity().unwrap());
+        }
+
+        #[test]
+        fn repair_preserves_device_file_when_registration_records_conflict_or_are_missing() {
+            let (_t, paths, _conn, control, grant) = fixture();
+            let root = &paths.root;
+            let identity = root.join(DEVICE_FILE);
+            fs::write(&identity, b"damaged-id").unwrap();
+            assert!(control.repair_device_identity().unwrap_err().contains("没有找到"));
+            assert_eq!(fs::read(&identity).unwrap(), b"damaged-id");
+            super::super::super::internal::write_json_atomic(&identity, &grant.device_id).unwrap();
+            import(root, &control, &serde_json::to_string(&grant).unwrap()).unwrap();
+            let enrollment = json!({
+                "issuerUrl": "https://issuer.example.com/",
+                "deviceId": uuid::Uuid::new_v4().to_string(),
+                "deviceSecret": "a".repeat(64),
+                "expected": {
+                    "batchId": grant.user_id, "scope": "device", "bucket": grant.bucket,
+                    "archiveEndAt": grant.archive_end_at
+                }
+            });
+            let enrollment_file = root.join(super::super::super::cloud_auth::FILE);
+            super::super::super::internal::write_json_atomic(&enrollment_file, &enrollment).unwrap();
+            fs::write(&identity, b"damaged-id").unwrap();
+            assert!(control.repair_device_identity().unwrap_err().contains("编号冲突"));
+            assert_eq!(fs::read(&identity).unwrap(), b"damaged-id");
+            assert!(!root.join("local-repair").exists());
         }
         #[test]
         fn shared_import_binds_two_profiles_roundtrips_and_never_starts_upload() {

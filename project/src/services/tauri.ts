@@ -289,15 +289,12 @@ export async function getAppVersion(): Promise<string> {
   return invoke<string>("get_app_version");
 }
 
-export interface UpdateCheckResult {
-  hasUpdate: boolean;
-  latestVersion: string;
-  releaseUrl: string;
-  releaseNotes: string;
+export async function checkForUpdate(): Promise<string | null> {
+  return invoke<string | null>("check_for_update");
 }
 
-export async function checkForUpdate(): Promise<UpdateCheckResult> {
-  return invoke<UpdateCheckResult>("check_for_update");
+export async function openUpdateRelease(version: string): Promise<void> {
+  await invoke("open_update_release", { version });
 }
 
 export async function openUrl(url: string): Promise<void> {
@@ -483,6 +480,7 @@ export async function exportWeeklyMarkdown(weekStart: string): Promise<string> {
 }
 
 export type EventPayloads = {
+  update_check_requested: null;
   window_event_updated: WindowSession;
   new_snapshot_saved: { snapshot: Snapshot };
   tracking_state_changed: { isRunning: boolean };

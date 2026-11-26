@@ -35,6 +35,10 @@ check("legacy pictures excluded", d => { d.uploads.legacy = 1; }, "已结束 · 
 check("legacy receipt excluded", d => { d.progress.receipt = {}; }, "已结束 · 待上传");
 check("zero pictures cannot claim acceptance", d => { d.snapshots.count = 0; d.uploads.ossAccepted = 0; }, "已结束 · 待上传");
 check("recording remains recording", d => { d.progress.status = "recording"; d.progress.endedAtMs = null; }, "采集中");
+check("invalid upload identity does not change local recording", d => { d.progress.status = "recording"; d.uploadStatusError = "device"; }, "采集中");
+check("an unreadable queue cannot report success", d => { d.uploadStatusError = "queue"; }, "已结束 · 同步暂不可用");
+check("failed image storage pauses the timer in the status", d => { d.progress.status = "recording"; d.captureNotice = { code: "save_error" }; }, "截图暂不可用 · 已暂停计时");
+check("a broken local task shows the review state", d => { d.startupError = "local state unreadable"; }, "本机任务需核对");
 check("paused remains paused", d => { d.progress.status = "paused"; d.progress.endedAtMs = null; }, "已暂停");
 check("receiver mode is unchanged", d => { d.config.uploadMode = "receiver"; }, "已结束 · 待上传");
 check("reconciled takes precedence", d => { d.progress.status = "uploaded"; }, "归档清单已对账");

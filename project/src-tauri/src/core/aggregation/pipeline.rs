@@ -289,6 +289,18 @@ fn handle_cmd(
                 "poll" | "title_change" => {
                     if let Some(ref id) = st.active_id {
                         if same_app(&st.last_app, &st.last_bundle, &app_name, &bundle_id) {
+                            // A full queue or an interrupted transaction can lose the
+                            // initial insert while this foreground window stays open.
+                            let exists = read_conn.lock().query_row(
+                                "SELECT EXISTS(SELECT 1 FROM window_sessions WHERE id=?1)",
+                                [id],
+                                |row| row.get::<_, bool>(0),
+                            );
+                            if matches!(exists, Ok(false)) {
+                                let intent = resolved_intent_for_insert(read_conn, &app_name, &bundle_id);
+                                insert_session(writer, id, st.start_ms, &app_name, &bundle_id,
+                                    &window_title, &extracted_url, &extracted_file_path, intent);
+                            }
                             let end = timestamp_ms;
                             let dur = (end - st.start_ms).max(0);
                             let _ = writer.try_send(WriteEvent::SessionUpdate(

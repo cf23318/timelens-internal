@@ -12,6 +12,14 @@ export function employeeSyncIssue(data: InternalOverview, english = false, now =
   if (data.progress.integrityError) return issue(
     text("部分记录需要核对", "Records need review"),
     text("本机记录已保留，请联系管理员核对完整性或上传冲突，无需清空数据。", "Local records are retained. Ask the administrator to review integrity or upload conflicts; do not clear data."));
+  if (data.uploadStatusError) {
+    const detail = {
+      queue: text("暂时无法读取本机上传队列。", "The local upload queue is temporarily unavailable."),
+      device: text("本机上传设备编号无法读取。", "The upload device ID is unavailable."),
+      config: text("本机上传配置有误，请联系管理员。", "The local upload configuration is invalid. Contact your administrator."),
+    };
+    return issue(text("同步暂不可用", "Sync unavailable"), detail[data.uploadStatusError]);
+  }
   const uploadError = data.uploads.lastError || data.progress.lastError;
   const cloudError = data.cloudIssuer?.lastError;
   const authorizationRetry = Boolean(uploadError?.startsWith("云端续期暂不可用"));

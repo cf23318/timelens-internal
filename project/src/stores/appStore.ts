@@ -9,7 +9,7 @@ import type {
   WindowSession,
   WriterStats,
 } from "../types";
-import type { AppSwitch, UpdateCheckResult } from "../services/tauri";
+import type { AppSwitch } from "../services/tauri";
 import * as api from "../services/tauri";
 
 function todayStr(): string {
@@ -42,10 +42,6 @@ interface AppState {
   pipelineHealth: PipelineHealth | null;
   loadingSessions: boolean;
   error: string | null;
-  updateAvailable: boolean;
-  latestVersion: string | null;
-  updateCheckResult: UpdateCheckResult | null;
-  updateDismissed: boolean;
   fragmentationAlert: {
     switchCount: number;
     windowMin: number;
@@ -64,8 +60,6 @@ interface AppState {
   setWriterStats: (w: WriterStats) => void;
   setFragmentationAlert: (alert: AppState["fragmentationAlert"]) => void;
   setFragmentationProtectUntilMs: (ms: number | null) => void;
-  setUpdateCheckResult: (r: UpdateCheckResult) => void;
-  dismissUpdate: () => void;
   clearError: () => void;
 }
 
@@ -85,10 +79,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   pipelineHealth: null,
   loadingSessions: false,
   error: null,
-  updateAvailable: false,
-  latestVersion: null,
-  updateCheckResult: null,
-  updateDismissed: false,
   fragmentationAlert: null,
   fragmentationProtectUntilMs: null,
   formatBytes,
@@ -177,19 +167,5 @@ export const useAppStore = create<AppState>((set, get) => ({
   setWriterStats: (w) => set({ writer: w }),
   setFragmentationAlert: (alert) => set({ fragmentationAlert: alert }),
   setFragmentationProtectUntilMs: (ms) => set({ fragmentationProtectUntilMs: ms }),
-  setUpdateCheckResult: (r) => {
-    const dismissed = localStorage.getItem("timelens_dismissed_version") === r.latestVersion;
-    set({
-      updateCheckResult: r,
-      updateAvailable: r.hasUpdate,
-      latestVersion: r.latestVersion,
-      updateDismissed: dismissed,
-    });
-  },
-  dismissUpdate: () => {
-    const ver = get().updateCheckResult?.latestVersion;
-    if (ver) localStorage.setItem("timelens_dismissed_version", ver);
-    set({ updateDismissed: true });
-  },
   clearError: () => set({ error: null }),
 }));

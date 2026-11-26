@@ -28,6 +28,7 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 log::warn!("无法恢复 TimeLens 主窗口：{e}");
             }
         }
+        let _ = window.emit("update_check_requested", ());
     }
 }
 
@@ -126,6 +127,7 @@ pub fn run() {
     }));
 
     builder
+        .manage(core::updates::UpdateChecker::default())
         .plugin(
             tauri::plugin::Builder::<tauri::Wry, ()>::new("internal-navigation")
                 .on_navigation(|_, url| core::internal::allow_webview_navigation(url))
@@ -147,10 +149,8 @@ pub fn run() {
             let paths = core::storage::DataPaths::new().map_err(|e| format!("{e}"))?;
             paths.ensure_dirs().map_err(|e| format!("{e}"))?;
             let data_lock = paths.lock_exclusive()?;
-            let wconn =
+            let mut wconn =
                 core::storage::db::open_write(&paths.db_path).map_err(|e| format!("{e}"))?;
-            let metrics = Arc::new(core::writer::WriterMetrics::default());
-            let writer = core::writer::spawn_writer_thread(wconn, metrics.clone());
             let read_conn =
                 core::storage::db::open_read(&paths.db_path).map_err(|e| format!("{e}"))?;
             let (ei, ec, _, _, _) = {
@@ -174,18 +174,21 @@ pub fn run() {
             let ocr_last_error = Arc::new(Mutex::new(None));
             let ocr_pending = Arc::new(AtomicUsize::new(0));
             let nudge_enabled = Arc::new(AtomicBool::new(false));
-            // 桌面端启动后默认开启采集（与产品预期一致）；无采集能力的平台保持 false。
+            // Restart recovery runs before the writer and never enables capture.
             let tracking = Arc::new(AtomicBool::new(false));
-            let internal = core::internal::InternalControl::load(&paths.root, tracking.clone())?;
-            if let Some(e) = metrics.last_error.lock().clone() {
-                internal.edit_progress(|p| {
-                    p.integrity_error = Some(e.clone());
-                    p.last_error = Some(e);
-                    Ok(())
-                })?;
+            let internal = core::internal::InternalControl::open_for_app(&paths.root, tracking.clone());
+            if internal.require_operable().is_ok() {
+                let task = internal.progress.lock().task_id.clone();
+                if let Err(error) = core::archive::initialize_owner(&paths, &read_conn.lock(), &task) {
+                    use core::internal::{LocalTaskIssue, LocalTaskIssueKind};
+                    internal.block_startup(LocalTaskIssue::new(LocalTaskIssueKind::StorageUnavailable, error));
+                } else if let Err(error) = core::recovery::startup(&paths, &mut wconn, &internal) {
+                    log::warn!("本机截图启动恢复未完成：{error}");
+                }
             }
-            core::archive::initialize_owner(&paths,&read_conn.lock(),&internal.progress.lock().task_id)?;
-            core::recovery::startup(&paths,&writer,&internal)?;
+            let task_available = internal.require_operable().is_ok();
+            let metrics = Arc::new(core::writer::WriterMetrics::default());
+            let writer = core::writer::spawn_recovered_writer_thread(wconn, metrics.clone());
             let running = Arc::new(AtomicBool::new(true));
             let is_afk = Arc::new(AtomicBool::new(false));
             let screen_ok = Arc::new(AtomicBool::new(false));
@@ -299,8 +302,10 @@ pub fn run() {
             }));
             app.manage(state);
             core::internal::spawn_task_clock(handle.clone());
-            core::archive::spawn(handle.clone());
-            core::cloud_auth::spawn(handle.clone());
+            if task_available {
+                core::archive::spawn(handle.clone());
+                core::cloud_auth::spawn(handle.clone());
+            }
             #[cfg(desktop)]
             {
                 let language = core::settings::get_language(&handle.state::<AppState>().0.read_conn.lock());
@@ -430,6 +435,7 @@ pub fn run() {
             api::save_internal_config,
             api::get_internal_progress,
             api::get_internal_overview,
+            api::repair_local_task,
             api::import_oss_upload_grant,
             api::activate_cloud_issuer,
             api::set_automatic_upload,
@@ -503,6 +509,7 @@ pub fn run() {
             api::set_language,
             api::get_app_version,
             api::check_for_update,
+            api::open_update_release,
             api::open_url,
             api::get_week_start_for_date,
             api::set_week_start_day,

@@ -110,8 +110,11 @@ fn write_webp_lossy(
         .map_err(|e| e.to_string())
 }
 
-fn wait_session(conn: &Mutex<Connection>, sig: &CaptureSignal, id: &str) -> bool {
+fn wait_session(conn: &Mutex<Connection>, sig: &CaptureSignal, id: &str, control: &InternalControl) -> bool {
     for _ in 0..80 {
+        if !control.is_current(sig.epoch) {
+            return false;
+        }
         let ok = conn.lock().query_row(
             "SELECT app_name,bundle_id,window_title,extracted_url,is_active FROM window_sessions WHERE id = ?1 LIMIT 1",
             [id],
@@ -135,7 +138,25 @@ fn wait_session(conn: &Mutex<Connection>, sig: &CaptureSignal, id: &str) -> bool
         }
         thread::sleep(Duration::from_millis(25));
     }
+    control.note_capture(sig.epoch, "save_error");
     false
+}
+
+fn display_plan_is_current(
+    all_displays: bool,
+    expected: &super::screens::CapturePlan,
+    current: &impl Fn() -> bool,
+    control: &InternalControl,
+    epoch: u64,
+) -> bool {
+    match super::screens::plan(all_displays, current) {
+        Ok(plan) => &plan == expected,
+        Err(error) => {
+            control.note_capture(epoch, "capture_error");
+            warn!("display selection: {error}");
+            false
+        }
+    }
 }
 
 pub fn spawn_capture_thread(
@@ -208,13 +229,15 @@ pub fn spawn_capture_thread(
                 );
                 continue;
             };
-            if !wait_session(read_conn.as_ref(), &sig, &sid) || !control.is_current(sig.epoch) {
+            if !wait_session(read_conn.as_ref(), &sig, &sid, &control) || !control.is_current(sig.epoch) {
                 continue;
             }
-            let plan = match super::screens::plan(cfg.all_displays) {
+            let current = || control.is_current(sig.epoch);
+            let plan = match super::screens::plan(cfg.all_displays, &current) {
                 Ok(r) => r,
-                Err(_) => {
-                    control.note_capture(sig.epoch, "privacy");
+                Err(error) => {
+                    control.note_capture(sig.epoch, "capture_error");
+                    warn!("display selection: {error}");
                     continue;
                 }
             };
@@ -226,7 +249,7 @@ pub fn spawn_capture_thread(
                 let Some(_job) = control.begin_native(sig.epoch) else {
                     continue;
                 };
-                super::screens::grab(&plan, &|| control.is_current(sig.epoch))
+                super::screens::grab(&plan, &current)
             };
             let images = match captured {
                 Ok(i) => i,
@@ -239,7 +262,7 @@ pub fn spawn_capture_thread(
             if !control.is_current(sig.epoch) {
                 continue;
             }
-            if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
+            if !display_plan_is_current(cfg.all_displays, &plan, &current, &control, sig.epoch)
                 || super::sensitive::permit_capture(&cfg, &front, url.as_deref()).is_err()
             {
                 control.note_capture(sig.epoch, "privacy");
@@ -256,14 +279,14 @@ pub fn spawn_capture_thread(
             if browser::url_for_front(&front) != url {
                 continue;
             }
-            if !wait_session(read_conn.as_ref(), &sig, &sid) {
+            if !wait_session(read_conn.as_ref(), &sig, &sid, &control) {
                 continue;
             }
             let Some(_active) = control.active(sig.epoch) else {
                 continue;
             };
             for (display, img) in images {
-                if super::screens::plan(cfg.all_displays).ok().as_ref() != Some(&plan)
+                if !display_plan_is_current(cfg.all_displays, &plan, &current, &control, sig.epoch)
                     || super::sensitive::permit_capture(&cfg, &front, url.as_deref()).is_err()
                 {
                     control.note_capture(sig.epoch, "privacy");
@@ -333,17 +356,15 @@ pub fn spawn_capture_thread(
                         crate::core::frame_upload::UploadDraft::new(&task, &display, &bytes, &cfg.participant_name)?;
                     crate::core::recovery::stage(&paths, &row, &draft, &bytes)?;
                     writer.send_snapshot_confirmed(row, draft)?;
-                    crate::core::recovery::committed(&paths, &id)?;
                     Ok(())
                 })();
                 if let Err(e) = saved {
                     control.note_capture(sig.epoch, "save_error");
-                    let _ = control.edit_progress(|p| {
-                        p.integrity_error = Some(e.clone());
-                        p.last_error = Some(e);
-                        Ok(())
-                    });
+                    log::warn!("截图保存未完成：{e}");
                     continue;
+                }
+                if let Err(error) = crate::core::recovery::committed(&paths, &id) {
+                    log::warn!("截图已保存，暂存清单稍后清理：{error}");
                 }
                 if sig.priority == CapturePriority::Low && sig.trigger_type == "poll" {
                     last_phash.insert(

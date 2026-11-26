@@ -14,6 +14,7 @@ const BATCH_MAX: usize = 64;
 #[derive(Debug, Default)]
 pub struct WriterMetrics {
     pub last_error: parking_lot::Mutex<Option<String>>,
+    transient_error: parking_lot::Mutex<Option<String>>,
     error_marker: parking_lot::Mutex<Option<std::path::PathBuf>>,
     pub total_batches: AtomicU64,
     pub total_events: AtomicU64,
@@ -34,6 +35,21 @@ impl WriterMetrics {
                 log::error!("无法持久保存数据库错误标记；任务保留未完成落盘状态");
             }
         }
+    }
+
+    fn flush_health(&self, conn: &Connection) -> Result<(), String> {
+        if let Some(error) = self.last_error.lock().clone() {
+            return Err(error);
+        }
+        let mut transient = self.transient_error.lock();
+        if transient.is_some() {
+            // Check the real database after the queue has drained. A released
+            // lock must not keep the application in a permanent error state.
+            conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                .map_err(|error| format!("本机数据库暂时无法写入，请重试暂停保存：{error}"))?;
+            *transient = None;
+        }
+        Ok(())
     }
     pub fn snapshot(&self, pending_estimate: u32) -> crate::core::models::WriterStats {
         let batches = self.total_batches.load(AtomicOrdering::Relaxed);
@@ -135,8 +151,6 @@ impl WriterHandle {
         match self.tx.try_send(ev) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(ev)) => {
-                self.metrics
-                    .record_error("数据库队列已满，存在未写入的数据；已禁止自动清理".into());
                 warn!("writer queue full, dropping event");
                 Err(ev)
             }
@@ -149,18 +163,35 @@ impl WriterHandle {
     }
 }
 
-pub fn spawn_writer_thread(mut conn: Connection, metrics: Arc<WriterMetrics>) -> WriterHandle {
+pub(super) fn read_integrity_marker(path: &std::path::Path) -> Option<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| "已有数据库完整性错误标记，请人工审核".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some("无法读取数据库完整性错误标记，请人工审核".into()),
+    }
+}
+
+pub fn spawn_writer_thread(conn: Connection, metrics: Arc<WriterMetrics>) -> WriterHandle {
+    spawn_writer(conn, metrics, false)
+}
+
+pub fn spawn_recovered_writer_thread(conn: Connection, metrics: Arc<WriterMetrics>) -> WriterHandle {
+    spawn_writer(conn, metrics, true)
+}
+
+fn spawn_writer(mut conn: Connection, metrics: Arc<WriterMetrics>, recovered: bool) -> WriterHandle {
     let marker = conn
         .path()
         .filter(|p| !p.is_empty())
         .and_then(|p| std::path::Path::new(p).parent())
         .map(|p| p.join("integrity-error.json"));
-    if let Some(path) = marker.as_ref().filter(|p| p.exists()) {
-        let message = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok())
-            .unwrap_or_else(|| "已有数据库完整性错误标记，请人工审核".into());
-        *metrics.last_error.lock() = Some(message);
+    if let Some(message) = marker.as_deref().and_then(read_integrity_marker) {
+        if !recovered || !super::recovery::is_legacy_writer_fault(&message)
+            || !super::recovery::database_passes_check(&conn)
+        {
+            *metrics.last_error.lock() = Some(message);
+        }
     }
     *metrics.error_marker.lock() = marker;
     let (tx, rx) = bounded(QUEUE_CAP);
@@ -180,12 +211,12 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             break;
         }
         if let WriteEvent::Flush(done) = first {
-            let _ = done.send(metrics.last_error.lock().clone().map_or(Ok(()), Err));
+            let _ = done.send(metrics.flush_health(conn));
             continue;
         }
         if let WriteEvent::EraseExpiredData(done) = first { let _=done.send(erase_data_inner(conn,true)); continue; }
         if let WriteEvent::EraseCollectedData(done) = first {
-            let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
+            let health = metrics.flush_health(conn);
             let _ = done.send(health.and_then(|_| erase_data(conn)));
             continue;
         }
@@ -226,11 +257,22 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
         batch.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
         let started = Instant::now();
         let n = batch.len() as u64;
-        let result = apply_batch(conn, &batch).map_err(|e| e.to_string());
-        if let Err(ref e) = result {
-            error!("writer batch failed: {e}");
-            metrics.record_error(format!("数据库写入失败，已禁止自动清理：{e}"));
+        let result = apply_batch(conn, &batch);
+        match &result {
+            Ok(()) if !batch.is_empty() => *metrics.transient_error.lock() = None,
+            Ok(()) => {},
+            Err(error) if matches!(error.sqlite_error_code(), Some(
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::DiskFull
+            )) => {
+                warn!("暂时无法写入本机数据库：{error}");
+                *metrics.transient_error.lock() = Some(error.to_string());
+            }
+            Err(error) => {
+                error!("writer batch failed: {error}");
+                metrics.record_error(format!("数据库写入失败，已禁止自动清理：{error}"));
+            }
         }
+        let result = result.map_err(|error| error.to_string());
         let health = metrics.last_error.lock().clone().map_or(Ok(()), Err);
         for event in &batch {
             if let WriteEvent::SnapshotConfirmed { done, .. } = event {
@@ -238,10 +280,10 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteEvent>, metrics: Arc<Wri
             }
         }
         for done in flushes {
-            let _ = done.send(health.clone());
+            let _ = done.send(result.clone().and_then(|_| metrics.flush_health(conn)));
         }
         for done in erasures {
-            let _ = done.send(health.clone().and_then(|_| erase_data(conn)));
+            let _ = done.send(result.clone().and_then(|_| metrics.flush_health(conn)).and_then(|_| erase_data(conn)));
         }
         for done in expirations { let _=done.send(erase_data_inner(conn,true)); }
         let ms = started.elapsed().as_millis() as u64;
@@ -296,6 +338,42 @@ fn erase_data_inner(conn:&mut Connection,keep_settings:bool)->Result<(),String>{
     })();
     let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
     result
+}
+
+fn insert_snapshot(conn: &Connection, row: &super::models::SnapshotRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO snapshots (
+            id, session_id, file_path, captured_at_ms, file_size_bytes,
+            trigger_type, resolution, format, perceptual_hash
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![row.id, row.session_id, row.file_path, row.captured_at_ms, row.file_size_bytes,
+                row.trigger_type, row.resolution, row.format, row.perceptual_hash],
+    )?;
+    Ok(())
+}
+
+/// Replay before the writer starts. An interrupted session insert must not lose a valid frame.
+pub(super) fn restore_snapshot(
+    conn: &mut Connection,
+    row: &super::models::SnapshotRow,
+    upload: &super::frame_upload::UploadDraft,
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    ensure_snapshot_session(&tx, row)?;
+    insert_snapshot(&tx, row)?;
+    super::frame_upload::insert_draft(&tx, row, upload)?;
+    tx.commit()
+}
+
+fn ensure_snapshot_session(conn: &Connection, row: &super::models::SnapshotRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO window_sessions (
+            id, start_ms, end_ms, duration_ms, app_name, window_title, raw_event_count, is_active
+        ) VALUES (?1, ?2, ?2, 0, 'TimeLens', '恢复的截图', 0, 0)
+        ON CONFLICT(id) DO NOTHING",
+        params![row.session_id, row.captured_at_ms],
+    )?;
+    Ok(())
 }
 
 fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<()> {
@@ -355,27 +433,11 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                     ],
                 )?;
             }
-            WriteEvent::Snapshot(s) | WriteEvent::SnapshotConfirmed { row: s, .. } => {
-                tx.execute(
-                    r#"INSERT OR IGNORE INTO snapshots (
-                        id, session_id, file_path, captured_at_ms, file_size_bytes,
-                        trigger_type, resolution, format, perceptual_hash
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                    params![
-                        s.id,
-                        s.session_id,
-                        s.file_path,
-                        s.captured_at_ms,
-                        s.file_size_bytes,
-                        s.trigger_type,
-                        s.resolution,
-                        s.format,
-                        s.perceptual_hash,
-                    ],
-                )?;
-                if let WriteEvent::SnapshotConfirmed { upload, .. } = ev {
-                    super::frame_upload::insert_draft(&tx, s, upload)?;
-                }
+            WriteEvent::Snapshot(s) => insert_snapshot(&tx, s)?,
+            WriteEvent::SnapshotConfirmed { row: s, upload, .. } => {
+                ensure_snapshot_session(&tx, s)?;
+                insert_snapshot(&tx, s)?;
+                super::frame_upload::insert_draft(&tx, s, upload)?;
             }
             WriteEvent::SnapshotOcr(r) => {
                 tx.execute(
@@ -586,7 +648,8 @@ fn apply_batch(conn: &mut Connection, batch: &[WriteEvent]) -> rusqlite::Result<
                         r#"INSERT INTO window_sessions (
                             id, start_ms, end_ms, duration_ms, app_name, bundle_id, window_title,
                             extracted_url, extracted_file_path, intent, raw_event_count, is_active
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                        ON CONFLICT(id) DO NOTHING"#,
                         params![
                             id,
                             start_ms,
@@ -638,6 +701,17 @@ mod tests {
     use crate::core::models::{RawEventRow, SessionUpdateOp, SnapshotRow, WriteEvent};
     use crate::core::storage::migrations::run_migrations;
     use rusqlite::Connection;
+
+    #[test]
+    fn full_writer_queue_does_not_permanently_block_capture() {
+        let (tx, rx) = bounded(1);
+        let writer = WriterHandle { tx, metrics: Arc::new(WriterMetrics::default()) };
+        writer.try_send(WriteEvent::WalCheckpoint).unwrap();
+        assert!(writer.try_send(WriteEvent::WalCheckpoint).is_err());
+        assert!(writer.check_health().is_ok());
+        rx.recv().unwrap();
+        writer.try_send(WriteEvent::WalCheckpoint).unwrap();
+    }
 
     fn conn_with_schema() -> Connection {
         let mut c = Connection::open_in_memory().unwrap();

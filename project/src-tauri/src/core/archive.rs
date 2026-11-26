@@ -35,7 +35,15 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
         return Err("归档状态文件无效".into());
     }
     serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|_| "归档状态损坏，需管理员核对".into())
+        .map_err(|_| "归档或任务归属文件无法解析".into())
+}
+pub(super) fn read_owner(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join("archive-profile-owner.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+        Ok(_) => read(&path).map(Some),
+    }
 }
 pub fn end_ms(config: &InternalConfig) -> Result<i64, String> {
     let value = chrono::DateTime::parse_from_rfc3339(&config.archive_end_at)
@@ -81,8 +89,7 @@ pub fn initialize_owner(
     task: &str,
 ) -> Result<(), String> {
     let owner = paths.root.join("archive-profile-owner.json");
-    if owner.exists() {
-        let _: String = read(&owner)?;
+    if read_owner(&paths.root)?.is_some() {
         return Ok(());
     }
     let tables=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('settings','schema_migrations') AND name NOT LIKE 'snapshot_ocr_fts_%'").map_err(|e|e.to_string())?

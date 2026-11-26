@@ -64,7 +64,11 @@ export interface UploadConfirmation {
 export interface InternalOverview {
   onboarding?: {employeeMode:boolean;activationPending:boolean;configured:boolean};
   cloudIssuer: {configured:boolean;issuerUrl:string;lastCheckedMs:number;lastError:string|null};
-  fixedDeviceId: string;
+  fixedDeviceId: string | null;
+  startupError?: string | null;
+  startupIssue?: LocalTaskIssue | null;
+  uploadStatusError?: "queue" | "config" | "device" | null;
+  deviceIdentityUnavailable?: boolean;
   ossGrant: {valid:boolean; scope?:"device"|"shared"; userId?:string; deviceId?:string; prefix?:string; endpoint?:string; expiresAt?:string; archiveEndAt?:string; fingerprint?:string; error?:string};
   config: InternalConfig;
   progress: TaskProgress;
@@ -76,6 +80,18 @@ export interface InternalOverview {
   uploads: {pending:number; verified:number; ossAccepted:number; blocked:number; legacy:number; lastError:string|null};
 }
 export const getInternalOverview = () => invoke<InternalOverview>("get_internal_overview");
+
+export interface LocalTaskIssue {
+  kind: "configAccess" | "configMissing" | "configFormat" | "configValues" | "progressAccess" | "progressMissing"
+    | "progressFormat" | "progressValues" | "archiveInvalid" | "ownerInvalid"
+    | "identityMismatch" | "storageUnavailable";
+  detail: string;
+}
+export const repairLocalTask = () => invoke<{
+  taskRepaired: boolean;
+  deviceRepaired: boolean;
+  deviceError: string | null;
+}>("repair_local_task");
 
 export const startFrameUpload=(confirmation:UploadConfirmation)=>invoke<void>("start_frame_upload",{confirmation});
 export const stopFrameUpload=()=>invoke<void>("stop_frame_upload");

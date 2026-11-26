@@ -1,4 +1,6 @@
 use image::DynamicImage;
+#[cfg(any(target_os = "windows", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Stable display label plus native-resolution image. Never fall back to an unrelated display.
 pub(super) fn grab(
@@ -55,42 +57,162 @@ pub(super) fn grab(
     }
     #[cfg(target_os = "windows")]
     {
-        let screens = screenshots::Screen::all().map_err(|_| "无法枚举显示器")?;
-        let mut images = Vec::new();
-        for screen in screens {
-            if !current() {
-                return Err("采集已暂停".into());
-            }
-            let info = screen.display_info;
-            let actual = Region::new(
-                &info.id.to_string(),
-                info.x as f64,
-                info.y as f64,
-                info.width as f64,
-                info.height as f64,
-            )?;
-            if !plan.regions.iter().any(|r| r == &actual) {
-                continue;
-            }
-            let captured = screen.capture().map_err(|_| "系统截图失败")?;
-            let (w, h) = (captured.width(), captured.height());
-            let rgba =
-                image::RgbaImage::from_raw(w, h, captured.into_raw()).ok_or("截图数据无效")?;
-            images.push((
-                format!("display-{}", info.id),
-                DynamicImage::ImageRgba8(rgba),
-            ));
-        }
-        if images.is_empty() {
-            return Err("前台显示器不可用".into());
-        }
-        Ok(images)
+        let plan = plan.clone();
+        run_windows_capture(current, std::time::Duration::from_secs(5), move |cancelled| {
+            grab_windows(&plan, cancelled)
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (plan, current);
         Err("此平台不支持屏幕采集".into())
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn run_windows_capture<T: Send + 'static>(
+    current: &impl Fn() -> bool,
+    timeout: std::time::Duration,
+    operation: impl FnOnce(&AtomicBool) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    use std::sync::{mpsc, Arc};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    struct InFlight;
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+
+    if !current() {
+        return Err("采集已暂停".into());
+    }
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return Err("上一次系统截图还未返回".into());
+    }
+    let flight = InFlight;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    std::thread::Builder::new()
+        .name("timelens-windows-screenshot".into())
+        .spawn(move || {
+            let result = operation(&worker_cancelled);
+            drop(flight);
+            let _ = sender.send(result);
+        })
+        .map_err(|_| "无法启动系统截图线程")?;
+    let result = wait_for_windows_capture(&receiver, current, timeout);
+    cancelled.store(true, Ordering::Release);
+    result?
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn wait_for_windows_capture<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    current: &impl Fn() -> bool,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
+    use std::{
+        sync::mpsc::RecvTimeoutError,
+        time::{Duration, Instant},
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !current() {
+            return Err("采集已暂停".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("系统截图超时".into());
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(value) if current() => return Ok(value),
+            Ok(_) => return Err("采集已暂停".into()),
+            Err(RecvTimeoutError::Disconnected) => return Err("系统截图线程已退出".into()),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn windows_wait_rejects_timeout_and_a_frame_after_pause() {
+    use std::{sync::mpsc, time::Duration};
+    let (send, recv) = mpsc::channel::<u8>();
+    let timeout = Duration::from_millis(20);
+    assert_eq!(wait_for_windows_capture(&recv, &|| true, timeout).unwrap_err(), "系统截图超时");
+    send.send(1).unwrap();
+    let poll_count = std::cell::Cell::new(0);
+    let active_until_read = || {
+        poll_count.set(poll_count.get() + 1);
+        poll_count.get() == 1
+    };
+    assert_eq!(wait_for_windows_capture(&recv, &active_until_read, timeout).unwrap_err(), "采集已暂停");
+}
+
+#[cfg(test)]
+#[test]
+fn windows_worker_times_out_without_accumulating_blocked_threads() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let (release, blocked) = mpsc::channel();
+    let result = run_windows_capture(&|| true, Duration::from_millis(30), move |cancelled| {
+        blocked.recv().unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        Ok(1)
+    });
+    assert_eq!(result.unwrap_err(), "系统截图超时");
+    let try_capture = || run_windows_capture(&|| true, Duration::from_secs(1), |_| Ok(2));
+    assert_eq!(try_capture().unwrap_err(), "上一次系统截图还未返回");
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match try_capture() {
+            Ok(result) => { assert_eq!(result, 2); break; }
+            Err(error) => {
+                assert_eq!(error, "上一次系统截图还未返回");
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn grab_windows(
+    plan: &CapturePlan,
+    cancelled: &AtomicBool,
+) -> Result<Vec<(String, DynamicImage)>, String> {
+    let screens = screenshots::Screen::all().map_err(|_| "无法枚举显示器")?;
+    let mut images = Vec::new();
+    for screen in screens {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("采集已暂停".into());
+        }
+        let info = screen.display_info;
+        let actual = Region::new(
+            &info.id.to_string(),
+            info.x as f64,
+            info.y as f64,
+            info.width as f64,
+            info.height as f64,
+        )?;
+        if !plan.regions.iter().any(|r| r == &actual) {
+            continue;
+        }
+        let captured = screen.capture().map_err(|_| "系统截图失败")?;
+        let (w, h) = (captured.width(), captured.height());
+        let rgba =
+            image::RgbaImage::from_raw(w, h, captured.into_raw()).ok_or("截图数据无效")?;
+        images.push((
+            format!("display-{}", info.id),
+            DynamicImage::ImageRgba8(rgba),
+        ));
+    }
+    if images.is_empty() {
+        return Err("前台显示器不可用".into());
+    }
+    Ok(images)
 }
 
 /// Desktop point coordinates, never screenshot pixels (important with mixed DPI).
@@ -131,7 +253,10 @@ pub(super) struct CapturePlan {
     #[cfg(target_os = "macos")]
     indices: Vec<u32>,
 }
-pub(super) fn plan(all: bool) -> Result<CapturePlan, String> {
+pub(super) fn plan(all: bool, current: &impl Fn() -> bool) -> Result<CapturePlan, String> {
+    if !current() {
+        return Err("采集已暂停".into());
+    }
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
@@ -162,35 +287,40 @@ pub(super) fn plan(all: bool) -> Result<CapturePlan, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let point = if all {
-            None
-        } else {
-            Some(crate::core::acquisition::foreground_window_center().ok_or("前台屏幕不可用")?)
-        };
-        let mut regions = Vec::new();
-        for s in screenshots::Screen::all().map_err(|_| "无法枚举显示器")? {
-            let d = s.display_info;
-            if let Some((x, y)) = point {
-                if x < d.x || y < d.y || x >= d.x + d.width as i32 || y >= d.y + d.height as i32 {
-                    continue;
-                }
-            }
-            regions.push(Region::new(
-                &d.id.to_string(),
-                d.x as f64,
-                d.y as f64,
-                d.width as f64,
-                d.height as f64,
-            )?);
-        }
-        if regions.is_empty() {
-            return Err("可采集屏幕为空".into());
-        }
-        Ok(CapturePlan { regions })
+        run_windows_capture(current, std::time::Duration::from_secs(5), move |_| plan_windows(all))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = all;
         Err("此平台不支持窗口检查".into())
     }
+}
+
+#[cfg(target_os = "windows")]
+fn plan_windows(all: bool) -> Result<CapturePlan, String> {
+    let point = if all {
+        None
+    } else {
+        Some(crate::core::acquisition::foreground_window_center().ok_or("前台屏幕不可用")?)
+    };
+    let mut regions = Vec::new();
+    for s in screenshots::Screen::all().map_err(|_| "无法枚举显示器")? {
+        let d = s.display_info;
+        if let Some((x, y)) = point {
+            if x < d.x || y < d.y || x >= d.x + d.width as i32 || y >= d.y + d.height as i32 {
+                continue;
+            }
+        }
+        regions.push(Region::new(
+            &d.id.to_string(),
+            d.x as f64,
+            d.y as f64,
+            d.width as f64,
+            d.height as f64,
+        )?);
+    }
+    if regions.is_empty() {
+        return Err("可采集屏幕为空".into());
+    }
+    Ok(CapturePlan { regions })
 }
